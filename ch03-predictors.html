@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 3장 분기 예측 II</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+.tg-tab td, .tg-tab th { padding: 4px 6px; white-space: nowrap; }
+.tg-tab tr.p td { background: var(--accent-soft); }
+.tg-tab tr.a td { background: var(--accent-2-soft); }
+.tg-tab tr.n td { background: var(--warn-soft); }
+.ras-row { display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 2px; margin: 4px 0 10px; }
+.ras-cell { font-family: var(--mono); font-size: 11px; line-height: 1.25; text-align: center; padding: 3px 0; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text-faint); min-width: 0; overflow: hidden; }
+.ras-cell.live { color: var(--text); background: var(--bg-elev); }
+.ras-cell.top { background: var(--accent-soft); border-color: var(--accent); color: var(--text); font-weight: 700; }
+.ras-cell.w { box-shadow: inset 0 -3px 0 var(--accent-2); }
+.ras-cell.b { box-shadow: inset 0 3px 0 var(--warn); }
+.ras-lab { font-size: 13px; color: var(--text-dim); }
+.ras-pad { padding: 14px 16px; }
+</style>
+</head>
+<body data-chapter="ch03">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 03</div>
+  <h1>분기 예측 II: TAGE·SC·ITTAGE·RAS</h1>
+  <p class="lead"><a href="ch02-bpu.html">2장</a>에서 BPU가 s1, s2, s3 세 단계로 블록의 끝과 다음 주소를 낸다는 것을 봤다. 이 장은 그 안에서 "갈까, 말까"와 "어디로"를 실제로 정하는 예측기들을 다룬다. 카운터 하나에서 시작해 히스토리, TAGE, SC, ITTAGE, RAS 순으로 쌓아 올린다. 범위는 <code>src/main/scala/xiangshan/frontend/bpu/</code> 아래의 <code>tage</code>, <code>utage</code>, <code>sc</code>, <code>ittage</code>, <code>ras</code> 패키지와 이들을 고르는 <code>Bpu.scala</code>의 선택 규칙이다.</p>
+  <ul class="objectives">
+    <li>1비트, 2비트, 3비트 포화 카운터가 루프와 교대 패턴에서 몇 번 틀리는지 예측할 수 있다.</li>
+    <li>PHR을 9, 13, 12비트로 접어 TAGE 인덱스와 태그를 만드는 과정을 설명할 수 있다.</li>
+    <li>TAGE가 provider와 alt를 고르고, 틀렸을 때 더 긴 표에 새 항목을 할당하는 규칙을 따라갈 수 있다.</li>
+    <li>SC가 TAGE를 뒤집는 조건을 임계값과 TAGE 신뢰도로 계산할 수 있다.</li>
+    <li>ITTAGE의 region 표와 RAS의 commit stack, speculative queue가 각각 무엇을 아끼는지 설명할 수 있다.</li>
+  </ul>
+</div>
+
+<section>
+  <h2>카운터 하나로 방향 맞히기</h2>
+  <p>조건 분기의 방향은 실행 단계에서야 확정된다. 그때까지 프런트엔드는 멈출 수 없으니 방향을 미리 찍어야 한다. 가장 단순한 방법은 "지난번과 같다"고 찍는 것이다. 식당 주방이 "이 손님은 지난번에 매운 걸 시켰다"만 기억하는 셈이다.</p>
+  <p>이 기억 장치가 <span class="term" data-def="정해진 범위 안에서만 오르내리는 카운터. 끝에 닿으면 더 가지 않고 멈춘다. 예측기는 MSB를 방향으로 읽는다. 근거 SaturateCounter.scala:38-55.">포화 카운터<span class="en">saturating counter</span></span>다. taken이면 +1, not-taken이면 -1, 끝에서는 멈춘다. 최상위 비트(MSB)가 1이면 taken으로 예측한다. 1비트 카운터는 직전 결과 그 자체다. 2비트부터는 한 번 틀려도 방향이 바로 뒤집히지 않는 <em>관성</em>이 생긴다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 190" role="img" aria-label="3비트 포화 카운터의 8개 상태">
+      <defs><marker id="m31a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="230" y="20" text-anchor="middle" class="lbl-dim">taken이면 +1 (7에서 멈춤)</text>
+      <line class="ln" x1="40" y1="30" x2="420" y2="30" marker-end="url(#m31a)"/>
+      <rect class="box-acc" x="10" y="44" width="48" height="48" rx="8"/><text x="34" y="74" text-anchor="middle" class="lbl-b">0</text>
+      <rect class="box-2" x="66" y="44" width="48" height="48" rx="8"/><text x="90" y="74" text-anchor="middle" class="lbl-b">1</text>
+      <rect class="box-2" x="122" y="44" width="48" height="48" rx="8"/><text x="146" y="74" text-anchor="middle" class="lbl-b">2</text>
+      <rect class="box-warn" x="178" y="44" width="48" height="48" rx="8"/><text x="202" y="74" text-anchor="middle" class="lbl-b">3</text>
+      <rect class="box-warn" x="234" y="44" width="48" height="48" rx="8"/><text x="258" y="74" text-anchor="middle" class="lbl-b">4</text>
+      <rect class="box-2" x="290" y="44" width="48" height="48" rx="8"/><text x="314" y="74" text-anchor="middle" class="lbl-b">5</text>
+      <rect class="box-2" x="346" y="44" width="48" height="48" rx="8"/><text x="370" y="74" text-anchor="middle" class="lbl-b">6</text>
+      <rect class="box-acc" x="402" y="44" width="48" height="48" rx="8"/><text x="426" y="74" text-anchor="middle" class="lbl-b">7</text>
+      <line class="ln" x1="420" y1="106" x2="40" y2="106" marker-end="url(#m31a)"/>
+      <text x="230" y="124" text-anchor="middle" class="lbl-dim">not-taken이면 -1 (0에서 멈춤)</text>
+      <line class="ln-dash" x1="230" y1="40" x2="230" y2="96"/><line class="ln-dash" x1="230" y1="132" x2="230" y2="160"/>
+      <text x="118" y="150" text-anchor="middle" class="lbl">MSB=0: not-taken 예측</text>
+      <text x="342" y="150" text-anchor="middle" class="lbl-acc">MSB=1: taken 예측</text>
+      <text x="34" y="176" text-anchor="middle" class="lbl-mono">포화</text>
+      <text x="118" y="176" text-anchor="middle" class="lbl-mono">mid</text>
+      <text x="230" y="176" text-anchor="middle" class="lbl-mono">weak 3·4</text>
+      <text x="342" y="176" text-anchor="middle" class="lbl-mono">mid</text>
+      <text x="426" y="176" text-anchor="middle" class="lbl-mono">포화</text>
+    </svg>
+    <figcaption>TAGE의 3비트 방향 카운터. 0과 7은 포화, 3과 4는 약함(weak), 나머지는 중간(mid)이다. 이 세 등급은 5절에서 SC 임계값을 고르는 데 다시 쓰인다. 근거 SaturateCounter.scala:38-60, tage/Parameters.scala:38.</figcaption>
+  </figure>
+  <p>코드의 판정 함수는 비트 연산 그대로다. <code>isPositive</code>는 MSB, <code>isSaturatePositive</code>는 모든 비트가 1, <code>isWeakPositive</code>는 2<sup>w-1</sup>(3비트면 4), <code>isWeakNegative</code>는 2<sup>w-1</sup>-1(3비트면 3), <code>isMid</code>는 포화도 약함도 아닌 값이다(SaturateCounter.scala:38-60). TAGE 방향 카운터는 3비트(<code>TakenCtrWidth = 3</code>, tage/Parameters.scala:38), 기본 예측을 내는 mainBTB 카운터는 2비트다(mbtb/Parameters.scala:34).</p>
+
+  <div class="sim" id="sim-cnt">
+    <div class="sim-head"><span class="sim-tag anim">ANIMATION</span><h3>1·2·3비트 카운터 비교</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="cnt-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>분기 패턴</label>
+          <div class="seg" id="cnt-trace"><button class="on" data-v="loop">루프 4회</button><button data-v="alt">교대</button><button data-v="bias">90% taken</button></div></div>
+        <div class="btn-row"><button class="btn primary" id="cnt-step">한 걸음</button><button class="btn" id="cnt-play">재생</button><button class="btn" id="cnt-reset">처음으로</button></div>
+        <div class="verdict grey" id="cnt-verdict">대기: 아직 분기가 없다</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">걸음</span><span class="v" id="cnt-n">0</span></div>
+      <div class="stat"><span class="k">1비트 정확도</span><span class="v" id="cnt-a1">-</span></div>
+      <div class="stat"><span class="k">2비트 정확도</span><span class="v acc" id="cnt-a2">-</span></div>
+      <div class="stat"><span class="k">3비트 정확도</span><span class="v" id="cnt-a3">-</span></div>
+    </div>
+    <div class="sim-note">합성 분기열에 실제 규칙(±1, 끝에서 멈춤, MSB로 예측)을 돌린다. 초기값은 각 폭의 약한 not-taken(0, 1, 3)으로 둔다. ① "루프 4회"(TTTN 반복)에서 1비트가 루프마다 두 번 틀리는 것을 보라. ② "교대"에서는 2비트도 3비트도 거의 다 틀린다. ③ "90% taken"에서는 관성이 있는 2·3비트가 1비트보다 낫다. 이유는 1절 본문과 바로 아래 PREDICT에 있다.</div>
+  </div>
+
+  <div class="sim" id="sim-pre">
+    <div class="sim-head"><span class="sim-tag predict">PREDICT</span><h3>교대 패턴과 2비트 카운터</h3></div>
+    <div class="sim-body">
+      <p style="margin:0">분기가 T, N, T, N...으로 정확히 번갈아 나온다. 2비트 카운터를 약한 not-taken(1)에서 시작하면, 100번 중 몇 번 맞힐까? 먼저 고른 뒤 실행하라.</p>
+      <div class="seg" id="pre-choice"><button class="on">거의 100번</button><button>약 50번</button><button>0번</button></div>
+      <div class="btn-row"><button class="btn primary" id="pre-run">실행</button></div>
+      <div class="verdict grey" id="pre-out">아직 실행하지 않음</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">2비트 카운터 적중</span><span class="v" id="pre-c">-</span></div>
+      <div class="stat"><span class="k">직전 결과 1비트로 고른 카운터 적중</span><span class="v acc" id="pre-h">-</span></div>
+    </div>
+    <div class="sim-note">① 카운터는 1과 2 사이를 오가며 매번 반대로 찍는다. ② 직전 결과(히스토리 1비트)로 카운터 두 개 중 하나를 고르면 첫 두세 번 이후 모두 맞는다. ③ 이것이 2절의 출발점이다. 같은 분기라도 "어떤 길로 왔는가"를 알면 맞힐 수 있다.</div>
+  </div>
+
+  <div class="callout warn"><strong>부호 있는 카운터의 약한 양수는 아직 어긋나 있다 (코드 불일치)</strong><p>SC가 쓰는 <code>SignedSaturateCounter</code>는 판정 함수에서 <code>isWeakPositive</code>를 값 0으로 본다(SignedSaturateCounter.scala:48-51). 그런데 같은 파일의 상수 <code>Value.WeakPositive</code>는 1을 돌려준다(SignedSaturateCounter.scala:139-142, 초기화 <code>resetWeakPositive</code>가 이 값을 쓴다 :128-129). 판정은 2026-01-23 커밋 b59e3f024 (#5551) "fix signed isWeakPositive"에서 0으로 고쳐졌고 상수는 그대로다. 이 장의 시뮬레이터는 판정 함수 쪽을 따른다.</p></div>
+</section>
+
+<section>
+  <h2>히스토리와 상관관계: PHR을 접어 쓰기</h2>
+  <p>교대 패턴에서 카운터 하나가 무너진 이유는 분기 하나만 봤기 때문이다. 실제 프로그램의 분기는 앞선 분기와 엮여 있다. <code>if (x &gt; 0) a(); ... if (x &gt; 0) b();</code>에서 두 번째 분기는 첫 번째와 같은 방향으로 간다. 이런 <span class="term" data-def="한 분기의 결과가 앞서 실행된 다른 분기들의 결과로 설명되는 성질. 히스토리를 인덱스에 섞으면 같은 PC라도 경로별로 다른 카운터를 쓸 수 있다.">상관관계<span class="en">correlation</span></span>를 잡으려면 "어떤 길로 여기 왔는가"를 기록해야 한다.</p>
+  <p>KMHv3는 그 기록으로 <a href="ch02-bpu.html">2장</a>의 <span class="term" data-def="Path History Register. taken 분기마다 (PC, 타깃) 해시 15비트를 넣고 2비트씩 밀어내는 532비트 경로 기록. 근거 history/phr/Phr.scala:44-74.">PHR<span class="en">path history register</span></span>을 쓴다. taken 분기가 하나 지날 때마다 2비트 밀고(<code>Shamt = 2</code>, phr/Parameters.scala:21), <code>pathHash = (Cat(pc[9:1], 0000) ^ target[16:2])[14:0]</code> 15비트를 XOR한다(phr/Helpers.scala:60-63). 원형 버퍼 구현을 시프트로 풀어 쓰면 <code>PHR' = (PHR &lt;&lt; 2) ^ hash15</code>이다(추론, Phr.scala:288-297의 포인터 이동과 하위 비트 XOR을 시프트로 바꿔 씀). 길이 532는 <code>nextMultipleOf(397 + 2·64 + 4, 4)</code>에서 나온다(FrontendParameters.scala:40-58).</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="PHR 갱신과 접기">
+      <defs><marker id="m32a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-code" x="10" y="14" width="200" height="50" rx="8"/>
+      <text x="110" y="36" text-anchor="middle" class="lbl-b">taken 분기</text>
+      <text x="110" y="55" text-anchor="middle" class="lbl-mono">pc[9:1]&lt;&lt;4 ^ target[16:2]</text>
+      <line class="ln" x1="210" y1="39" x2="248" y2="39" marker-end="url(#m32a)"/>
+      <rect class="box-acc" x="250" y="14" width="200" height="50" rx="8"/>
+      <text x="350" y="36" text-anchor="middle" class="lbl-b">hash 15비트</text>
+      <text x="350" y="55" text-anchor="middle" class="lbl-mono">PHR = (PHR&lt;&lt;2) ^ hash</text>
+      <rect class="box-2" x="10" y="86" width="440" height="34" rx="6"/>
+      <text x="20" y="108" class="lbl-mono">bit0 (최신)</text>
+      <text x="440" y="108" text-anchor="end" class="lbl-mono">bit531 (오래됨)</text>
+      <rect class="box-acc" x="10" y="86" width="120" height="34" rx="6" opacity="0.55"/>
+      <text x="70" y="140" text-anchor="middle" class="lbl-dim">최근 L비트만 사용</text>
+      <line class="ln" x1="70" y1="146" x2="70" y2="160" marker-end="url(#m32a)"/>
+      <rect class="box-grey" x="10" y="162" width="40" height="26" rx="4"/><text x="30" y="180" text-anchor="middle" class="lbl-mono">c0</text>
+      <text x="58" y="180" text-anchor="middle" class="lbl">^</text>
+      <rect class="box-grey" x="66" y="162" width="40" height="26" rx="4"/><text x="86" y="180" text-anchor="middle" class="lbl-mono">c1</text>
+      <text x="124" y="180" text-anchor="middle" class="lbl">^ ...</text>
+      <line class="ln" x1="140" y1="175" x2="180" y2="175" marker-end="url(#m32a)"/>
+      <rect class="box-ok" x="182" y="158" width="268" height="34" rx="6"/>
+      <text x="316" y="180" text-anchor="middle" class="lbl-b">W비트 조각을 모두 XOR</text>
+      <text x="10" y="216" class="lbl-mono">W=9 → set 인덱스용</text>
+      <text x="10" y="238" class="lbl-mono">W=13, W=12 → 태그용 (12비트는 1칸 밀어 씀)</text>
+    </svg>
+    <figcaption>히스토리는 길어도 표 인덱스는 9비트뿐이다. 그래서 최근 L비트를 W비트 조각으로 잘라 XOR로 "접는다". 근거 bpu/Helpers.scala:185-192, Types.scala:67-78, tage/Helpers.scala:26-36.</figcaption>
+  </figure>
+  <p>접는 함수 <code>computeFoldedHist</code>는 최근 L비트를 W비트 조각으로 자르고 모두 XOR한다(bpu/Helpers.scala:185-192). TAGE는 표마다 세 가지 폭으로 접는다. 인덱스용 <code>min(L, 9)</code>, 태그용 <code>min(L, 13)</code>과 <code>min(L, 12)</code>다(Types.scala:67-78). 12비트 쪽은 <code>Cat(fold12, 0)</code>으로 한 칸 밀어 13비트 쪽과 겹치지 않게 섞는다(tage/Helpers.scala:30-34). 이렇게 하면 같은 비트 패턴이 인덱스와 태그에서 서로 다르게 나타나 우연한 충돌이 줄어든다.</p>
+  <div class="callout decision"><strong>2025-12-05 PHR 시프트를 2로 바꿨다 (#5315)</strong><p>커밋 cbca1ab1e "feat(Phr): change shamt to 2"가 taken마다 미는 폭을 2로 정했다. 시프트가 작을수록 같은 길이의 히스토리에 더 많은 taken 분기가 담긴다. 397비트 표는 대략 198개 taken 분기를 본다(397 / 2, 추론: 해시가 15비트라 가장 오래된 몇 개는 일부 비트만 남는다).</p></div>
+</section>
+
+<section>
+  <h2>TAGE: 여러 길이의 히스토리를 한꺼번에</h2>
+  <p>히스토리를 얼마나 길게 볼지가 문제다. 짧으면 먼 상관을 놓치고, 길면 처음 보는 경로마다 새로 배워야 해서 느리다. <span class="term" data-def="TAgged GEometric history length predictor. 히스토리 길이가 기하급수로 늘어나는 태그 표 여러 개를 동시에 찾아 가장 긴 적중 표의 답을 쓴다.">TAGE<span class="en">tagged geometric history length</span></span>는 답을 하나로 고르지 않는다. 길이가 다른 표를 모두 동시에 찾고, 맞는 태그가 있는 표 중 가장 긴 것을 믿는다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>표</th><th class="num">히스토리 길이 L</th><th class="num">담기는 taken 수 (L/2, 내림)</th></tr>
+    <tr><td>T0</td><td class="num">4</td><td class="num">2</td></tr><tr><td>T1</td><td class="num">9</td><td class="num">4</td></tr><tr><td>T2</td><td class="num">17</td><td class="num">8</td></tr><tr><td>T3</td><td class="num">29</td><td class="num">14</td></tr><tr><td>T4</td><td class="num">56</td><td class="num">28</td></tr><tr><td>T5</td><td class="num">109</td><td class="num">54</td></tr><tr><td>T6</td><td class="num">211</td><td class="num">105</td></tr><tr><td>T7</td><td class="num">397</td><td class="num">198</td></tr>
+  </table></div>
+  <p>표는 8개, 각 4096 항목, 2-way다(tage/Parameters.scala:24-35). 뱅크가 4개라 뱅크당 512 set, set 인덱스는 9비트다(Types.scala:49-52). 항목은 유효 비트, 13비트 태그(<code>TagWidth</code>), 3비트 방향 카운터를 갖는다. 2비트 <span class="term" data-def="이 항목이 기본값보다 나은 답을 냈는지 기록하는 카운터. 0이면 교체 후보가 된다. KMHv3에서는 올리기만 하고, 내리는 것은 전역 리셋뿐이다.">useful 카운터<span class="en">useful counter</span></span>는 별도 SRAM에 접어서 둔다(tage/TageTable.scala:51-81).</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 270" role="img" aria-label="TAGE 예측 경로">
+      <defs><marker id="m33a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-code" x="10" y="10" width="200" height="40" rx="8"/><text x="110" y="35" text-anchor="middle" class="lbl-b">PC (블록 시작 + 위치)</text>
+      <rect class="box-code" x="250" y="10" width="200" height="40" rx="8"/><text x="350" y="35" text-anchor="middle" class="lbl-b">PHR 접은 값 ×8</text>
+      <line class="ln" x1="110" y1="50" x2="110" y2="66" marker-end="url(#m33a)"/>
+      <line class="ln" x1="350" y1="50" x2="350" y2="66" marker-end="url(#m33a)"/>
+      <rect class="box-2" x="10" y="68" width="48" height="56" rx="6"/><text x="34" y="92" text-anchor="middle" class="lbl-b">T0</text><text x="34" y="112" text-anchor="middle" class="lbl-mono">4</text>
+      <rect class="box-2" x="66" y="68" width="48" height="56" rx="6"/><text x="90" y="92" text-anchor="middle" class="lbl-b">T1</text><text x="90" y="112" text-anchor="middle" class="lbl-mono">9</text>
+      <rect class="box-ok" x="122" y="68" width="48" height="56" rx="6"/><text x="146" y="92" text-anchor="middle" class="lbl-b">T2</text><text x="146" y="112" text-anchor="middle" class="lbl-mono">17</text>
+      <rect class="box-2" x="178" y="68" width="48" height="56" rx="6"/><text x="202" y="92" text-anchor="middle" class="lbl-b">T3</text><text x="202" y="112" text-anchor="middle" class="lbl-mono">29</text>
+      <rect class="box-acc" x="234" y="68" width="48" height="56" rx="6"/><text x="258" y="92" text-anchor="middle" class="lbl-b">T4</text><text x="258" y="112" text-anchor="middle" class="lbl-mono">56</text>
+      <rect class="box-2" x="290" y="68" width="48" height="56" rx="6"/><text x="314" y="92" text-anchor="middle" class="lbl-b">T5</text><text x="314" y="112" text-anchor="middle" class="lbl-mono">109</text>
+      <rect class="box-2" x="346" y="68" width="48" height="56" rx="6"/><text x="370" y="92" text-anchor="middle" class="lbl-b">T6</text><text x="370" y="112" text-anchor="middle" class="lbl-mono">211</text>
+      <rect class="box-2" x="402" y="68" width="48" height="56" rx="6"/><text x="426" y="92" text-anchor="middle" class="lbl-b">T7</text><text x="426" y="112" text-anchor="middle" class="lbl-mono">397</text>
+      <text x="146" y="142" text-anchor="middle" class="lbl-acc2">alt</text>
+      <text x="258" y="142" text-anchor="middle" class="lbl-acc">provider</text>
+      <text x="426" y="142" text-anchor="middle" class="lbl-dim">miss</text>
+      <line class="ln" x1="258" y1="148" x2="258" y2="166" marker-end="url(#m33a)"/>
+      <rect class="box-warn" x="120" y="168" width="276" height="46" rx="8"/>
+      <text x="258" y="188" text-anchor="middle" class="lbl-b">provider가 weak(3·4)인가?</text>
+      <text x="258" y="206" text-anchor="middle" class="lbl-mono">useAltOnNa[표, altConf] ≥ 16</text>
+      <line class="ln" x1="160" y1="214" x2="110" y2="234" marker-end="url(#m33a)"/>
+      <line class="ln" x1="356" y1="214" x2="380" y2="234" marker-end="url(#m33a)"/>
+      <text x="96" y="256" text-anchor="middle" class="lbl">예: alt 또는 기본값</text>
+      <text x="380" y="256" text-anchor="middle" class="lbl-acc">아니오: provider</text>
+    </svg>
+    <figcaption>8개 표를 한 번에 찾고, 적중한 표 중 가장 긴 것이 provider, 두 번째가 alt다. provider가 막 들어온 약한 항목이면 표별 선택기가 alt를 쓸지 정한다. 근거 tage/Tage.scala:147-176.</figcaption>
+  </figure>
+  <p>인덱스와 태그는 PC와 접은 히스토리로 만든다. 블록 시작 PC를 <code>instOffset 1 | bankIdx 2 | setIdx 9 | tag 13</code> 필드로 나누고(tage/Helpers.scala:46-54), set 인덱스는 <code>setIdx ^ fold9</code>, 태그는 <code>tag ^ fold13 ^ (fold12 &lt;&lt; 1) ^ position</code>이다(tage/Helpers.scala:59-66). 마지막 <code>position</code>은 블록 안에서 분기가 몇 번째 2바이트에 있는지(5비트)다. 한 블록의 여러 분기가 같은 set을 쓰고 태그로만 갈린다. 필드 순서로 보면 bank는 <code>pc[2:1]</code>, set은 <code>pc[11:3]</code>, tag는 <code>pc[24:12]</code>다(추론, AddrField가 하위 비트부터 차례로 자른다고 볼 때).</p>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-T1 · useProvider</span><h4>provider를 믿을까, alt를 쓸까</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">provider가 있고, 그 카운터가 weak(3·4)가 아니거나 <code>useAltOnNa[Cat(표 번호, altConf)]</code>가 음수(16 미만)이면 provider를 쓴다. 아니면 alt가 있을 때 alt, 없으면 TAGE 예측은 무효이고 mainBTB 기본 예측이 쓰인다. altConf는 alt가 있으면 "alt가 weak 아님", 없으면 "기본 카운터 포화"다.</dd>
+      <dt>이유</dt><dd class="why">새로 할당된 항목은 카운터가 weak(4 또는 3)에서 시작한다. 한 번 본 경로로 만든 답이라 아직 믿을 근거가 약하다. 그 표의 신참이 그동안 alt보다 자주 틀렸다면 alt를 쓴다.</dd>
+      <dt>없으면</dt><dd>틀릴 때마다 새 항목이 생기고, 그 신참이 곧바로 잘 배운 alt를 덮어 정확도가 떨어진다.</dd>
+      <dt>근거</dt><dd class="src"><a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala#L165" target="_blank">src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala:165-176@09453ff8</a>, 선택기 16개는 <code>NumUseAltOnNa = 2·NumTables</code>(tage/Parameters.scala:61), 5비트이고 16에서 시작한다(Tage.scala:56).</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-08-20 UseAltOnNa를 분기별이 아니라 표별로 (#6328)</strong><p>커밋 cb9ff1d8d 본문: 예전에는 분기마다 "alt를 선호하는가"를 기록했는데, 분기가 너무 많아 한 카운터를 여러 분기가 나눠 쓰며 서로 방해했다. 이제는 "이 표가 충분히 학습됐는가"를 표별로 기록한다. 그래서 인덱스가 PC가 아니라 <code>(provider 표, altConf)</code>다.</p></div>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-T2 · useAltOnNa 학습</span><h4>선택기는 둘이 다를 때만 배운다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">provider가 weak이고 provider 예측과 alt(또는 기본) 예측이 다를 때만 갱신한다. alt 쪽이 맞으면 +1, provider가 맞으면 -1.</dd>
+      <dt>이유</dt><dd class="why">둘이 같은 답이면 어느 쪽을 골라도 결과가 같다. 정확히 하나만 맞는 경우만 선택에 대한 정보가 있다.</dd>
+      <dt>없으면</dt><dd>의미 없는 사건으로 카운터가 흔들려 선택이 무작위에 가까워진다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala:428-430@09453ff8, 반영은 :638-659</dd>
+    </dl>
+  </div>
+
+  <h3>틀렸을 때: 더 긴 표에 새 항목</h3>
+  <p>학습은 결과가 나온 뒤에 한다. provider 카운터는 실제 방향으로 ±1 움직인다(Tage.scala:408, 421). alt 카운터는 alt를 실제로 썼을 때만 움직인다(:403, 424). provider가 맞고 alt(또는 기본)와 답이 달랐다면 useful을 1 올린다(:411-412). 틀렸으면 지금 provider보다 긴 표에 새 항목을 만든다. 더 긴 히스토리가 이 경우를 구별해 주길 기대하는 것이다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-T3 · needAllocate</span><h4>할당할지 정하기</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">BPU 전체가 틀렸고 TAGE 최종 답도 틀렸을 때 할당한다. 단 provider가 이미 T7이면 하지 않는다. provider를 안 썼고 provider는 맞았으며 weak였던 경우도 하지 않는다.</dd>
+      <dt>이유</dt><dd class="why">더 긴 표가 없으면 갈 곳이 없다. 두 번째 예외는 "provider가 맞았는데 선택기가 alt를 골라 틀린" 경우다. 이건 표가 아니라 선택기의 잘못이므로 G-T2가 고친다.</dd>
+      <dt>없으면</dt><dd>쓸모없는 할당이 늘어 멀쩡한 항목을 밀어낸다.</dd>
+      <dt>근거</dt><dd class="src"><a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala#L417" target="_blank">src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala:417-419@09453ff8</a>, 블록당 할당은 최대 1개(:489-491)</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-T4 · allocate select</span><h4>어느 표, 어느 way에 넣을까</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">provider보다 긴 표만 후보다(provider가 없으면 전부). 각 표의 같은 set에서 무효 way, 없으면 "weak이고 useful=0" way, 없으면 "useful=0" way를 찾는다. 후보 표 마스크를 15비트 LFSR 하위 8비트로 걸러 남은 것 중 가장 짧은 표를 고른다. 다 걸러지면 원래 후보 중 가장 짧은 표다. way는 가장 낮은 번호.</dd>
+      <dt>이유</dt><dd class="why">짧은 표는 빨리 배우고 덜 붐빈다. 그래도 항상 가장 짧은 표만 고르면 같은 표가 반복 경쟁한다. 무작위로 건너뛰면 할당이 여러 표로 퍼진다.</dd>
+      <dt>없으면</dt><dd>할당이 한 표에 몰려 서로 밀어내는 핑퐁이 생긴다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala:498-541@09453ff8. 새 항목: 태그 <code>rawTag ^ position</code>, 카운터 taken이면 4, 아니면 3, useful 0(:546-559)</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-08-17 할당은 무작위로, 그러나 짧은 표 쪽으로 (#6349)</strong><p>커밋 bb887b596 "feat(Tage): random allocate" 본문: "When allocating a new entry, assign it randomly, but with a bias toward lower tables." 코드 주석은 주기 2<sup>15</sup>-1인 15비트 LFSR을 쓰는 이유를 할당 사건과의 짧은 주기 상관을 피하려는 것이라 적는다(Tage.scala:527-530).</p></div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-T5 · useful reset</span><h4>자리가 없으면 결국 모두 지운다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">할당이 필요한데 후보가 하나도 없으면 8비트 <code>usefulResetCtr</code>를 1 올린다. 255에 닿으면 모든 표의 useful을 0으로 쓸어낸다. 쓸기는 SRAM 쓰기가 발생할 때마다 뱅크별로 set 하나씩 진행하고, 그동안 useful 읽기는 0으로 본다.</dd>
+      <dt>이유</dt><dd class="why">KMHv3의 useful은 학습 때 올라가기만 한다(<code>getIncrease</code>, Tage.scala:411-412). 내려가는 길은 이 주기적 리셋뿐이다(:561, 626-636). 한 번 쓸모 있었던 항목은 리셋 전까지 영원히 자리를 지킨다.</dd>
+      <dt>없으면</dt><dd>표가 오래된 "한때 유용했던" 항목으로 굳어 새 경로를 영영 배우지 못한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala:561, 626-636@09453ff8, tage/TageTable.scala:131, 177-218, 폭 <code>UsefulResetCtrWidth = 8</code>(tage/Parameters.scala:42)</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-04-30 useful 카운터를 SRAM으로 (#5852), 2026-08-21 리셋 때 쓰기 버퍼 비우기 (#6377)</strong><p>커밋 4bfb226bf "area(tage): use SRAM to store usefulCtr"는 면적을 줄이려 useful을 레지스터에서 접힌 SRAM으로 옮겼다(<code>NumUsefulCtrSramFolds = 8</code>). 그 결과 리셋도 한 번에 못 하고 set 단위로 쓸게 됐다. 커밋 a99a09b01은 리셋을 시작할 때 쓰기 버퍼를 비워 오래된 useful 값이 리셋 뒤에 되살아나지 않게 했다(TageTable.scala:157, 160).</p></div>
+
+  <div class="sim" id="sim-tage">
+    <div class="sim-head"><span class="sim-tag anim">ANIMATION</span><h3>TAGE 한 걸음씩</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="tage-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>분기 패턴</label>
+          <div class="seg" id="tage-trace"><button class="on" data-v="loop">루프</button><button data-v="alt">교대</button><button data-v="corr">상관</button></div></div>
+        <div class="ctl"><label>루프 반복 수 N <output data-for="n"></output></label>
+          <input type="range" data-k="n" min="2" max="120" step="1" value="8" data-fmt="int"></div>
+        <div class="btn-row"><button class="btn primary" id="tage-step">한 걸음</button><button class="btn" id="tage-play">재생</button><button class="btn" id="tage-reset">처음으로</button></div>
+        <div class="verdict grey" id="tage-verdict">대기</div>
+      </div>
+    </div>
+    <div class="table-wrap"><table class="data tg-tab" id="tage-tab"></table></div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">예측한 조건 분기</span><span class="v" id="tage-n">0</span></div>
+      <div class="stat"><span class="k">최근 100개 정확도</span><span class="v acc" id="tage-acc">-</span></div>
+      <div class="stat"><span class="k">분기별 최근 정확도</span><span class="v" id="tage-per">-</span></div>
+      <div class="stat"><span class="k">할당 누적</span><span class="v" id="tage-alloc">0</span></div>
+    </div>
+    <div class="sim-note">실제 상수(표 길이 4…397, set 9비트, 태그 13비트, 3비트 카운터, 2비트 useful, 2-way, useAltOnNa 16개 초기 16, LFSR 15비트)와 G-T1~G-T5 규칙을 합성 분기열에 돌린다. 단순화: 블록 시작 PC를 64B로 정렬하고 각 분기를 따로 예측한다. 기본 예측은 PC별 2비트 카운터(초기 1), LFSR 시드는 하드웨어와 다르다. useful 리셋은 카운터가 255에 닿는 그 걸음에 바로 하지만, 하드웨어는 포화한 뒤 다음 t3_fire에 시작한다(Tage.scala:561, 632-636). 그림은 예측마다 답을 낸 표(맨 아래 줄은 기본 예측)를 찍고 틀린 것을 빨갛게 칠한다. 아래 표의 P는 provider, A는 alt, "새"는 이번에 할당된 항목이다. ① N=8에서 재생해 탈출(N) 예측이 어느 표에서 나오는지 보라. 탈출을 구별하려면 루프 바깥 점프 O의 해시가 히스토리 안에 남아야 하는데, taken 하나에 2비트씩 밀리므로 L &gt; 2·(N−1)인 표가 필요하다. N=8이면 T2(17)로 충분하지만 이 시뮬에서는 LFSR이 T2, T3를 건너뛰어 T4(56)가 잡는다. ② N을 30, 60, 120으로 올리면 탈출을 잡는 표가 T5, T6, T7로 옮겨 가고, 마지막 틀림이 N=8의 40번째 예측 무렵에서 N=120의 약 960번째로 늦어진다. ③ "상관"에서 A는 동전 던지기라 50% 근처, A와 같은 방향인 B는 100%에 가까워진다. 3절.</div>
+  </div>
+</section>
+
+<section>
+  <h2>빠른 예측과 느린 예측: uTAGE와 단계별 선택</h2>
+  <p>TAGE는 정확하지만 8개 SRAM을 읽고 태그를 비교하느라 s2, s3까지 걸린다. 그동안 s1은 무언가를 내야 한다. <a href="ch02-bpu.html">2장</a>에서 본 대로 s1은 uBTB, aBTB로 다음 블록을 바로 낸다. 그런데 aBTB의 방향 비트만으로는 히스토리 상관을 못 잡는다. 그래서 s1에 아주 작은 TAGE, <span class="term" data-def="MicroTage. s1에서 쓰는 작은 TAGE. 512 set, 1-way 표 2개(히스토리 5, 9). aBTB가 찾은 조건 분기의 방향을 덮어쓴다. 근거 utage/Parameters.scala:25-51.">uTAGE<span class="en">micro TAGE</span></span>를 둔다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 260" role="img" aria-label="s1 s2 s3에서 방향과 타깃을 정하는 예측기">
+      <defs><marker id="m34a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="76" y="20" text-anchor="middle" class="lbl-b">s1</text><text x="230" y="20" text-anchor="middle" class="lbl-b">s2</text><text x="384" y="20" text-anchor="middle" class="lbl-b">s3</text>
+      <rect class="box-2" x="10" y="32" width="132" height="44" rx="8"/><text x="76" y="59" text-anchor="middle" class="lbl">uBTB · aBTB</text>
+      <rect class="box-acc" x="10" y="84" width="132" height="44" rx="8"/><text x="76" y="111" text-anchor="middle" class="lbl">uTAGE 방향</text>
+      <rect class="box-acc" x="10" y="136" width="132" height="44" rx="8"/><text x="76" y="163" text-anchor="middle" class="lbl">uRAS 복귀</text>
+      <rect class="box-2" x="164" y="32" width="132" height="44" rx="8"/><text x="230" y="59" text-anchor="middle" class="lbl">mainBTB</text>
+      <rect class="box-acc" x="164" y="84" width="132" height="44" rx="8"/><text x="230" y="111" text-anchor="middle" class="lbl">TAGE 빠른 답</text>
+      <rect class="box-2" x="318" y="32" width="132" height="44" rx="8"/><text x="384" y="59" text-anchor="middle" class="lbl">TAGE 전체</text>
+      <rect class="box-2" x="318" y="84" width="132" height="44" rx="8"/><text x="384" y="111" text-anchor="middle" class="lbl">SC</text>
+      <rect class="box-2" x="318" y="136" width="132" height="44" rx="8"/><text x="384" y="163" text-anchor="middle" class="lbl">ITTAGE · RAS</text>
+      <line class="ln" x1="142" y1="106" x2="162" y2="106" marker-end="url(#m34a)"/>
+      <line class="ln" x1="296" y1="106" x2="316" y2="106" marker-end="url(#m34a)"/>
+      <rect class="box-ok" x="10" y="196" width="440" height="56" rx="8"/>
+      <text x="230" y="218" text-anchor="middle" class="lbl-b">s3 방향: SC &gt; TAGE &gt; mainBTB 카운터</text>
+      <text x="230" y="240" text-anchor="middle" class="lbl-b">s3 타깃: RAS &gt; ITTAGE &gt; mainBTB 타깃</text>
+    </svg>
+    <figcaption>같은 블록을 세 번 예측한다. 뒤 단계가 다르게 말하면 앞 단계 결과를 덮어쓴다(override, 2장). 근거 Bpu.scala:296-310, 356-360, 417-457.</figcaption>
+  </figure>
+  <p>s2는 TAGE의 <code>fastTakenVec</code>를 쓴다. 이 값은 provider와 alt를 따지지 않고, 적중한 가장 긴 표의 카운터 MSB다(Tage.scala:121-131, Bpu.scala:356-360). s3에서야 G-T1까지 거친 정식 답과 SC가 나온다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-B1 · s3 select</span><h4>s3의 최종 방향과 타깃</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">조건 분기의 방향은 <code>MuxCase(mainBTB taken; useSc → SC, useTage → TAGE)</code>다. MuxCase는 앞 항목이 우선이라 SC가 쓰이면 SC, 아니면 TAGE가 유효할 때 TAGE, 둘 다 아니면 mainBTB 카운터다. 첫 taken 분기가 return이면 RAS 주소, 간접 점프이고 ITTAGE가 적중하면 ITTAGE 주소, 아니면 mainBTB 타깃.</dd>
+      <dt>이유</dt><dd class="why">더 많은 정보를 본 예측기가 우선이다. SC는 TAGE 답을 보고 나서 판단하고, RAS는 호출 깊이를 정확히 안다.</dd>
+      <dt>없으면</dt><dd>느리지만 정확한 예측이 버려진다.</dd>
+      <dt>근거</dt><dd class="src"><a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/Bpu.scala#L417" target="_blank">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:417-432, 439-457@09453ff8</a></dd>
+    </dl>
+  </div>
+  <p>uTAGE 표는 둘이다. 512 set, 1-way에 히스토리 5비트·태그 8비트, 히스토리 9비트·태그 8비트다(utage/Parameters.scala:25-31, 51; <code>MicroTageInfo(NumSets, HistoryLength, HistBitsInTag, TagWidth)</code>, Types.scala:81-86). 방향 카운터 3비트, useful 2비트다(:32-36). 적중한 표 중 번호가 큰 표가 답한다(MicroTage.scala:120-131).</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-U1 · uTAGE override</span><h4>s1에서 uTAGE가 aBTB 방향을 덮는다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">aBTB가 찾은 분기가 조건 분기이고 uTAGE가 적중하면 uTAGE 방향을, 아니면 aBTB 방향을 쓴다. 무조건 점프는 항상 taken.</dd>
+      <dt>이유</dt><dd class="why">s1에서도 짧은 히스토리 상관(루프 몇 회, 교대)은 잡자는 것이다. 틀려도 s2, s3가 덮어쓴다.</dd>
+      <dt>없으면</dt><dd>짧은 패턴 분기마다 s2/s3 override가 생기고, 그만큼 인출 거품이 늘어난다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:296-310@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-U2 · uTAGE 학습</span><h4>uTAGE는 백엔드가 아니라 s3에게 배운다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s3 예측이 나오면 그것을 정답으로 보고(<code>fastTrain</code>) 학습한다. 틀렸으면 provider보다 높은 표 중 useful=0인 첫 표에 반대 방향으로 할당한다. 할당할 곳이 없으면 8비트(<code>LowTickWidth + 1</code>) lowTickCounter를 올리고, 최상위 비트가 서면(128번) T0의 useful은 모두 -1, T1의 useful은 모두 절반이 된다. 새 항목 카운터는 4 또는 3, useful 초기값은 앞쪽 절반 표가 1, 뒤쪽 절반이 2다.</dd>
+      <dt>이유</dt><dd class="why">백엔드 결과는 수십 사이클 뒤에 온다. s3 답은 2사이클 뒤라 s1이 바로 따라잡을 수 있다. s3도 틀릴 수 있지만, uTAGE의 목표는 s3를 흉내내 override를 줄이는 것이다.</dd>
+      <dt>없으면</dt><dd>uTAGE가 늦게 배워 s1과 s3가 자주 엇갈린다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:169-174, utage/MicroTage.scala:262-330, 380-384, utage/BypassShadowBuffer.scala:187-222@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="callout warn"><strong>이름이 헷갈리는 상수 두 개 (코드 불일치)</strong><p><code>utage/Parameters.scala:60</code>은 <code>EnableFastTrain = false</code>인데 바로 위 주석은 "utage can only be fast-trained"이고, 모듈은 <code>io.fastTrain.get</code>으로 실제로 fast train을 받는다. 또 <code>HighTickWidth = 8</code>은 표 번호 2, 3에만 쓰이는데 표가 2개뿐이라 지금은 쓰이지 않는다(MicroTage.scala:71-88).</p></div>
+</section>
+
+<section>
+  <h2>SC: 통계 보정기</h2>
+  <p>TAGE가 잘 못하는 분기가 있다. 방향이 히스토리와 <em>약하게</em> 엮여 있는 분기, 예를 들어 "대체로 taken인데 특정 조건 몇 개가 겹치면 not-taken"인 분기다. TAGE는 한 항목의 카운터만 보므로 이런 통계적 경향을 잘 못 합친다. <span class="term" data-def="Statistical Corrector. 여러 작은 표의 부호 있는 카운터를 더해 합의 부호로 방향을, 합의 크기로 신뢰도를 정한다. 합이 TAGE 신뢰도에 맞는 임계값을 넘을 때만 TAGE를 덮는다.">SC<span class="en">statistical corrector</span></span>는 여러 표의 작은 투표를 더해 TAGE를 보정한다. 퍼셉트론과 같은 발상이다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="SC 합산과 임계값 비교">
+      <defs><marker id="m35a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-2" x="10" y="12" width="100" height="36" rx="6"/><text x="60" y="35" text-anchor="middle" class="lbl">path ×2</text>
+      <rect class="box-2" x="122" y="12" width="100" height="36" rx="6"/><text x="172" y="35" text-anchor="middle" class="lbl">global ×2</text>
+      <rect class="box-2" x="234" y="12" width="100" height="36" rx="6"/><text x="284" y="35" text-anchor="middle" class="lbl">bw ×2</text>
+      <rect class="box-2" x="346" y="12" width="104" height="36" rx="6"/><text x="398" y="35" text-anchor="middle" class="lbl">imli · bias</text>
+      <line class="ln" x1="230" y1="50" x2="230" y2="68" marker-end="url(#m35a)"/>
+      <rect class="box-acc" x="80" y="70" width="300" height="44" rx="8"/>
+      <text x="230" y="90" text-anchor="middle" class="lbl-b">합 = Σ (2·ctr + 1)</text>
+      <text x="230" y="107" text-anchor="middle" class="lbl-mono">ctr 6비트 −32…31, 8개 표, |합| ≤ 504</text>
+      <line class="ln" x1="230" y1="114" x2="230" y2="132" marker-end="url(#m35a)"/>
+      <rect class="box-warn" x="10" y="134" width="140" height="56" rx="8"/><text x="80" y="157" text-anchor="middle" class="lbl">TAGE 0 또는 7</text><text x="80" y="178" text-anchor="middle" class="lbl-mono">|합| &gt; thr&gt;&gt;4</text>
+      <rect class="box-warn" x="160" y="134" width="140" height="56" rx="8"/><text x="230" y="157" text-anchor="middle" class="lbl">TAGE mid</text><text x="230" y="178" text-anchor="middle" class="lbl-mono">|합| &gt; thr&gt;&gt;5</text>
+      <rect class="box-warn" x="310" y="134" width="140" height="56" rx="8"/><text x="380" y="157" text-anchor="middle" class="lbl">TAGE weak</text><text x="380" y="178" text-anchor="middle" class="lbl-mono">|합| &gt; thr&gt;&gt;6</text>
+      <line class="ln" x1="230" y1="190" x2="230" y2="208" marker-end="url(#m35a)"/>
+      <rect class="box-ok" x="80" y="210" width="300" height="34" rx="8"/><text x="230" y="232" text-anchor="middle" class="lbl-b">넘으면 useSc: 방향 = 합 ≥ 0</text>
+    </svg>
+    <figcaption>TAGE가 확신할수록 SC가 넘어야 할 문턱이 높다. 초기 thr=1130이면 문턱은 70, 35, 17이다. 근거 sc/Sc.scala:208-234, 267-314, sc/Helpers.scala:57-60, sc/Parameters.scala:38-48.</figcaption>
+  </figure>
+  <p>표 구성은 path 2개, global 2개, backward(bw) 2개, IMLI 1개, bias 1개로 모두 8개다(sc/Parameters.scala:24-37, 88). 각 항목은 6비트 부호 있는 카운터(<code>CtrWidth = 6</code>)이고, 투표값은 <code>Cat(ctr, 1) = 2·ctr + 1</code>이라 0이 나오지 않는다(sc/Helpers.scala:57). 표마다 8-way이고 way는 블록 안 위치 5비트를 3비트로 접어 고른다(sc/Helpers.scala:49-55). bias 표는 32-way로, 위치 3비트에 TAGE provider의 "weak인가, taken인가" 2비트를 붙여 고른다(Sc.scala:245-253). path와 global은 각각 PHR과 GHR을, bw는 backward 분기 히스토리 8비트를, IMLI는 내부 루프 반복 수 8비트를 쓴다(bpu/Parameters.scala:77-79). 문턱 thr은 SC 전체에 하나가 아니라 way마다 따로 있다(<code>scThreshold(wayIdx)</code>, Sc.scala:271, 갱신 :501-514).</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-S1 · useSc</span><h4>SC가 TAGE를 덮는 조건</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">조건 분기가 mainBTB에 적중하고 TAGE provider가 있을 때만 본다. provider 카운터가 0/7이면 <code>|합| &gt; thr&gt;&gt;4</code>, mid면 <code>&gt;&gt;5</code>, weak면 <code>&gt;&gt;6</code>를 넘어야 useSc다. 방향은 <code>합 ≥ 0</code>.</dd>
+      <dt>이유</dt><dd class="why">강하게 확신하는 TAGE를 뒤집으려면 SC도 강하게 확신해야 한다. 약한 TAGE는 조금만 반대해도 넘어간다.</dd>
+      <dt>없으면</dt><dd>SC의 작은 잡음이 맞던 TAGE 답을 뒤집는다. 또는 반대로 SC가 아는 것을 영영 못 쓴다.</dd>
+      <dt>근거</dt><dd class="src"><a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/sc/Sc.scala#L297" target="_blank">src/main/scala/xiangshan/frontend/bpu/sc/Sc.scala:292-314@09453ff8</a>, 문턱 계산 :267-274</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-S2 · SC 학습</span><h4>표와 문턱은 언제 움직이나</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">카운터: TAGE 예측이 유효했고, "SC가 틀렸거나 합이 문턱을 못 넘었을 때" 실제 방향으로 ±1(sc/Helpers.scala:83-93). 단 SC를 썼고 맞았고 TAGE와 같은 답이었다면 쓰기 자체를 하지 않는다(Sc.scala:388-393). 문턱: 같은 조건에서 SC가 틀렸으면 +1, 아니면 -1. 결과가 [832, 8064] 밖이면 그대로 둔다.</dd>
+      <dt>이유</dt><dd class="why">이미 넉넉히 맞는 경우까지 배우면 카운터가 포화해 새 경향에 둔해진다. 문턱은 SC가 자주 틀리면 높아져 덜 개입하고, 자주 맞으면 낮아져 더 개입한다.</dd>
+      <dt>없으면</dt><dd>문턱이 0 근처로 떨어지거나 끝없이 올라 SC가 늘 끼어들거나 영영 침묵한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/sc/Sc.scala:493-514@09453ff8. 범위: Min = (8+5)&lt;&lt;6 = 832, Max = min(8·63&lt;&lt;4, 2<sup>13</sup>-1) = 8064(sc/Parameters.scala:88-90). 8064&gt;&gt;4 = 504 = 8·63은 합의 최대 크기와 같다.</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-03-03 문턱 갱신에 범위를 둔다 (#5632)</strong><p>커밋 eba560fca "feat(sc): set threshold update range" 본문: 시뮬레이터 동작과는 다르지만 SPEC06 int에서 0.22% 이득이 있었다. 이후 2026-04-09 #5756이 global 표를, 2026-04-14 #5796이 bw 표를 켰다.</p></div>
+  <div class="callout warn"><strong>쓰이지 않는 문턱 하나 (코드 불일치)</strong><p><code>s2_thresholds = thr &gt;&gt; 3</code>(Sc.scala:293)은 루프 안에서 <code>thres</code>로 읽히지만(:300) 어떤 판정에도 쓰이지 않는다. 실제 판정은 &gt;&gt;4, &gt;&gt;5, &gt;&gt;6뿐이다. 파라미터 주석(sc/Parameters.scala:85-87)은 "thr&gt;&gt;3 + …" 식으로 설명해 코드와 어긋난다.</p></div>
+
+  <div class="sim" id="sim-sc">
+    <div class="sim-head"><span class="sim-tag lab">LAB</span><h3>SC가 TAGE를 뒤집는 문턱</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="sc-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>TAGE provider 카운터 <output data-for="tage"></output></label><input type="range" data-k="tage" min="0" max="7" step="1" value="4" data-fmt="int"></div>
+        <div class="ctl"><label>path 카운터 ×2 <output data-for="path"></output></label><input type="range" data-k="path" min="-32" max="31" step="1" value="-3" data-fmt="int"></div>
+        <div class="ctl"><label>global 카운터 ×2 <output data-for="glob"></output></label><input type="range" data-k="glob" min="-32" max="31" step="1" value="-2" data-fmt="int"></div>
+        <div class="ctl"><label>bw 카운터 ×2 <output data-for="bw"></output></label><input type="range" data-k="bw" min="-32" max="31" step="1" value="0" data-fmt="int"></div>
+        <div class="ctl"><label>IMLI 카운터 <output data-for="imli"></output></label><input type="range" data-k="imli" min="-32" max="31" step="1" value="0" data-fmt="int"></div>
+        <div class="ctl"><label>bias 카운터 <output data-for="bias"></output></label><input type="range" data-k="bias" min="-32" max="31" step="1" value="-6" data-fmt="int"></div>
+        <div class="ctl"><label>문턱 thr <output data-for="thr"></output></label><input type="range" data-k="thr" min="832" max="8064" step="2" value="1130" data-fmt="int"></div>
+        <div class="verdict grey" id="sc-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">합 Σ(2c+1)</span><span class="v" id="sc-sum">-</span></div>
+      <div class="stat"><span class="k">적용 문턱</span><span class="v acc" id="sc-th">-</span></div>
+      <div class="stat"><span class="k">TAGE 예측</span><span class="v" id="sc-tp">-</span></div>
+      <div class="stat"><span class="k">최종 방향</span><span class="v" id="sc-fin">-</span></div>
+    </div>
+    <div class="sim-note">한 분기에 대해 G-S1을 실제 상수로 계산한다. 카운터 값은 합성이고, path/global/bw 슬라이더는 두 표에 같은 값을 넣는다. 실제 문턱은 way마다 따로 있지만 여기서는 한 way의 문턱 하나만 다룬다. ① 기본값(TAGE 4 = weak taken, 합 −24)에서 SC가 TAGE를 뒤집는 것을 보라. 문턱은 1130&gt;&gt;6 = 17이다. ② TAGE를 7로 올리면 문턱이 70으로 뛰어 같은 합으로는 못 뒤집는다. ③ 모든 카운터를 31로 올려도 합은 504를 넘지 못한다. 그래서 thr 최대 8064의 &gt;&gt;4가 정확히 504다. 5절.</div>
+  </div>
+</section>
+
+<section>
+  <h2>ITTAGE: 간접 점프의 타깃 맞히기</h2>
+  <p>방향만 문제인 것이 아니다. <code>jalr</code> 같은 간접 점프는 레지스터 값으로 가므로 타깃이 매번 다를 수 있다. 가상 함수 호출이나 <code>switch</code> 점프 표가 그렇다. mainBTB는 마지막 타깃 하나만 기억한다. 같은 점프라도 경로마다 다른 타깃을 기억하려면 TAGE 구조에 방향 대신 타깃을 담으면 된다. 그것이 <span class="term" data-def="Indirect Target TAGE. TAGE와 같은 다중 히스토리 태그 표에 방향 대신 타깃 주소를 저장한다. 타깃 하위 20비트는 항목에, 상위 비트는 region 표에 둔다.">ITTAGE<span class="en">indirect target TAGE</span></span>다.</p>
+  <p>표는 5개, (항목 수, 히스토리 길이)는 (256, 4), (256, 8), (512, 13), (512, 16), (512, 32)다(ittage/Parameters.scala:23-29). 태그 9비트, 신뢰도 2비트, useful 1비트다(:30-43). 문제는 타깃 주소가 50비트라는 점이다. 항목마다 다 담으면 크다. 그래서 하위 20비트(<code>TargetWidth = 20</code>)만 항목에 두고, 나머지 상위 30비트(<code>RegionBits = VAddrBits - 20</code>, :82)는 16칸짜리 <span class="term" data-def="ITTAGE 타깃의 상위 비트(1MiB 단위 구역)를 모아 둔 16칸 레지스터 표. 항목은 4비트 포인터로 칸을 가리킨다. 근거 ittage/RegionWays.scala:47-66.">region 표<span class="en">region table</span></span>에 모아 4비트 포인터로 가리킨다. 한 region은 2<sup>20</sup>바이트, 즉 1MiB 구역이다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 230" role="img" aria-label="ITTAGE 항목과 region 표로 타깃 조립">
+      <defs><marker id="m36a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="18" class="lbl-dim">항목 (IttageEntry)</text>
+      <rect class="box-grey" x="10" y="26" width="60" height="36" rx="4"/><text x="40" y="49" text-anchor="middle" class="lbl-mono">tag 9</text>
+      <rect class="box-grey" x="74" y="26" width="56" height="36" rx="4"/><text x="102" y="49" text-anchor="middle" class="lbl-mono">conf 2</text>
+      <rect class="box-acc" x="134" y="26" width="150" height="36" rx="4"/><text x="209" y="49" text-anchor="middle" class="lbl-mono">offset 20</text>
+      <rect class="box-acc" x="288" y="26" width="70" height="36" rx="4"/><text x="323" y="49" text-anchor="middle" class="lbl-mono">ptr 4</text>
+      <rect class="box-grey" x="362" y="26" width="88" height="36" rx="4"/><text x="406" y="49" text-anchor="middle" class="lbl-mono">usePc 1</text>
+      <line class="ln" x1="323" y1="62" x2="323" y2="92" marker-end="url(#m36a)"/>
+      <rect class="box-2" x="250" y="94" width="200" height="48" rx="8"/>
+      <text x="350" y="114" text-anchor="middle" class="lbl-b">region 표 16칸</text>
+      <text x="350" y="133" text-anchor="middle" class="lbl-mono">상위 30비트 (1MiB 구역)</text>
+      <rect class="box-2" x="10" y="94" width="200" height="48" rx="8"/>
+      <text x="110" y="114" text-anchor="middle" class="lbl-b">PC의 region</text>
+      <text x="110" y="133" text-anchor="middle" class="lbl-mono">usePc 또는 표 miss</text>
+      <line class="ln" x1="350" y1="142" x2="290" y2="170" marker-end="url(#m36a)"/>
+      <line class="ln" x1="110" y1="142" x2="170" y2="170" marker-end="url(#m36a)"/>
+      <line class="ln" x1="209" y1="62" x2="230" y2="170" marker-end="url(#m36a)"/>
+      <rect class="box-ok" x="80" y="172" width="300" height="48" rx="8"/>
+      <text x="230" y="194" text-anchor="middle" class="lbl-b">타깃 = region ‖ offset</text>
+      <text x="230" y="212" text-anchor="middle" class="lbl-mono">50비트 주소</text>
+    </svg>
+    <figcaption>타깃이 같은 1MiB 구역 안이면 PC의 region을 그대로 쓰고, 다른 구역이면 region 표를 가리킨다. 공통 상위 비트를 공유해 항목을 작게 만든다. 근거 ittage/Bundles.scala:44-57, ittage/Ittage.scala:227-243.</figcaption>
+  </figure>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-I1 · ITTAGE select</span><h4>provider냐 alt냐</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">적중한 가장 긴 표가 provider, 두 번째가 alt다. provider 신뢰도가 0이고 alt가 있으면 alt 타깃, 아니면 provider 타깃을 쓴다. 적중이 있으면 s3에서 <code>hit</code>이다.</dd>
+      <dt>이유</dt><dd class="why">신뢰도 0은 "막 틀려서 타깃을 바꾸려는 중"이라는 뜻이다. 그때는 더 짧지만 자리잡은 alt가 낫다.</dd>
+      <dt>없으면</dt><dd>방금 틀린 타깃을 다시 내서 같은 실수를 반복한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/ittage/Ittage.scala:217-223, 253-259, 268@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-I2 · ITTAGE 학습</span><h4>신뢰도, 타깃 교체, 할당, tick</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">신뢰도: 할당 때 2(weak positive), 그 외에는 맞으면 +1, 틀리면 -1. 저장된 타깃은 할당 때나 신뢰도가 0일 때만 바꾼다. useful은 alt와 타깃이 다를 때만 "provider가 맞았는가"로 덮어쓴다. 틀렸고 "provider는 맞았는데 신뢰도 0이라 안 쓴" 경우가 아니면 provider보다 긴 표 중 적중하지 않았고 useful=0인 곳에 할당한다(<code>!r.valid &amp;&amp; usefulCnt.isSaturateNegative</code>, Ittage.scala:300)(LFSR로 섞고, 없으면 첫 후보). tick은 할당 실패면 +1, 성공이면 -1이고 포화하면 모든 useful을 0으로 만든다. region 표는 할당할 때 타깃 region이 PC region과 다를 때만 쓴다.</dd>
+      <dt>이유</dt><dd class="why">타깃은 한 번 틀렸다고 바로 바꾸지 않는다. 신뢰도가 바닥나야 바꾼다. 다형 호출이 섞인 곳에서 타깃이 핑퐁하지 않게 하려는 것이다.</dd>
+      <dt>없으면</dt><dd>두 타깃을 번갈아 가는 점프에서 매번 틀린다. useful이 굳으면 새 경로를 못 배운다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/ittage/IttageTable.scala:247-263, ittage/Ittage.scala:300-323, 339-402@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="callout warn"><strong>선언만 있고 쓰이지 않는 useAltOnNa, 그리고 region 교체 (추론)</strong><p>ITTAGE에도 <code>useAltOnNa</code> 레지스터가 선언돼 있지만(Ittage.scala:76) 어디서도 읽거나 갱신하지 않는다. TAGE와 달리 ITTAGE의 alt 선택은 G-I1의 "신뢰도 0" 규칙뿐이다. 또 region 표는 PLRU로 교체되고 적중 판정은 칸의 유효 비트만 본다(RegionWays.scala:54-66). 그래서 칸이 다른 region으로 교체되면 그 칸을 가리키던 옛 항목은 조용히 다른 타깃을 낼 수 있다(추론: 코드에 이를 막는 검사가 보이지 않는다).</p></div>
+</section>
+
+<section>
+  <h2>RAS: 호출과 복귀를 스택으로</h2>
+  <p>함수 복귀(<code>ret</code>)도 간접 점프지만 규칙이 있다. 가장 최근에 호출한 곳 다음으로 돌아간다. 그러니 호출 때 복귀 주소를 쌓고 복귀 때 꺼내면 거의 다 맞는다. 이것이 <span class="term" data-def="Return Address Stack. call에서 복귀 주소를 push하고 return에서 pop해 타깃으로 쓴다.">RAS<span class="en">return address stack</span></span>다. 어려운 점은 추측이다. BPU는 실행보다 훨씬 앞서 push와 pop을 하고, 그중 일부는 잘못된 경로 위의 것이다. 틀린 경로가 쌓은 것을 되돌릴 수 있어야 한다.</p>
+  <p>KMHv3는 스택을 둘로 나눈다. 커밋된 call/return만 반영한 16칸 <span class="term" data-def="커밋된 call/return만 반영하는 16칸 원형 스택. 칸마다 3비트 반복 카운터가 있다. 포인터 nsp.">commit stack</span>과, 추측으로 push한 항목을 쌓는 32칸 <span class="term" data-def="아직 커밋되지 않은 push를 순서대로 기록하는 32칸 원형 큐. 각 항목은 자기 아래 항목(nos)을 가리켜 연결 리스트처럼 pop한다. 포인터 tosr, tosw, bos.">speculative queue</span>다(ras/Parameters.scala:22-24). 같은 주소로 연속 호출(재귀)하면 새 칸 대신 3비트 카운터만 올린다(최대 7, :35).</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="RAS commit stack과 speculative queue">
+      <defs><marker id="m37a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="450" y="18" text-anchor="end" class="lbl-b">speculative queue 32칸</text>
+      <rect class="box-grey" x="10" y="28" width="60" height="40" rx="4"/><text x="40" y="53" text-anchor="middle" class="lbl-mono">...</text>
+      <rect class="box-2" x="74" y="28" width="60" height="40" rx="4"/><text x="104" y="53" text-anchor="middle" class="lbl-mono">r1</text>
+      <rect class="box-2" x="138" y="28" width="60" height="40" rx="4"/><text x="168" y="53" text-anchor="middle" class="lbl-mono">r2</text>
+      <rect class="box-acc" x="202" y="28" width="60" height="40" rx="4"/><text x="232" y="53" text-anchor="middle" class="lbl-mono">r3</text>
+      <rect class="box-grey" x="266" y="28" width="60" height="40" rx="4"/><text x="296" y="53" text-anchor="middle" class="lbl-mono">빈칸</text>
+      <text x="104" y="86" text-anchor="middle" class="lbl-dim">bos</text>
+      <text x="232" y="86" text-anchor="middle" class="lbl-acc">tosr (꼭대기)</text>
+      <text x="296" y="104" text-anchor="middle" class="lbl-acc2">tosw (다음 쓰기)</text>
+      <path class="ln" d="M232,28 C232,8 168,8 168,26" fill="none" marker-end="url(#m37a)"/>
+      <text x="160" y="16" text-anchor="end" class="lbl-mono">nos</text>
+      <text x="10" y="134" class="lbl-b">commit stack 16칸</text>
+      <rect class="box-2" x="10" y="144" width="60" height="40" rx="4"/><text x="40" y="169" text-anchor="middle" class="lbl-mono">c0</text>
+      <rect class="box-2" x="74" y="144" width="60" height="40" rx="4"/><text x="104" y="169" text-anchor="middle" class="lbl-mono">c1</text>
+      <rect class="box-ok" x="138" y="144" width="60" height="40" rx="4"/><text x="168" y="169" text-anchor="middle" class="lbl-mono">c2 ×3</text>
+      <rect class="box-grey" x="202" y="144" width="60" height="40" rx="4"/><text x="232" y="169" text-anchor="middle" class="lbl-mono">...</text>
+      <text x="168" y="202" text-anchor="middle" class="lbl-dim">nsp (커밋 꼭대기)</text>
+      <rect class="box-warn" x="290" y="130" width="160" height="70" rx="8"/>
+      <text x="370" y="152" text-anchor="middle" class="lbl">return 예측:</text>
+      <text x="370" y="172" text-anchor="middle" class="lbl-mono">bos ≤ tosr &lt; tosw 이면</text>
+      <text x="370" y="190" text-anchor="middle" class="lbl-mono">queue, 아니면 stack</text>
+      <text x="230" y="236" text-anchor="middle" class="lbl-dim">커밋되면 queue 항목이 stack으로 옮겨지고 bos가 앞으로 간다</text>
+    </svg>
+    <figcaption>추측 push는 queue에만 쌓인다. 꼭대기가 queue의 살아 있는 구간에 있으면 queue에서, 아니면 commit stack에서 읽는다. 근거 ras/RasStack.scala:67-132.</figcaption>
+  </figure>
+  <p>call의 복귀 주소는 블록 시작 PC(정렬) + <code>cfiPosition·2</code> + 2다(Ras.scala:73). 위치가 명령 끝 2바이트를 가리키므로 +2가 다음 명령이다(Ras.scala:102의 주석 "Redirected branch PC points to end of instruction").</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-R1 · spec push/pop</span><h4>s3에서 추측으로 push, pop</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s3 예측의 첫 taken 분기가 call이면 push, return이면 pop. 단 queue가 거의 찼으면(<code>tosw - bos &gt; 30</code>) 둘 다 하지 않는다. push는 <code>tosr = tosw, tosw++</code>, 새 항목의 nos는 옛 tosr. 꼭대기와 같은 주소이고 카운터가 7 미만이면 sctr만 +1, 아니면 ssp+1, sctr=0. pop은 tosr을 nos로 옮기고, sctr&gt;0이면 sctr-1, 아니면 ssp-1.</dd>
+      <dt>이유</dt><dd class="why">queue는 커밋을 기다리는 동안만 항목을 지키면 된다. 꽉 차면 아직 커밋 안 된 항목을 덮어 복구가 불가능해지므로 미리 멈춘다.</dd>
+      <dt>없으면</dt><dd>복구에 필요한 항목이 덮여 잘못된 경로 이후 복귀 주소가 전부 틀린다.</dd>
+      <dt>근거</dt><dd class="src"><a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/ras/Ras.scala#L66" target="_blank">src/main/scala/xiangshan/frontend/bpu/ras/Ras.scala:66-74@09453ff8</a>, ras/RasStack.scala:134-171, 416-422</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-R2 · redirect</span><h4>틀린 경로에서 돌아오기</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">백엔드 redirect가 오면 한 사이클 늦춰, 그 분기를 예측할 때 저장한 <code>tosr, tosw, ssp, sctr</code>를 되살린다. 그 분기가 call이었으면 다시 push(주소 = cfiPc + 2), return이었으면 저장된 nos로 다시 pop한다. queue가 거의 찬 상태면 redirect의 tosw가 현재보다 앞설 때만 받는다.</dd>
+      <dt>이유</dt><dd class="why">포인터만 되돌리면 틀린 경로가 쓴 항목은 tosw 밖으로 밀려 자연히 무시된다. 지울 필요가 없다.</dd>
+      <dt>없으면</dt><dd>틀린 경로의 call이 스택에 남아 이후 모든 return이 한 칸씩 어긋난다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/ras/Ras.scala:92-103, ras/RasStack.scala:389-414@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G-R3 · commit</span><h4>커밋된 call/return만 stack에 반영</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">커밋 정보는 한 사이클 늦게 들어온다. call 커밋: 꼭대기와 주소가 같고 카운터&lt;7이면 카운터+1, 아니면 nsp+1 칸에 <code>{queue[metaTosw].주소, 0}</code>을 쓴다. 그리고 bos = metaTosw. return 커밋: 카운터&gt;0이면 -1, 아니면 nsp-1. nsp가 예측 때의 ssp와 다르면 먼저 ssp로 맞춘다.</dd>
+      <dt>이유</dt><dd class="why">커밋된 것은 다시 되돌릴 일이 없으니 작은 stack에 압축해 두고, queue 칸은 비운다.</dd>
+      <dt>없으면</dt><dd>queue가 금세 차서 G-R1이 push를 멈춘다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/ras/Ras.scala:105-113, ras/RasStack.scala:335-382@09453ff8. 관련 XSError 검사는 주석 처리돼 있다(:351, 374, 383-387).</dd>
+    </dl>
+  </div>
+  <p>s1에도 작은 복사본 <code>MicroRas</code>가 있다. s1이 return을 만나면 s2, s3에서 진행 중인 push/pop을 보고 꼭대기를 짐작한다. 예를 들어 s2에서 call이 진행 중이면 그 call의 복귀 주소를 쓴다. 짐작할 수 없는 조합(s2에서 pop이 진행 중 등)이면 <code>isCanUse = 0</code>으로 두고 쓰지 않는다(MicroRas.scala:153-246). 쓸 수 있으면 uBTB/aBTB 타깃을 uRAS 주소로 바꾼다(Bpu.scala:550-558).</p>
+  <div class="callout decision"><strong>2026-01-29 s1에서도 복귀 주소를 예측 (#5366)</strong><p>커밋 8bc33bbbb "feat(ras): differentiate return address predictions in S1"이 MicroRas를 도입했다. 커밋 본문은 비어 있다. 이전에는 s1이 BTB에 기록된 옛 타깃을 썼고, 호출한 곳이 다르면 s3에서 override됐을 것이다(추론: 제목과 코드 구조에서 읽은 것).</p></div>
+  <div class="callout warn"><strong>깊이 17 이상의 재귀 아닌 호출 (추론)</strong><p>commit stack은 16칸 원형이고 nsp/ssp는 4비트라 넘치면 돌아 감는다(ras/Helpers.scala:22-23). 서로 다른 주소로 17번 넘게 호출이 커밋되면 가장 오래된 칸이 덮여, 깊이 17 이상의 return은 틀린 주소를 낸다(추론: 아래 시뮬레이터가 이 규칙을 그대로 돌린 결과이며, 하드웨어 실측은 하지 않았다).</p></div>
+
+  <div class="sim" id="sim-ras">
+    <div class="sim-head"><span class="sim-tag anim">ANIMATION</span><h3>RAS 상태 기계</h3></div>
+    <div class="sim-body">
+      <div class="btn-row"><button class="btn primary" id="ras-callA">call (같은 곳)</button><button class="btn" id="ras-callN">call (새 곳)</button><button class="btn" id="ras-ret">return</button><button class="btn" id="ras-commit">모두 커밋</button></div>
+      <div class="btn-row"><button class="btn" id="ras-mark">분기 예측(체크포인트)</button><button class="btn" id="ras-redir">redirect 회복</button><button class="btn" id="ras-reset">처음으로</button></div>
+      <div class="ras-pad">
+        <div class="ras-lab">speculative queue (위 테두리 = bos, 아래 줄 = tosw, 강조 = tosr)</div>
+        <div class="ras-row" id="ras-q0"></div><div class="ras-row" id="ras-q1"></div>
+        <div class="ras-lab">commit stack (강조 = nsp, 아래 줄 = ssp)</div>
+        <div class="ras-row" id="ras-cs"></div>
+      </div>
+      <div class="verdict grey" id="ras-verdict">대기</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">tosr / tosw / bos</span><span class="v" id="ras-ptr">-</span></div>
+      <div class="stat"><span class="k">ssp·sctr / nsp</span><span class="v" id="ras-sp">-</span></div>
+      <div class="stat"><span class="k">다음 return 예측 / 정답</span><span class="v acc" id="ras-top">-</span></div>
+      <div class="stat"><span class="k">return 적중</span><span class="v" id="ras-hit">-</span></div>
+    </div>
+    <div class="sim-note">G-R1~G-R3를 실제 크기(queue 32, stack 16, 카운터 3비트, nearOverflow &gt; 30)로 돌린다. 한 버튼이 한 사이클이고, 커밋과 redirect의 한 사이클 지연은 생략했다. 칸의 글자는 복귀 주소를 부른 call 번호, 숫자는 카운터다. ① "call (같은 곳)"을 10번 누르면 queue는 10칸을 쓰지만 ssp는 2, sctr은 1이다. 첫 call이 ssp를 1로 올리고, 이어지는 7번은 sctr만 올리며, sctr이 7에 닿은 뒤의 call이 ssp를 한 번 더 올린다. ② "call (새 곳)" 20번, "모두 커밋", return 20번을 해 보라. 16번 맞고 마지막 4번(깊이 17~20)이 틀린다. ③ 체크포인트 뒤에 call 몇 번 후 redirect를 누르면 tosw가 되돌아가 틀린 경로의 칸이 회색이 된다. 커밋 없이 call을 31번 넘게 누르면 nearOverflow로 push가 멈춘다. 7절.</div>
+  </div>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ul>
+    <li>방향 예측의 단위는 포화 카운터다. TAGE는 3비트를 쓰고, 0/7(포화), 1·2·5·6(mid), 3·4(weak) 등급이 선택과 SC 문턱에 쓰인다.</li>
+    <li>TAGE는 PHR을 4~397비트 8가지 길이로 접어 동시에 찾고, 적중한 가장 긴 표(provider)를 믿되 막 들어온 weak 항목이면 표별 useAltOnNa가 alt를 고른다.</li>
+    <li>틀리면 provider보다 긴 표에 LFSR로 섞되 짧은 표 쪽으로 할당한다. useful은 올라가기만 하고, 자리가 없을 때 255번 쌓이면 전부 지운다.</li>
+    <li>SC는 8개 표의 2c+1을 더해, TAGE 신뢰도별 문턱 thr&gt;&gt;4/5/6을 넘을 때만 TAGE를 뒤집는다. s3 방향 우선순위는 SC &gt; TAGE &gt; mainBTB다.</li>
+    <li>ITTAGE는 타깃 하위 20비트만 항목에 두고 상위는 16칸 region 표로 공유한다. RAS는 32칸 추측 queue와 16칸 commit stack으로 나눠, redirect 때 포인터만 되돌린다.</li>
+  </ul>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="2">
+    <div class="q">TAGE provider 카운터가 4이고, 해당 useAltOnNa 카운터가 20, alt 표가 적중해 alt 카운터가 1이다. TAGE의 예측은?</div>
+    <div class="opts"><button>taken. provider가 있으면 항상 provider를 쓴다</button><button>예측 무효. weak provider는 버린다</button><button>not-taken. alt를 쓴다</button><button>taken. alt가 weak가 아니므로 provider를 쓴다</button></div>
+    <div class="explain">4는 weak이고 20 ≥ 16이라 useAltOnNa가 양수이므로 useProvider는 거짓이다. alt가 있으니 TAGE는 유효하고 alt 카운터 1(MSB 0)로 not-taken이다. 1번은 G-T1의 예외를 무시했다. 2번은 alt가 없을 때의 경우다. 4번은 altConf가 선택기 인덱스에만 쓰이고 provider 사용 여부를 직접 정하지 않는다는 점을 놓쳤다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">TAGE provider 카운터가 7, SC 문턱 thr이 1130, SC 합이 −50이다. 최종 방향은?</div>
+    <div class="opts"><button>not-taken. SC 합이 음수다</button><button>taken. 문턱 70을 넘지 못해 SC를 쓰지 않는다</button><button>not-taken. 문턱 17을 넘었다</button></div>
+    <div class="explain">카운터 7은 포화라 문턱은 1130&gt;&gt;4 = 70이다. |−50| = 50 &lt; 70이므로 useSc가 거짓이고 TAGE의 taken이 남는다. 1번은 문턱을 무시했다. 3번의 17은 weak(3·4)일 때의 문턱 1130&gt;&gt;6이다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">잘못된 경로에서 call이 3번 추측 push된 뒤 redirect가 왔다. RAS는 그 세 항목을 어떻게 처리하나?</div>
+    <div class="opts"><button>지우지 않는다. tosw를 되돌리면 그 칸들은 살아 있는 구간 밖이 된다</button><button>commit stack에서 세 칸을 pop한다</button><button>queue 전체를 비운다</button></div>
+    <div class="explain">G-R2는 tosr, tosw, ssp, sctr만 되살린다. 꼭대기 판정은 bos ≤ tosr &lt; tosw일 때만 queue를 보므로 tosw 밖의 칸은 무시된다. 2번: 추측 push는 commit stack에 쓰지 않는다(G-R3는 커밋 때만 쓴다). 3번: 맞는 경로에서 아직 커밋 안 된 항목까지 잃게 된다.</div>
+  </div>
+  <div class="quiz" data-answer="3">
+    <div class="q">TAGE가 틀려 할당하려는데 provider가 T2다. 할당 후보가 될 수 있는 표는?</div>
+    <div class="opts"><button>T0~T7 전부</button><button>T0, T1 (짧은 표가 빨리 배운다)</button><button>항상 T3 하나</button><button>T3~T7 중 무효 또는 useful=0 way가 있는 표</button></div>
+    <div class="explain">G-T4는 provider보다 긴 표만 후보로 삼고, 그중 무효, weak이고 useful=0, useful=0 순으로 way를 찾는다. 1번은 provider가 없을 때의 경우다. 2번은 더 짧은 표라 같은 혼동을 반복한다. 3번: 짧은 쪽 편향은 있지만 LFSR이 T3를 걸러 내면 T4 이상이 될 수 있다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08.</p>
+
+</main>
+</div>
+<script src="assets/ch03-a.js"></script>
+<script src="assets/ch03-b.js"></script>
+<script src="assets/ch03-c.js"></script>
+</body>
+</html>

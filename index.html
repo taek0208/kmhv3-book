@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book: 쿤밍후 v3 코어</title>
+<meta name="description" content="XiangShan Kunminghu v3 RISC-V 비순차 코어를 처음 배우는 사람을 위한 인터랙티브 교과서">
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+</head>
+<body data-chapter="index">
+<div class="page">
+<main class="chapter cover-page">
+
+<div class="cover split">
+  <div>
+    <div class="eyebrow">XiangShan · Kunminghu v3 · Interactive textbook</div>
+    <h1>CPU를 처음 여는 사람을 위한<br><em>쿤밍후 v3 코어 교과서</em></h1>
+    <p class="lead">XiangShan 쿤밍후 v3(KMHv3)는 한 사이클에 명령어 8개를 해석하고, 352개를 동시에 처리 중으로 붙잡아 두는 RISC-V 비순차 코어다.
+      이 책은 파이프라인이 무엇인지 모르는 사람이 <strong>Chisel 코드의 실제 규칙과 상수</strong>를 직접 움직여 보며 그 구조를 따라가도록 쓰였다.</p>
+    <div class="cta"><a class="primary" href="ch01-overview.html">1장부터 시작하기 →</a><a href="#chapters">전체 챕터</a></div>
+    <div class="hero-badges"><span>13개 챕터</span><span>장마다 시뮬레이터 4개 이상</span><span>코드 줄 단위 근거</span><span>kunminghu-v3 @09453ff8</span></div>
+  </div>
+  <div class="cover-aside sim" id="sim-hero">
+    <canvas id="hero-cv"></canvas>
+    <div class="aside-ctl">
+      <div class="row">
+        <div class="ctl"><label>분기 예측 실패 / 1000명령 <output data-for="bm" data-fmt="f1"></output></label>
+          <input type="range" data-k="bm" min="0" max="20" step="0.5" value="4"></div>
+        <div class="ctl"><label>메모리까지 가는 미스 / 1000명령 <output data-for="mm" data-fmt="f1"></output></label>
+          <input type="range" data-k="mm" min="0" max="20" step="0.5" value="1"></div>
+      </div>
+      <div class="row">
+        <div class="ctl"><label>메모리 지연(사이클) <output data-for="lat" data-fmt="int"></output></label>
+          <input type="range" data-k="lat" min="50" max="400" step="10" value="200"></div>
+        <div class="ctl"><label>미스 겹침 정도(MLP) <output data-for="mlp" data-fmt="f1"></output></label>
+          <input type="range" data-k="mlp" min="1" max="8" step="0.5" value="2"></div>
+      </div>
+      <output class="cap" id="hero-cap">-</output>
+    </div>
+  </div>
+</div>
+
+<div class="part-head"><h2>숫자로 보는 KMHv3</h2><span>책을 끝내면 아래 숫자가 코드 어디에서 나오고 왜 그 크기인지 설명할 수 있게 된다. 모두 DefaultConfig 기준.</span></div>
+<div class="stat-strip">
+  <div class="stat"><b>8</b><span>디코드·리네임·커밋 폭. 한 사이클 최대 8개 (Parameters.scala:81-84)</span></div>
+  <div class="stat"><b>352</b><span>ROB 항목 수. 동시에 날아다니는 명령어 상한 (Parameters.scala:114)</span></div>
+  <div class="stat"><b>224</b><span>정수 물리 레지스터. 아키텍처 레지스터 32개 뒤에서 이름을 바꿔 붙인다 (Parameters.scala:121-126)</span></div>
+  <div class="stat"><b>64B</b><span>한 번에 예측·인출하는 fetch block 크기 (2장, 4장)</span></div>
+  <div class="stat"><b>64KB</b><span>L1 명령어 캐시와 L1 데이터 캐시 각각 (icache/Parameters.scala:29-38, Configs.scala:587)</span></div>
+  <div class="stat"><b>2MB</b><span>코어마다 붙은 L2 캐시, 4뱅크 8웨이 (Configs.scala:586)</span></div>
+</div>
+
+<div class="part-head"><h2>읽는 순서</h2><span>명령어가 코어를 지나는 순서 그대로 읽는다. 앞에서 뒤로, 그리고 마지막에 전체를 함께 돌린다.</span></div>
+<div class="flow-grid">
+  <div class="flow-card"><b>지도 · 1장</b>파이프라인, 슈퍼스칼라, 비순차 실행을 처음부터. 그리고 KMHv3의 큰 그림.</div>
+  <div class="flow-card"><b>예측 · 2-3장</b>다음에 어디로 갈지 미리 맞힌다. BTB, TAGE, SC, ITTAGE, RAS.</div>
+  <div class="flow-card"><b>인출 · 4장</b>예측한 주소에서 명령어 바이트를 가져와 경계를 자른다.</div>
+  <div class="flow-card"><b>준비 · 5-6장</b>디코드, 리네임, 디스패치, 이슈 큐에서 차례를 기다린다.</div>
+  <div class="flow-card"><b>실행 · 7장</b>레지스터를 읽고 ALU·곱셈기·나눗셈기에서 계산한다.</div>
+  <div class="flow-card"><b>마무리 · 8장</b>ROB가 순서대로 커밋하고, 틀린 예측은 되감는다.</div>
+  <div class="flow-card"><b>메모리 · 9-10장</b>로드·스토어 순서 문제와 캐시, TLB, 프리페처.</div>
+  <div class="flow-card"><b>확장과 실습 · 11-13장</b>벡터, 빌드와 검증, 그리고 통합 실험실.</div>
+</div>
+
+<div class="part-head"><h2>이어지는 케이스: 한 명령어의 시간표</h2><span>여러 장이 같은 질문을 한 칸씩 채운다. 명령어 하나가 인출에서 실행까지 몇 사이클을 쓰는가.</span></div>
+<div class="case">
+  <div>
+    <p><strong>정수 덧셈 하나, <code>add a0, a0, a1</code>.</strong> 분기 예측이 맞았고 캐시에 명령어가 있다고 하자.</p>
+    <p>4장은 인출 쪽 사이클을, 5-7장은 디코드부터 실행까지를, 8장은 예측이 틀렸을 때 되돌아가는 비용을 센다. 13장에서 이 시간표를 시뮬레이터로 직접 그린다.</p>
+    <p class="note">오른쪽 값은 코드의 파이프라인 레지스터 수를 세어 얻은 추정(추론)이다. 시뮬레이션으로 잰 값이 아니다. 근거는 13장.</p>
+  </div>
+  <div class="slip">
+    <div class="row"><span>BPU s0 → 디코드 입구 (리다이렉트 직후)</span><span>약 8 cyc</span></div>
+    <div class="row"><span>디코드 → 리네임 → 디스패치</span><span>2 cyc</span></div>
+    <div class="row"><span>디스패치 → 가장 이른 선택(select)</span><span>1 cyc</span></div>
+    <div class="row"><span>선택 → OG0 → OG1 → EX</span><span>3 cyc</span></div>
+    <div class="row"><span>분기 예측 실패 시 추가 비용</span><span class="minus">약 +16 cyc</span></div>
+    <div class="row total"><span>정상 경로, 인출 시작부터 실행까지</span><span>약 14 cyc</span></div>
+  </div>
+</div>
+
+<div class="cta-band">
+  <div><h2>통합 실험실</h2><p>책 전체의 규칙을 한 화면에서 함께 돌려 본다. 명령어 순서를 고르고, 의존성과 캐시 미스와 분기 예측 실패가 파이프라인 표를 어떻게 바꾸는지 본다.</p></div>
+  <a href="ch13-lab.html">실험실 열기 →</a>
+</div>
+
+<div class="part-head" id="chapters"><h2>전체 챕터</h2><span>장마다 질문 → 그림 → 원리 → 규칙 카드 → 시뮬레이터 → 퀴즈 순서로 읽는다.</span></div>
+<div class="ch-grid">
+  <a class="ch-card" href="ch01-overview.html"><span class="num">Chapter 01</span><h3>CPU 기초와 KMHv3 지도</h3><p>파이프라인, 슈퍼스칼라, 비순차 실행, 그리고 XSCore의 세 부분.</p><span class="tags"><span class="hot">블록 지도</span><span>파라미터 표</span></span></a>
+  <a class="ch-card" href="ch02-bpu.html"><span class="num">Chapter 02</span><h3>분기 예측 I: BPU와 BTB</h3><p>s1·s2·s3 세 단계 예측과 덮어쓰기 버블, uBTB·aBTB·MainBTB.</p><span class="tags"><span class="hot">BTB 조회</span><span>override</span></span></a>
+  <a class="ch-card" href="ch03-predictors.html"><span class="num">Chapter 03</span><h3>분기 예측 II: TAGE·SC·ITTAGE·RAS</h3><p>방향은 TAGE와 SC가, 간접 점프 목표는 ITTAGE가, 복귀 주소는 RAS가 맞힌다.</p><span class="tags"><span class="hot">TAGE 실험</span><span>RAS</span></span></a>
+  <a class="ch-card" href="ch04-fetch.html"><span class="num">Chapter 04</span><h3>명령어 인출: FTQ·ICache·IFU</h3><p>예측기가 앞서 달리고 FTQ가 그 사이를 잇는 분리형 프런트엔드.</p><span class="tags"><span class="hot">명령어 경계</span><span>ICache</span></span></a>
+  <a class="ch-card" href="ch05-decode-rename.html"><span class="num">Chapter 05</span><h3>디코드와 리네임</h3><p>마이크로 연산으로 쪼개고, 가짜 의존성을 물리 레지스터로 없앤다.</p><span class="tags"><span class="hot">RAT 스테퍼</span><span>퓨전</span></span></a>
+  <a class="ch-card" href="ch06-dispatch-issue.html"><span class="num">Chapter 06</span><h3>디스패치와 이슈 큐</h3><p>13개 정수 이슈 큐, 깨우기-선택 루프, 로드 미스 취소.</p><span class="tags"><span class="hot">wakeup</span><span>age</span></span></a>
+  <a class="ch-card" href="ch07-execute.html"><span class="num">Chapter 07</span><h3>데이터패스와 실행 유닛</h3><p>레지스터 파일 포트, 바이패스, 레지스터 캐시, FU 지연 시간.</p><span class="tags"><span class="hot">바이패스</span><span>SRT16</span></span></a>
+  <a class="ch-card" href="ch08-rob-redirect.html"><span class="num">Chapter 08</span><h3>ROB, 커밋, 리다이렉트</h3><p>순서대로 끝내는 이유, 플러시와 walk, 예외와 인터럽트.</p><span class="tags"><span class="hot">ROB 링</span><span>정밀 예외</span></span></a>
+  <a class="ch-card" href="ch09-loadstore.html"><span class="num">Chapter 09</span><h3>로드·스토어와 LSQ</h3><p>스토어-로드 포워딩, 순서 위반 검출, 13가지 리플레이 원인.</p><span class="tags"><span class="hot">포워딩</span><span>StoreSet</span></span></a>
+  <a class="ch-card" href="ch10-cache-mmu.html"><span class="num">Chapter 10</span><h3>캐시, TLB, 프리페처</h3><p>주소를 tag·index·offset으로 자르고, 페이지 테이블을 걷는다.</p><span class="tags"><span class="hot">주소 분해</span><span>Sv39</span></span></a>
+  <a class="ch-card" href="ch11-vector.html"><span class="num">Chapter 11</span><h3>벡터 확장(RVV)</h3><p>VLEN 128, SEW·LMUL·vl, 마이크로 연산 분할과 vtype 추측.</p><span class="tags"><span class="hot">vsetvli 계산기</span><span>개편 중</span></span></a>
+  <a class="ch-card" href="ch12-verify.html"><span class="num">Chapter 12</span><h3>빌드·시뮬레이션·검증</h3><p>Chisel에서 Verilog까지, difftest 동시 실행, TopDown 정체 원인 분석.</p><span class="tags"><span class="hot">difftest</span><span>TopDown</span></span></a>
+  <a class="ch-card" href="ch13-lab.html"><span class="num">Chapter 13</span><h3>통합 실험실: 한 명령어의 일생</h3><p>모든 장의 규칙을 묶은 단순화 파이프라인 시뮬레이터.</p><span class="tags"><span class="hot">파이프라인 표</span><span>ROB 가득 참</span></span></a>
+</div>
+
+<p class="footnote">근거 기준: XiangShan <code>kunminghu-v3</code> 브랜치 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08. 이 책은 OpenXiangShan의 공식 문서가 아니며, 코드를 읽어 정리한 학습 자료다.
+  표지 시뮬레이터의 CPI 모델은 단순 모델이다: 이상 CPI = 1/8(커밋 폭), 분기 실패 페널티 16사이클(13장의 추정), 메모리 미스는 지연/MLP만큼 더한다.</p>
+
+</main>
+</div>
+<script src="assets/index.js"></script>
+</body>
+</html>

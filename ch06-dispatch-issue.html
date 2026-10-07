@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 6장: 디스패치와 이슈 큐</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+.dom { padding: 14px 16px; min-width: 0; }
+.cg-wrap { overflow-x: auto; max-width: 100%; }
+.cg { border-collapse: collapse; font: 600 11px var(--mono); }
+.cg th, .cg td { border: 1px solid var(--border); min-width: 26px; height: 26px; text-align: center; padding: 0 3px; white-space: nowrap; }
+.cg th { color: var(--text-dim); background: var(--surface); }
+.cg th.rl { text-align: left; min-width: 70px; }
+.cg .s { background: var(--accent-soft); color: var(--accent); }
+.cg .w { background: var(--ok-soft); color: var(--ok); }
+.cg .x { background: var(--bad-soft); color: var(--bad); }
+.cg .f { color: var(--text-faint); }
+.cg .now { box-shadow: inset 0 0 0 2px var(--accent-2); }
+.tier { font-size: 12px; color: var(--text-dim); margin: 10px 0 4px; }
+.slots { display: flex; flex-wrap: wrap; gap: 4px; }
+.slot { width: 34px; height: 28px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); font: 600 11px/26px var(--mono); text-align: center; color: var(--text-faint); }
+.slot.rd { background: var(--ok-soft); color: var(--ok); border-color: var(--ok); }
+.slot.wt { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+.slot.is { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+</style>
+</head>
+<body data-chapter="ch06">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 06</div>
+  <h1>디스패치와 이슈 큐</h1>
+  <p class="lead"><a href="ch05-decode-rename.html">5장</a>에서 이름을 바꾼 uop는 아직 실행되지 않는다. 먼저 어느 실행 유닛의 줄에 설지 정하고, 그 줄에서 피연산자가 준비되기를 기다렸다가 <strong>준비된 것 가운데 가장 오래된 것</strong>부터 출발한다. 이 장은 이 두 결정, 디스패치와 이슈를 코드 위치와 함께 따라간다. 이 장에서는 정수 영역(<code>intRegion</code>)의 디스패치와 <code>backend/issue</code> 이슈 큐만 다루고, 레지스터 읽기(OG0/OG1)와 바이패스는 <a href="ch07-execute.html">7장</a>, 로드 파이프 내부는 <a href="ch09-loadstore.html">9장</a>으로 넘긴다.</p>
+  <ul class="objectives">
+    <li>디스패치와 이슈가 각각 무엇을 정하는지 식당 비유로 설명할 수 있다.</li>
+    <li>디스패치가 uop를 붙잡는 네 가지 조건을 코드 위치와 함께 말할 수 있다.</li>
+    <li>웨이크업이 도착하는 사이클과 소비자가 선택되는 사이클을 계산할 수 있다.</li>
+    <li>에이지 매트릭스에서 가장 오래된 준비 uop를 찾을 수 있다.</li>
+    <li>enq·simp·comp 세 층의 이동 규칙과 enq.ready 백프레셔를 설명할 수 있다.</li>
+    <li>로드 miss 때 어떤 uop가 취소되는지 loadDependency 비트로 예측할 수 있다.</li>
+  </ul>
+</div>
+
+<section id="s1">
+  <h2>디스패치와 이슈: 웨이터와 요리사</h2>
+  <p>리네임은 한 사이클에 uop를 최대 8개 내보낸다(<code>RenameWidth = 8</code>, Parameters.scala:82). 이 uop들은 쓰는 실행 유닛이 다르고, 피연산자가 준비된 시점도 다르다. 모두를 한 줄에 세워 순서대로 내보내면 맨 앞 uop 하나가 피연산자를 기다리는 동안 뒤의 준비된 uop까지 모두 멈춘다. 그래서 비순차 코어는 결정을 둘로 나눈다.</p>
+  <p>식당으로 그려 보자. 웨이터는 주문서를 받으면 그릴, 튀김, 음료 가운데 <em>어느 스테이션의 꽂이</em>에 꽂을지만 정한다. 이것이 <span class="term" data-def="리네임된 uop를 실행 유닛 종류에 맞는 이슈 큐에 넣는 단계. 순서대로 들어오고 큐 자리가 없으면 멈춘다.">디스패치<span class="en">(dispatch)</span></span>다. 스테이션의 요리사는 꽂이의 주문서 가운데 재료가 다 도착한 것을 골라, 그중 가장 먼저 들어온 주문부터 조리한다. 이것이 <span class="term" data-def="이슈 큐에서 피연산자가 준비된 uop를 골라 실행 유닛으로 내보내는 일. KMHv3에서는 준비된 것 중 가장 오래된 것을 고른다.">이슈<span class="en">(issue)</span></span>다. 재료가 도착했다는 알림이 <span class="term" data-def="생산자 uop가 결과를 곧 낼 것이라고 대기 중인 소비자에게 물리 레지스터 번호로 알리는 신호.">웨이크업<span class="en">(wakeup)</span></span>이고, 꽂이가 <span class="term" data-def="실행을 기다리는 uop를 담는 칸 묶음. KMHv3 정수 영역에는 13개가 있다.">이슈 큐<span class="en">(issue queue, IQ)</span></span>다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 236" role="img" aria-label="식당과 KMHv3 파이프라인 대응">
+      <defs><marker id="f61-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="8" y="16" class="lbl-dim">식당</text>
+      <rect class="box-user" x="8" y="24" width="96" height="56" rx="10"/><text x="56" y="48" text-anchor="middle" class="lbl-b">손님 주문</text><text x="56" y="68" text-anchor="middle" class="lbl-dim">주문서 묶음</text>
+      <rect class="box-user" x="124" y="24" width="96" height="56" rx="10"/><text x="172" y="48" text-anchor="middle" class="lbl-b">웨이터</text><text x="172" y="68" text-anchor="middle" class="lbl-dim">꽂이 고르기</text>
+      <rect class="box-user" x="240" y="24" width="96" height="56" rx="10"/><text x="288" y="48" text-anchor="middle" class="lbl-b">주문서 꽂이</text><text x="288" y="68" text-anchor="middle" class="lbl-dim">재료 기다림</text>
+      <rect class="box-user" x="356" y="24" width="96" height="56" rx="10"/><text x="404" y="48" text-anchor="middle" class="lbl-b">요리사</text><text x="404" y="68" text-anchor="middle" class="lbl-dim">오래된 것부터</text>
+      <line class="ln" x1="104" y1="52" x2="122" y2="52" marker-end="url(#f61-a)"/><line class="ln" x1="220" y1="52" x2="238" y2="52" marker-end="url(#f61-a)"/><line class="ln" x1="336" y1="52" x2="354" y2="52" marker-end="url(#f61-a)"/>
+      <line class="ln-dash" x1="56" y1="82" x2="56" y2="124"/><line class="ln-dash" x1="172" y1="82" x2="172" y2="124"/><line class="ln-dash" x1="288" y1="82" x2="288" y2="124"/><line class="ln-dash" x1="404" y1="82" x2="404" y2="124"/>
+      <text x="8" y="120" class="lbl-dim">KMHv3</text>
+      <rect class="box-acc" x="8" y="126" width="96" height="56" rx="10"/><text x="56" y="150" text-anchor="middle" class="lbl-b">Rename</text><text x="56" y="170" text-anchor="middle" class="lbl-mono">8 uop/사이클</text>
+      <rect class="box-acc" x="124" y="126" width="96" height="56" rx="10"/><text x="172" y="150" text-anchor="middle" class="lbl-b">Dispatch</text><text x="172" y="170" text-anchor="middle" class="lbl-mono">IQ 고르기</text>
+      <rect class="box-2" x="240" y="126" width="96" height="56" rx="10"/><text x="288" y="150" text-anchor="middle" class="lbl-b">이슈 큐</text><text x="288" y="170" text-anchor="middle" class="lbl-mono">srcState</text>
+      <rect class="box-2" x="356" y="126" width="96" height="56" rx="10"/><text x="404" y="150" text-anchor="middle" class="lbl-b">Select</text><text x="404" y="170" text-anchor="middle" class="lbl-mono">→ OG0·OG1·EX</text>
+      <line class="ln" x1="104" y1="154" x2="122" y2="154" marker-end="url(#f61-a)"/><line class="ln" x1="220" y1="154" x2="238" y2="154" marker-end="url(#f61-a)"/><line class="ln" x1="336" y1="154" x2="354" y2="154" marker-end="url(#f61-a)"/>
+      <path class="ln-acc" d="M404,184 C404,222 288,222 288,186" fill="none" marker-end="url(#f61-a)"/>
+      <text x="346" y="230" text-anchor="middle" class="lbl-acc">웨이크업</text>
+    </svg>
+    <figcaption>위는 식당, 아래는 KMHv3다. 디스패치는 어느 줄에 설지만 정하고, 언제 출발할지는 이슈 큐가 웨이크업을 보고 정한다.</figcaption>
+  </figure>
+
+  <p>KMHv3 정수 영역에는 이슈 큐가 13개 있다(Parameters.scala:341-453). ALU 큐 여섯, 로드 주소 큐 셋, 스토어 주소(STA) 둘, 스토어 데이터(STD) 둘이다. 모든 큐의 입구(enq 포트)는 2개다. ALU0~2 큐에는 분기 유닛(BJU)이 함께 붙어 출구가 둘이다. 칸 수를 모두 더하면 238칸이다(18×3 + 20×3 + 20×3 + 16×2 + 16×2).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="정수 영역 이슈 큐 13개">
+      <text x="230" y="16" text-anchor="middle" class="lbl-b">intRegion 이슈 큐 13개 · 238칸</text>
+      <rect class="box-acc" x="4" y="28" width="70" height="76" rx="8"/><text x="39" y="50" text-anchor="middle" class="lbl-b">ALU0</text><text x="39" y="68" text-anchor="middle" class="lbl-mono">+BJU0</text><text x="39" y="92" text-anchor="middle" class="lbl-acc">18</text>
+      <rect class="box-acc" x="80" y="28" width="70" height="76" rx="8"/><text x="115" y="50" text-anchor="middle" class="lbl-b">ALU1</text><text x="115" y="68" text-anchor="middle" class="lbl-mono">+BJU1</text><text x="115" y="92" text-anchor="middle" class="lbl-acc">18</text>
+      <rect class="box-acc" x="156" y="28" width="70" height="76" rx="8"/><text x="191" y="50" text-anchor="middle" class="lbl-b">ALU2</text><text x="191" y="68" text-anchor="middle" class="lbl-mono">+BJU2</text><text x="191" y="92" text-anchor="middle" class="lbl-acc">18</text>
+      <rect class="box-acc" x="232" y="28" width="70" height="76" rx="8"/><text x="267" y="50" text-anchor="middle" class="lbl-b">ALU3</text><text x="267" y="68" text-anchor="middle" class="lbl-mono">Bku·VSet</text><text x="267" y="92" text-anchor="middle" class="lbl-acc">20</text>
+      <rect class="box-acc" x="308" y="28" width="70" height="76" rx="8"/><text x="343" y="50" text-anchor="middle" class="lbl-b">ALU4</text><text x="343" y="68" text-anchor="middle" class="lbl-mono">Mul</text><text x="343" y="92" text-anchor="middle" class="lbl-acc">20</text>
+      <rect class="box-acc" x="384" y="28" width="70" height="76" rx="8"/><text x="419" y="50" text-anchor="middle" class="lbl-b">ALU5</text><text x="419" y="68" text-anchor="middle" class="lbl-mono">Mul</text><text x="419" y="92" text-anchor="middle" class="lbl-acc">20</text>
+      <rect class="box-2" x="5" y="120" width="60" height="76" rx="8"/><text x="35" y="142" text-anchor="middle" class="lbl-b">LDU0</text><text x="35" y="160" text-anchor="middle" class="lbl-mono">load</text><text x="35" y="184" text-anchor="middle" class="lbl-acc2">20</text>
+      <rect class="box-2" x="70" y="120" width="60" height="76" rx="8"/><text x="100" y="142" text-anchor="middle" class="lbl-b">LDU1</text><text x="100" y="160" text-anchor="middle" class="lbl-mono">load</text><text x="100" y="184" text-anchor="middle" class="lbl-acc2">20</text>
+      <rect class="box-2" x="135" y="120" width="60" height="76" rx="8"/><text x="165" y="142" text-anchor="middle" class="lbl-b">LDU2</text><text x="165" y="160" text-anchor="middle" class="lbl-mono">load</text><text x="165" y="184" text-anchor="middle" class="lbl-acc2">20</text>
+      <rect class="box-grey" x="200" y="120" width="60" height="76" rx="8"/><text x="230" y="142" text-anchor="middle" class="lbl-b">STA0</text><text x="230" y="160" text-anchor="middle" class="lbl-mono">sta</text><text x="230" y="184" text-anchor="middle" class="lbl">16</text>
+      <rect class="box-grey" x="265" y="120" width="60" height="76" rx="8"/><text x="295" y="142" text-anchor="middle" class="lbl-b">STA1</text><text x="295" y="160" text-anchor="middle" class="lbl-mono">sta</text><text x="295" y="184" text-anchor="middle" class="lbl">16</text>
+      <rect class="box-grey" x="330" y="120" width="60" height="76" rx="8"/><text x="360" y="142" text-anchor="middle" class="lbl-b">STD0</text><text x="360" y="160" text-anchor="middle" class="lbl-mono">std</text><text x="360" y="184" text-anchor="middle" class="lbl">16</text>
+      <rect class="box-grey" x="395" y="120" width="60" height="76" rx="8"/><text x="425" y="142" text-anchor="middle" class="lbl-b">STD1</text><text x="425" y="160" text-anchor="middle" class="lbl-mono">std</text><text x="425" y="184" text-anchor="middle" class="lbl">16</text>
+      <text x="230" y="218" text-anchor="middle" class="lbl-dim">숫자 = 칸 수. 모든 큐의 입구는 2칸이다.</text>
+      <text x="230" y="240" text-anchor="middle" class="lbl-dim">fp·vec 영역의 큐는 별도 구현(FltIssueQueue·VecIssueQueue)</text>
+    </svg>
+    <figcaption>정수 영역 이슈 큐 13개. ALU0~2는 분기 유닛과 함께 18칸, 나머지 ALU와 로드 큐는 20칸, 스토어 큐는 16칸이다(Parameters.scala:344-445).</figcaption>
+  </figure>
+
+  <div class="callout warn"><strong>범위: 이 장의 이슈 큐는 정수 영역 것이다</strong>
+    <p>정수 영역은 <code>Region</code> 모듈이고(Backend.scala:193), 이 모듈만 <code>backend/issue</code>의 <code>IssueQueueImp</code>를 만든다(Region.scala:42-44). fp와 vec 영역은 <code>FltRegionModule</code>·<code>VecRegionModule</code>이고(Backend.scala:179-180), 각자 <code>FltIssueQueue</code>(FltIssueQueue.scala:26)와 <code>VecIssueQueue</code>(VecIssueQueue.scala:24)를 쓴다. 둘은 <code>backend/issue</code>에서 에이지 검출기(<code>AgeDetector</code>, <code>NewAgeDetector</code>)만 가져오고, 입구 정책 <code>EnqPolicy</code>는 파일 안에 따로 정의한다(FltIssueQueue.scala:882, VecIssueQueue.scala:1373). 이 장의 규칙을 fp·vec 큐에 그대로 옮기면 안 된다. fp 큐는 4개 20칸, vec 큐는 6개 16칸이다(Parameters.scala:454-551).</p></div>
+</section>
+
+<section id="s2">
+  <h2>디스패치: uop를 어느 큐에 넣는가</h2>
+  <p>ALU uop 하나가 갈 수 있는 큐는 ALU0~5 여섯 개다. 아무렇게나 고르면 한 큐는 넘치고 옆 큐는 비는 일이 생긴다. 넘친 큐는 디스패치를 막고, 막힌 uop 하나가 그룹 전체의 다음 진행을 붙잡는다. 디스패치는 그래서 <strong>덜 찬 큐부터</strong> 채운다.</p>
+  <ol class="steps">
+    <li><b>후보 큐 찾기</b> FU 종류마다 그 FU를 가진 큐 목록을 만든다. 후보가 여럿인 종류만 분산 대상이다(Dispatch.scala:65-95).</li>
+    <li><b>큐 정렬</b> 각 큐의 점유 수를 레지스터에 담아(<code>issueQueueCountReg</code>, Dispatch.scala:445) 쌍마다 비교한다. 적은 쪽이 앞이고, 같으면 <em>번호가 큰 큐</em>가 앞이다(<code>IQSort</code>, Dispatch.scala:457-468). 분산 최적화가 켜져 있으면(기본값) 이 순서를 3개씩 묶어 한 번 더 정렬한다(<code>IQSortUpdate</code>, :474-496). 이 재정렬도 동점이면 뒤쪽이 앞이라 묶음 안 순서가 뒤집힌다. 그래서 여섯 큐의 점유가 모두 같으면 최종 순서는 ALU3, ALU4, ALU5, ALU0, ALU1, ALU2다. 점유 수는 큐 전체가 아니라 출구 포트마다 센 값이다. 최적화가 켜지면 발행된 칸(최대 3)과 최종 응답을 뺀다(IssueQueue.scala:1028-1034). 출구가 둘인 ALU0~2에서 BJU 칸은 ALU 출구 수에 들어가지 않는다.</li>
+    <li><b>순번으로 배정</b> 한 그룹 안에서 같은 FU 종류의 k번째 uop는 정렬 순서 (k mod 큐 수)번째 큐로 간다(Dispatch.scala:499, 563-569).</li>
+    <li><b>입구 포트 배정</b> 한 큐로 가는 uop 가운데 i번째가 그 큐의 enq 포트 i로 간다(Dispatch.scala:613-617).</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 206" role="img" aria-label="그룹 안 순번에 따른 큐 배정">
+      <defs><marker id="f63-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker><marker id="f63-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+      <text x="230" y="14" text-anchor="middle" class="lbl-dim">한 그룹의 ALU uop 8개 (k = 같은 종류 안 순번)</text>
+      <g class="lbl-b" text-anchor="middle">
+      <rect class="box" x="5" y="22" width="50" height="40" rx="7"/><text x="30" y="47">u0</text>
+      <rect class="box" x="61" y="22" width="50" height="40" rx="7"/><text x="86" y="47">u1</text>
+      <rect class="box" x="117" y="22" width="50" height="40" rx="7"/><text x="142" y="47">u2</text>
+      <rect class="box" x="173" y="22" width="50" height="40" rx="7"/><text x="198" y="47">u3</text>
+      <rect class="box" x="229" y="22" width="50" height="40" rx="7"/><text x="254" y="47">u4</text>
+      <rect class="box" x="285" y="22" width="50" height="40" rx="7"/><text x="310" y="47">u5</text>
+      <rect class="box-acc" x="341" y="22" width="50" height="40" rx="7"/><text x="366" y="47">u6</text>
+      <rect class="box-acc" x="397" y="22" width="50" height="40" rx="7"/><text x="422" y="47">u7</text>
+      </g>
+      <line class="ln" x1="30" y1="62" x2="40" y2="126" marker-end="url(#f63-a)"/><line class="ln" x1="86" y1="62" x2="116" y2="126" marker-end="url(#f63-a)"/>
+      <line class="ln" x1="142" y1="62" x2="192" y2="126" marker-end="url(#f63-a)"/><line class="ln" x1="198" y1="62" x2="268" y2="126" marker-end="url(#f63-a)"/>
+      <line class="ln" x1="254" y1="62" x2="344" y2="126" marker-end="url(#f63-a)"/><line class="ln" x1="310" y1="62" x2="420" y2="126" marker-end="url(#f63-a)"/>
+      <line class="ln-acc" x1="366" y1="62" x2="50" y2="126" marker-end="url(#f63-b)"/><line class="ln-acc" x1="422" y1="62" x2="126" y2="126" marker-end="url(#f63-b)"/>
+      <rect class="box-ok" x="6" y="128" width="68" height="48" rx="8"/><text x="40" y="148" text-anchor="middle" class="lbl-mono">sort[0]</text><text x="40" y="167" text-anchor="middle" class="lbl">u0, u6</text>
+      <rect class="box-ok" x="82" y="128" width="68" height="48" rx="8"/><text x="116" y="148" text-anchor="middle" class="lbl-mono">sort[1]</text><text x="116" y="167" text-anchor="middle" class="lbl">u1, u7</text>
+      <rect class="box" x="158" y="128" width="68" height="48" rx="8"/><text x="192" y="148" text-anchor="middle" class="lbl-mono">sort[2]</text><text x="192" y="167" text-anchor="middle" class="lbl">u2</text>
+      <rect class="box" x="234" y="128" width="68" height="48" rx="8"/><text x="268" y="148" text-anchor="middle" class="lbl-mono">sort[3]</text><text x="268" y="167" text-anchor="middle" class="lbl">u3</text>
+      <rect class="box" x="310" y="128" width="68" height="48" rx="8"/><text x="344" y="148" text-anchor="middle" class="lbl-mono">sort[4]</text><text x="344" y="167" text-anchor="middle" class="lbl">u4</text>
+      <rect class="box-warn" x="386" y="128" width="68" height="48" rx="8"/><text x="420" y="148" text-anchor="middle" class="lbl-mono">sort[5]</text><text x="420" y="167" text-anchor="middle" class="lbl">u5</text>
+      <text x="230" y="198" text-anchor="middle" class="lbl-dim">왼쪽일수록 덜 찬 큐. 한 큐에 최대 2개(enq 포트 2)</text>
+    </svg>
+    <figcaption>ALU uop가 8개면 앞 6개는 정렬된 큐에 하나씩, 남은 2개는 가장 덜 찬 두 큐로 다시 돌아간다. 한 큐가 받는 수는 enq 포트 수 2를 넘지 않는다.</figcaption>
+  </figure>
+
+  <p>배정이 끝나도 바로 나가는 것은 아니다. 각 uop는 아래 네 관문을 통과해야 <code>fromRename(i).ready</code>가 켜진다(Dispatch.scala:597).</p>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">D1 · uopBlockByIQ</span><h4>한 큐에 한 사이클 최대 2개, 큐가 안 받으면 0개</h4><span class="actor code">Dispatch</span></div>
+    <dl><dt>조건</dt><dd class="cond">uop i마다, 슬롯 0~i 가운데 큐 j를 고른 uop 수를 센다(Dispatch.scala:584). 큐 j가 ready면 그 수 &gt; numEnq(2)일 때, ready가 아니면 1개라도 있을 때 막는다. 모든 큐에 대해 OR한다(:649). 수가 앞에서부터 누적되므로 한 uop가 막히면 <em>뒤 uop는 목표 큐와 상관없이</em> 모두 막힌다.</dd>
+    <dt>이유</dt><dd class="why">큐의 입구는 2칸뿐이다. 세 번째 uop는 들어갈 포트가 없다.</dd>
+    <dt>없으면</dt><dd>포트가 없는 uop가 ready를 받고 사라진다. 리네임은 보냈다고 믿고 큐에는 없는 uop가 생긴다. 누적으로 세지 않으면 뒤 uop가 앞 uop를 앞질러 큐에 들어간다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/dispatch/Dispatch.scala:584, 643-649@09453ff8</dd></dl></div>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">D2 · STA·STD 짝</span><h4>스토어는 주소 큐와 데이터 큐가 함께 받아야 들어간다</h4><span class="actor code">Region</span></div>
+    <dl><dt>조건</dt><dd class="cond">STA 큐 입구의 ready = <code>staReady &amp;&amp; stdReady &amp;&amp; vstdReady</code>. STD 큐 입력은 STA 입력을 복사해 만든다(std src0 = sta src1).</dd>
+    <dt>이유</dt><dd class="why">디스패치는 STD 큐를 따로 보지 않는다(Dispatch.scala:54-55에서 STD·VSTD 큐를 걸러 낸다). 스토어 한 개가 두 큐에 동시에 들어가야 주소와 데이터가 짝을 이룬다.</dd>
+    <dt>없으면</dt><dd>주소만 들어가고 데이터 칸이 없는 스토어가 생긴다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/Region.scala:276-303@09453ff8</dd></dl></div>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">D3 · allowDispatch</span><h4>LSQ 자리가 없으면 그 uop부터 뒤가 모두 멈춘다</h4><span class="actor code">Dispatch</span></div>
+    <dl><dt>조건</dt><dd class="cond">스토어는 <code>sqIdxEnd &gt; sqDeqIdx</code>, 로드는 <code>lqIdxEnd &gt; lqDeqIdx</code>여야 하고, 앞 uop의 <code>allowDispatch</code>도 참이어야 한다. 사슬이라 한 번 거짓이 되면 뒤의 모든 종류가 거짓이다.</dd>
+    <dt>이유</dt><dd class="why">로드·스토어 큐 번호는 리네임에서 미리 셌다. 큐 머리를 넘어서는 번호를 받은 uop는 아직 들어갈 칸이 없다.</dd>
+    <dt>없으면</dt><dd>LQ·SQ의 아직 비지 않은 칸을 덮어쓴다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/dispatch/Dispatch.scala:711-728@09453ff8</dd></dl></div>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">D4 · toRenameAllFire</span><h4>그룹이 다 나가야 다음 그룹을 받는다</h4><span class="actor code">PipeGroupConnect</span></div>
+    <dl><dt>조건</dt><dd class="cond">리네임→디스패치 그룹 레지스터는 <code>outAllFire || 비었음</code>일 때만 새 그룹을 받는다. <code>toRenameAllFire</code> = 모든 슬롯이 무효이거나 fire.</dd>
+    <dt>이유</dt><dd class="why">큐 배정(<code>uopSelIQ</code>)과 순번이 그룹 단위로 계산된다. 그룹이 섞이면 순번이 틀어진다.</dd>
+    <dt>없으면</dt><dd>앞 그룹의 막힌 uop와 새 그룹의 uop가 같은 enq 포트를 놓고 겹친다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/PipeGroupConnect.scala:136@09453ff8, Dispatch.scala:165@09453ff8</dd></dl></div>
+
+  <p>결과적으로 그룹 안의 uop는 <em>앞에서부터 이어진 묶음</em>으로만 나간다. D1의 누적 수, LSQ 사슬(D3), <code>blockBackward</code>(Dispatch.scala:876-879)와 <code>waitForward</code>(:862-866)가 모두 같은 방향으로 작동한다. 코드 주석도 "Instructions should enter issue queues in order."라고 적는다(:853). 남은 uop는 그룹 레지스터에 남고, 그동안 다음 그룹은 들어오지 못한다. 블록된 uop는 분산 최적화가 켜져 있으면 다음 사이클에 큐를 다시 고른다(Dispatch.scala:570-576).</p>
+
+  <div class="sim" id="sim-disp">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>ALU uop 분산: 막힌 uop가 큐를 다시 고르면</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="disp-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>그룹당 ALU uop <output data-for="n" data-fmt="int"></output></label>
+          <input type="range" data-k="n" min="1" max="8" step="1" value="6"></div>
+        <div class="ctl"><label>큐 소비 속도 차이 <output data-for="skew" data-fmt="f2"></output></label>
+          <input type="range" data-k="skew" min="0" max="0.8" step="0.1" value="0.5"></div>
+        <div class="seg" id="disp-mode"><button class="on">opt 켬</button><button>opt 끔</button><button>슬롯 고정(가상)</button></div>
+        <div class="verdict grey" id="disp-verdict">계산 중</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">디스패치 처리량</span><span class="v" id="disp-thr">0<small>uop/사이클</small></span></div>
+      <div class="stat"><span class="k">막힌 사이클</span><span class="v acc" id="disp-stall">0</span></div>
+      <div class="stat"><span class="k">평균 점유 차이(최대-최소)</span><span class="v" id="disp-spread">0</span></div>
+      <div class="stat"><span class="k">완료 그룹</span><span class="v" id="disp-groups">0</span></div>
+    </div>
+    <div class="sim-note">합성 데이터로 300사이클을 돌린다. 큐 크기 18·18·18·20·20·20, 두 단계 정렬(opt 켬은 3개 묶음 재정렬 포함), 큐당 2개 제한, 막힌 uop 뒤가 모두 막히는 규칙은 코드에서 가져왔다. 재정렬에 이번 그룹 배정 수를 더하는 보정과 출구별 점유 계산은 생략했다. 큐마다 사이클당 하나를 확률 p로 내보낸다(막대 위 숫자). 큐가 받는 조건은 "빈칸 2개 이상"으로 단순화했다(Dispatch.scala:956 주석). 점선은 그 한계다. "슬롯 고정"은 비교용 가상안이다. ① 소비 속도 차이 0.5에서 세 모드의 처리량을 비교해 보라. ② uop를 4개로 줄이면 opt 끔도 느린 큐를 피한다. 왜 그런지 생각해 보라(정렬 뒤 앞 4개만 쓴다). ③ 차이를 0으로 두면 세 모드가 비슷해진다. 규칙은 2절, 실제 enq.ready는 5절에서 다룬다.</div>
+  </div>
+
+  <div class="callout decision"><strong>2026-04-27 분산 최적화에 끄는 스위치 추가 (#5815)</strong>
+    <p>커밋 187b74c95 "feat(dispatch): add switch to disable dispatch balance opt (#5815)". 현재 값은 <code>EnableDispatchIQBalanceOpt = true</code>다(Parameters.scala:120). 꺼도 큐는 여전히 점유 수로 정렬된다(<code>IQSort</code>, Dispatch.scala:499). 꺼지는 것은 이번 사이클 배정 수를 더하는 보정(<code>needAppendIQValidNumVec</code>, :434-444), 3개씩 묶은 재정렬(<code>IQSortUpdate</code>, :474-496), 막힌 uop의 재배정(:570)이다.</p></div>
+</section>
+
+<section id="s3">
+  <h2>웨이크업과 셀렉트: 재료가 왔다는 알림</h2>
+  <p>이슈 큐의 칸은 자기 피연산자가 준비됐는지 어떻게 알까? 매 사이클 레지스터 파일을 들여다보면 비싸다. KMHv3는 두 가지 출처를 쓴다. 디스패치 순간에는 <span class="term" data-def="물리 레지스터마다 1비트로 '아직 값이 없음'을 기록하는 표. 할당 때 busy가 되고 웨이크업이나 쓰기 때 ready가 된다.">BusyTable<span class="en">(busy table)</span></span>을 읽고, 큐에 들어간 뒤에는 생산자가 보내는 웨이크업을 듣는다. 웨이크업을 받은 칸은 준비가 되고, 준비된 칸 가운데 하나를 고르는 것이 <span class="term" data-def="이슈 큐에서 준비된 칸 가운데 이번 사이클에 내보낼 칸을 고르는 논리.">셀렉트<span class="en">(select)</span></span>다. 고른 uop가 다시 웨이크업을 보내 다음 소비자를 깨우므로 이 둘은 고리를 이룬다.</p>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">W1 · BusyTable 갱신</span><h4>같은 사이클이면 웨이크업이 할당을 이긴다</h4><span class="actor code">BusyTable</span></div>
+    <dl><dt>조건</dt><dd class="cond">웨이크업 또는 쓰기 → ready. 그렇지 않고 할당 또는 로드 취소 → busy(정수 0번 레지스터는 항상 ready). 읽기 응답 = <code>!(table || 이번 사이클 할당)</code>.</dd>
+    <dt>이유</dt><dd class="why">디스패치 시점의 준비 상태가 정확해야 큐에 들어간 뒤 웨이크업을 놓쳐도 영원히 기다리지 않는다.</dd>
+    <dt>없으면</dt><dd>이미 지나간 웨이크업을 기다리는 uop가 큐에 갇힌다. 반대로 이번 사이클에 할당된 레지스터를 ready로 읽으면 값 없이 출발한다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rename/BusyTable.scala:148-166@09453ff8</dd></dl></div>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">W2 · canIssue</span><h4>모든 소스가 준비되고 아직 발행 안 된 칸만 후보다</h4><span class="actor code">IQ entry</span></div>
+    <dl><dt>조건</dt><dd class="cond"><code>canIssue = srcReady &amp;&amp; !issued &amp;&amp; !blocked</code>. comp·enq 칸은 여기에 <code>canIssueBypass</code>(이번 사이클 웨이크업으로 준비)를 더한다. simp 칸은 더하지 않는다.</dd>
+    <dt>이유</dt><dd class="why">웨이크업 도착 사이클에 바로 고르면 의존 사슬이 사이클마다 이어진다. 이 경로는 비싸서 일부 칸에만 둔다.</dd>
+    <dt>없으면</dt><dd>소스 없는 uop가 출발하거나, 이미 보낸 uop를 두 번 보낸다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/issue/EntryBundles.scala:34-41, 310, 474-475@09453ff8</dd></dl></div>
+
+  <p>웨이크업은 언제 도착할까. 큐는 uop를 고른 사이클 T에 그 uop를 FU 지연만큼의 파이프(<code>MultiWakeupQueue</code>)에 넣는다. 지연마다 파이프가 하나씩 있고(MultiWakeupQueue.scala:44), 출구에 레지스터 한 단(<code>lastConnect</code>, :47, :79-80)이 더 있다. 그래서 웨이크업은 <strong>T + 지연 + 1</strong>에 소비자 큐에 닿는다. ALU의 지연은 0이므로(FuConfig.scala:343, 기본값 :68) 소비자는 T+1에 선택될 수 있다. 연속 사이클에 의존 사슬이 이어지는 이 모양을 <span class="term">백투백<span class="en">(back-to-back)</span></span> 발행이라 한다. Mul은 지연 2(FuConfig.scala:364)이므로 소비자는 T+3에 선택된다. 실제 데이터가 어디서 오는지(바이패스)는 <a href="ch07-execute.html">7장</a>에서 다룬다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 206" role="img" aria-label="웨이크업 도착과 선택 시점">
+      <defs><marker id="f64-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ok)"/></marker></defs>
+      <g class="lbl-mono" text-anchor="middle"><text x="152" y="16">T</text><text x="216" y="16">T+1</text><text x="280" y="16">T+2</text><text x="344" y="16">T+3</text><text x="408" y="16">T+4</text></g>
+      <text x="6" y="44" class="lbl">ALU 생산자</text><rect class="box-acc" x="122" y="26" width="60" height="28" rx="6"/><text x="152" y="45" text-anchor="middle" class="lbl-acc">선택</text>
+      <text x="6" y="84" class="lbl">소비자</text><rect class="box-ok" x="186" y="66" width="60" height="28" rx="6"/><text x="216" y="85" text-anchor="middle" class="lbl-b">W·선택</text>
+      <path class="ln-ok" d="M182,48 C200,52 206,58 210,64" fill="none" marker-end="url(#f64-a)"/>
+      <text x="6" y="134" class="lbl">MUL 생산자</text><rect class="box-acc" x="122" y="116" width="60" height="28" rx="6"/><text x="152" y="135" text-anchor="middle" class="lbl-acc">선택</text>
+      <rect class="box-grey" x="186" y="116" width="124" height="28" rx="6"/><text x="248" y="135" text-anchor="middle" class="lbl-dim">지연 2</text>
+      <text x="6" y="174" class="lbl">소비자</text><rect class="box-ok" x="314" y="156" width="60" height="28" rx="6"/><text x="344" y="175" text-anchor="middle" class="lbl-b">W·선택</text>
+      <path class="ln-ok" d="M310,140 C330,144 336,148 340,154" fill="none" marker-end="url(#f64-a)"/>
+      <text x="230" y="202" text-anchor="middle" class="lbl-dim">웨이크업 도착(W) = 선택 사이클 + 지연 + 1</text>
+    </svg>
+    <figcaption>ALU 생산자를 T에 고르면 소비자는 T+1, Mul 생산자면 T+3에 고를 수 있다. comp 칸은 W가 도착한 그 사이클에 선택된다.</figcaption>
+  </figure>
+
+  <p>누가 누구를 깨우는지도 정해져 있다. ALU0~5와 LDU0~2는 ALU·LDU·STA·STD·BJU 큐를 깨우고, LDU는 fp 큐(FEX0~3)도 깨운다(Parameters.scala:558-575). 나눗셈과 CSR처럼 지연이 정해지지 않은 FU는 선택 때 웨이크업을 보내지 않고, 실행이 끝날 때 EXU가 보내는 <code>wakeupFromExu</code>를 지연 0으로 넣는다(IssueQueue.scala:771-781). 그 사이클에는 같은 출구의 선택을 막는다(<code>deq.ready := !wakeupFromExu.valid</code>, IssueQueue.scala:910-917).</p>
+
+  <div class="sim" id="sim-wake">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>의존 사슬 다섯 개가 출발하는 사이클</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="wake-scn"><button class="on">ALU 사슬</button><button>MUL 섞기</button></div>
+      <label class="ctl"><input type="checkbox" id="wake-simp"> 모든 소비자가 simp 칸에 있다고 가정 (바이패스 없음)</label>
+      <div class="cg-wrap"><table class="cg" id="wake-grid"></table></div>
+      <div class="ctl"><label>진행 (드래그로 되감기) <output id="wake-tout">0</output></label>
+        <input type="range" id="wake-t" min="0" max="11" step="1" value="0"></div>
+      <div class="btn-row"><button class="btn primary" id="wake-play">재생</button><button class="btn" id="wake-step">한 사이클</button><button class="btn" id="wake-reset">처음으로</button></div>
+      <div class="verdict grey" id="wake-verdict">대기</div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>현재 사이클</span><b id="wake-cyc">0</b></div>
+      <div class="ro"><span>선택된 uop</span><b id="wake-done">0 / 5</b></div>
+      <div class="stat"><span class="k">I5 선택 사이클</span><span class="v" id="wake-last">0<small>사이클</small></span></div>
+      <div class="ro"><span>선택 간격</span><b id="wake-gaps">-</b></div>
+    </div>
+    <div class="sim-note">I1→I2→…→I5는 각자 앞 uop의 결과를 쓰는 합성 사슬이다. S = 선택, W = 웨이크업 도착, r = 준비됐지만 아직 못 고름. 지연(ALU 0, Mul 2)과 "T + 지연 + 1" 규칙은 코드 그대로다. 출구 경쟁은 없다고 가정했다. ① ALU 사슬을 재생해 S가 대각선으로 한 칸씩 내려가는지 보라. ② MUL 섞기로 바꿔 I2 뒤에 2사이클 틈이 생기는지 보라. ③ simp 가정을 켜면 간격마다 1사이클씩 늘어난다. 이유는 5절의 세 층 구조에 있다.</div>
+  </div>
+
+  <div class="callout decision"><strong>2025-05-22 idiv·csr의 불확정 웨이크업 구조 변경</strong>
+    <p>커밋 8a5c09f05 "feat(backend): refactor uncertain wakeup of idiv and csr". 제목에 PR 번호는 없다. 현재 코드에서 불확정 지연 FU는 Csr, Div, Fdiv, Vfdiv다(FuConfig.scala:867-869).</p></div>
+</section>
+
+<section id="s4">
+  <h2>가장 오래된 것부터: 에이지 매트릭스</h2>
+  <p>준비된 칸이 여럿이고 출구는 하나라면 무엇을 먼저 보낼까. KMHv3는 가장 먼저 들어온 칸을 고른다. 오래된 uop일수록 ROB 머리에 가까워 커밋을 붙잡고 있을 가능성이 높기 때문이다. 그런데 이슈 큐는 FIFO가 아니다. 칸이 아무 순서로나 비므로 위치로는 나이를 알 수 없다. 칸을 매번 앞으로 당기면 나이는 알 수 있지만 매 사이클 큐 전체를 옮겨야 한다. 대신 칸 쌍마다 "누가 먼저 왔나"를 1비트로 적어 두는 것이 <span class="term" data-def="n개 칸의 모든 쌍 (i, j)에 대해 i가 j보다 먼저 들어왔는지를 1비트로 기억하는 n×n 표. 상삼각만 저장한다.">에이지 매트릭스<span class="en">(age matrix)</span></span>다.</p>
+  <ol class="steps">
+    <li><b>저장</b> <code>age(i)(j)</code> = i가 j보다 먼저 들어옴. 대각선은 항상 참이고, i&gt;j 쪽은 <code>!age(j)(i)</code>로 읽으므로 상삼각만 레지스터로 둔다(AgeDetector.scala:37-48).</li>
+    <li><b>갱신</b> i만 들어오면 행 i를 거짓(가장 어림), j만 들어오면 참. 같은 사이클에 둘 다 들어오면 앞 번호 포트로 들어온 쪽이 더 오래된 것으로 친다(AgeDetector.scala:61-80).</li>
+    <li><b>선택</b> <code>out(i) = canIssue(i) &amp;&amp; 모든 j에 대해 (age(i)(j) || !canIssue(j))</code>. 준비 안 된 칸의 열은 가려지므로 남는 것은 준비된 칸 중 가장 오래된 하나다(AgeDetector.scala:92-96).</li>
+  </ol>
+  <p>나가는 칸은 따로 지우지 않는다. 빈 칸의 낡은 나이 비트는 그 칸이 준비 상태가 아니므로 선택에 영향을 주지 않는다(AgeDetector.scala:28-30 주석).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 226" role="img" aria-label="4칸 에이지 매트릭스로 가장 오래된 준비 칸 고르기">
+      <text x="6" y="40" class="lbl-dim">들어온 순서</text><text x="6" y="62" class="lbl-b">E2, E0, E3, E1</text>
+      <text x="6" y="104" class="lbl-dim">age(i)(j) = 1</text><text x="6" y="124" class="lbl-dim">: i가 j보다 먼저</text>
+      <g class="lbl-mono" text-anchor="middle"><text x="192" y="38">E0</text><text x="232" y="38">E1</text><text x="272" y="38">E2</text><text x="312" y="38">E3</text></g>
+      <rect class="box-grey" x="252" y="46" width="40" height="164" rx="4"/>
+      <rect class="box-acc" x="172" y="46" width="160" height="40" rx="4"/>
+      <g class="lbl-mono"><text x="146" y="71">E0</text><text x="146" y="111">E1</text><text x="146" y="151">E2</text><text x="146" y="191">E3</text></g>
+      <g class="lbl" text-anchor="middle">
+        <text x="192" y="71">1</text><text x="232" y="71">1</text><text x="272" y="71">0</text><text x="312" y="71">1</text>
+        <text x="192" y="111">0</text><text x="232" y="111">1</text><text x="272" y="111">0</text><text x="312" y="111">0</text>
+        <text x="192" y="151">1</text><text x="232" y="151">1</text><text x="272" y="151">1</text><text x="312" y="151">1</text>
+        <text x="192" y="191">0</text><text x="232" y="191">1</text><text x="272" y="191">0</text><text x="312" y="191">1</text>
+      </g>
+      <text x="346" y="80" class="lbl">준비: E0 E1 E3</text><text x="346" y="104" class="lbl-dim">E2 열은 가림</text>
+      <text x="346" y="140" class="lbl-acc">E0 행만</text><text x="346" y="160" class="lbl-acc">전부 통과</text>
+      <text x="346" y="196" class="lbl-b">→ E0 선택</text>
+    </svg>
+    <figcaption>가장 오래된 E2는 준비되지 않아 열이 가려진다. 남은 준비 칸 가운데 E0의 행만 모두 1이므로 E0가 나간다.</figcaption>
+  </figure>
+
+  <p>KMHv3의 큐는 칸을 세 영역으로 나누고 영역마다 에이지 검출기를 따로 둔다. enq 칸은 <code>NewAgeDetector</code>(IssueQueue.scala:531), simp와 comp 칸은 <code>AgeDetector</code>(:563, :568)다. 각 검출기가 기록하는 나이는 <em>그 영역에 들어온 순서</em>다. 세 영역의 후보는 아래 규칙으로 하나로 합친다.</p>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">S1 · 영역 우선순위</span><h4>comp에 후보가 있으면 comp, 없으면 simp, 그다음 enq</h4><span class="actor code">IssueQueue</span></div>
+    <dl><dt>조건</dt><dd class="cond"><code>selOH = Cat(comp.bits, Fill(!comp.valid) &amp; simp.bits, Fill(!comp.valid &amp;&amp; !simp.valid) &amp; enq.bits)</code></dd>
+    <dt>이유</dt><dd class="why">칸은 enq → simp → comp 순으로 옮겨 가므로 comp에 있는 칸이 대체로 더 오래됐다. 세 영역을 한 매트릭스로 묶는 대신 고정 우선순위로 합쳐 논리를 줄인다.</dd>
+    <dt>없으면</dt><dd>세 후보 중 무엇을 보낼지 정해지지 않아 한 출구에 둘 이상이 나간다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/issue/IssueQueue.scala:579-583@09453ff8</dd></dl></div>
+
+  <p>ALU0~2 큐처럼 출구가 둘이면 두 출구의 FU 집합이 완전히 같거나 완전히 달라야 한다(IssueQueue.scala:466). ALU와 BJU는 FU 집합이 겹치지 않으므로(IssueBlockParams.scala:352-354) 출구마다 따로 위 선택을 한다(IssueQueue.scala:530 이후).</p>
+
+  <div class="sim" id="sim-age">
+    <div class="sim-head"><span class="sim-tag predict">Predict</span><h3>준비된 E2·E4·E5 중 누가 나갈까</h3></div>
+    <div class="sim-body">
+      <p style="margin:0">6칸 큐에 사이클마다 이렇게 들어왔다. 0: E3(포트0)·E1(포트1), 1: E5, 2: E0(포트0)·E4(포트1), 3: E2. 지금 준비된 칸은 E2, E4, E5다. 에이지 매트릭스가 고르는 칸은?</p>
+      <div class="seg" id="age-pick"><button class="on">E2 (번호가 가장 작다)</button><button>E4</button><button>E5</button></div>
+      <div class="btn-row"><button class="btn primary" id="age-run">확인</button></div>
+      <div class="verdict grey" id="age-out">아직 확인하지 않음</div>
+      <div class="cg-wrap"><table class="cg" id="age-mat"></table></div>
+      <div class="tier">준비 상태 바꾸기 (누르면 켜고 끈다)</div>
+      <div class="seg" id="age-rdy"><button>E0</button><button>E1</button><button>E2</button><button>E3</button><button>E4</button><button>E5</button></div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>선택</span><b id="age-sel">?</b></div>
+      <div class="ro"><span>준비된 칸 수</span><b id="age-cnt">3</b></div>
+      <div class="ro"><span>나이 순서</span><b id="age-order">확인 후 공개</b></div>
+    </div>
+    <div class="sim-note">합성 진입 이력에 AgeDetector의 갱신 규칙과 선택식을 그대로 돌린다. 표의 칸은 age(i)(j)이고, 선택된 칸의 행이 강조된다. ① 확인 뒤 E5의 준비를 끄면 누가 나가는지 보라. ② E3를 켜 보라. 같은 사이클에 들어온 E1보다 E3가 앞서는 이유는 포트 0이기 때문이다. ③ 모두 끄면 선택이 없다. 규칙은 4절.</div>
+  </div>
+</section>
+
+<section id="s5">
+  <h2>enq·simp·comp 세 층과 백프레셔</h2>
+  <p>20칸 큐의 모든 칸에 웨이크업 비교기, 같은 사이클 바이패스, 선택 논리를 다 달면 한 사이클 안에 끝내기 어렵다. KMHv3는 칸을 세 층으로 나눈다. 새로 들어온 uop가 머무는 <code>enq</code> 2칸, 잠시 대기만 하는 <code>simp</code>, 선택의 중심인 <code>comp</code>다. 칸 수는 <code>numSimp = numEntries - numEnq - numComp</code>(IssueBlockParams.scala:167)이므로 20칸 큐는 2 + 6 + 12, 18칸 큐는 2 + 6 + 10이다. simp와 comp는 0이거나 numEnq 이상이어야 한다(IssueQueue.scala:83-84).</p>
+  <p>enq 칸과 comp 칸은 <code>isComp = true</code>로 만들어져 웨이크업 도착 사이클에 선택될 수 있다. simp 칸은 <code>isComp = false</code>라서 웨이크업이 <code>srcState</code> 레지스터에 적힌 다음 사이클부터 후보가 된다(Entries.scala:46-48, EntryBundles.scala:474-475). simp가 싼 대신 느린 이유는 여기 있다. 그래서 simp 칸은 오래 머물지 않고 comp로 옮겨 간다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 262" role="img" aria-label="enq simp comp 사이 이동">
+      <defs><marker id="f66-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker><marker id="f66-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+      <rect class="box-user" x="8" y="96" width="104" height="62" rx="10"/><text x="60" y="122" text-anchor="middle" class="lbl-b">enq · 2칸</text><text x="60" y="144" text-anchor="middle" class="lbl-dim">즉시 선택 O</text>
+      <rect class="box-warn" x="172" y="18" width="116" height="62" rx="10"/><text x="230" y="44" text-anchor="middle" class="lbl-b">simp · 6칸</text><text x="230" y="66" text-anchor="middle" class="lbl-dim">1사이클 늦게</text>
+      <rect class="box-acc" x="172" y="174" width="116" height="62" rx="10"/><text x="230" y="200" text-anchor="middle" class="lbl-b">comp · 12칸</text><text x="230" y="222" text-anchor="middle" class="lbl-dim">즉시 선택 O</text>
+      <rect class="box-ok" x="352" y="96" width="100" height="62" rx="10"/><text x="402" y="122" text-anchor="middle" class="lbl-b">select</text><text x="402" y="144" text-anchor="middle" class="lbl-mono">comp&gt;simp&gt;enq</text>
+      <line class="ln" x1="112" y1="108" x2="170" y2="64" marker-end="url(#f66-a)"/><text x="122" y="78" class="lbl-acc">①</text>
+      <line class="ln" x1="112" y1="146" x2="170" y2="190" marker-end="url(#f66-a)"/><text x="122" y="190" class="lbl-acc">②</text>
+      <line class="ln" x1="230" y1="80" x2="230" y2="172" marker-end="url(#f66-a)"/><text x="238" y="132" class="lbl-acc">③</text>
+      <line class="ln-acc" x1="288" y1="200" x2="350" y2="148" marker-end="url(#f66-b)"/><line class="ln-acc" x1="288" y1="52" x2="350" y2="108" marker-end="url(#f66-b)"/>
+      <line class="ln-acc" x1="60" y1="158" x2="60" y2="250"/><line class="ln-acc" x1="60" y1="250" x2="402" y2="250"/><line class="ln-acc" x1="402" y1="250" x2="402" y2="160" marker-end="url(#f66-b)"/>
+    </svg>
+    <figcaption>① simp에 자리가 충분하면 enq→simp, ② simp가 비었고 comp에 자리가 충분하면 enq→comp, ③ simp의 가장 오래된 두 칸은 comp 빈칸만큼 옮겨 간다. 선택은 세 층 모두에서 할 수 있다.</figcaption>
+  </figure>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">T1 · enq 이동</span><h4>enq 칸은 전부 옮기거나 하나도 안 옮긴다</h4><span class="actor code">Entries</span></div>
+    <dl><dt>조건</dt><dd class="cond">comp로: <code>PopCount(enq 유효) &lt;= PopCount(comp 빈칸) &amp;&amp; simp 전부 빔</code>. 아니면 simp로: <code>PopCount(enq 유효) &lt;= PopCount(simp 받을 수 있는 칸)</code>. 실제로 옮기는 칸은 <code>valid &amp;&amp; !issued</code>다.</dd>
+    <dt>이유</dt><dd class="why">simp가 비었을 때만 comp로 직행해야 simp에 남은 더 오래된 칸보다 새 칸이 comp에 먼저 들어가는 일이 없다. 전부 아니면 전무(Entries.scala:190 주석)여서 enq.ready 판단이 단순해진다.</dd>
+    <dt>없으면</dt><dd>enq 칸 하나만 남아 새 uop를 받을 자리가 반쪽이 되고, comp의 나이 순서가 프로그램 순서와 어긋난다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/issue/Entries.scala:193-194@09453ff8</dd></dl></div>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">T2 · simp → comp</span><h4>가장 오래된 simp 두 칸이 comp 빈칸만큼 올라간다</h4><span class="actor code">Entries</span></div>
+    <dl><dt>조건</dt><dd class="cond"><code>simpCanTrans2Comp(idx) = !enqCanTrans2Comp &amp;&amp; PopCount(comp 빈칸) &gt;= idx + 1</code>. 대상은 simp 에이지 검출기가 고른 <code>valid &amp;&amp; !issued</code> 칸 중 가장 오래된 numEnq개다(IssueQueue.scala:403, :556-560).</dd>
+    <dt>이유</dt><dd class="why">simp는 바이패스가 없어 느리다. 오래된 칸일수록 빨리 comp로 올려야 의존 사슬이 늦지 않는다.</dd>
+    <dt>없으면</dt><dd>오래된 uop가 simp에 머물러 매번 1사이클씩 늦게 출발한다(3절 실험의 simp 가정).</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/issue/Entries.scala:136-139, 196@09453ff8</dd></dl></div>
+
+  <p>이제 <span class="term" data-def="받는 쪽이 꽉 찼을 때 ready를 내려 보내는 쪽을 멈추게 하는 흐름 제어.">백프레셔<span class="en">(back-pressure)</span></span>다. 큐가 새 uop를 받을 수 있는지는 한 비트 <code>enq.ready</code>로 디스패치에 알린다. 이 비트가 0이면 2절의 D1 관문이 그 큐로 가는 uop를 모두 막는다.</p>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">B1 · enq.ready</span><h4>simp에 빈칸이 2개 이상이거나 enq가 비었고, enq에 발행된 칸이 없을 때만 받는다</h4><span class="actor code">IssueQueue</span></div>
+    <dl><dt>조건</dt><dd class="cond"><code>enqReady = GatedValidRegNext((!simpCanotIn || !enqHasValid) &amp;&amp; !enqHasIssued)</code>. <code>simpCanotIn</code> = simp 빈칸이 정확히 1개이거나 0개.</dd>
+    <dt>이유</dt><dd class="why">enq 두 칸은 함께 옮겨 가므로 simp에 2칸이 있어야 enq를 비울 수 있다. 발행된 enq 칸은 옮기지 않으므로(<code>validForTrans</code>) 응답이 올 때까지 자리를 차지한다.</dd>
+    <dt>없으면</dt><dd>비워지지 않은 enq 칸에 새 uop를 써서 기존 uop를 잃는다. enq 칸의 assert가 이를 잡는다(EnqEntry.scala:58-60).</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/issue/IssueQueue.scala:1041-1056@09453ff8</dd></dl></div>
+
+  <p>이 신호는 <em>다음 사이클의 valid 비트</em>(<code>validVecRegNext</code>, 칸 valid 레지스터의 입력)로 계산한 뒤 레지스터에 담는다. 그래서 사이클 t에 보이는 값은 사이클 t의 칸 상태를 반영한다. 다만 사이클 t 안에서 비워질 칸은 세지 않으므로 보수적이다. 조합 논리를 레지스터 뒤로 옮겨 타이밍을 맞추려는 구조다.</p>
+
+  <div class="callout decision"><strong>2024-12-10 모든 이슈 큐에 simp 칸을 최소 2개</strong>
+    <p>커밋 49f2b2502 "timing(backend): each IQ has at least two simple entries". PR 번호는 제목에 없다. 지금 코드의 <code>require(numSimp == 0 || numSimp &gt;= numEnq)</code>(IssueQueue.scala:83)와 같은 방향이다.</p></div>
+  <div class="callout decision"><strong>2026-02-28 enq.ready 생성 논리를 타이밍 때문에 수정 · 2026-03-03 BJU 큐 20칸 → 18칸</strong>
+    <p>커밋 eb857dff3 "timing(IssueQueue): fix generate logic of enq.ready for timing"과 a4ba2991a "timing(intRegion): reduce bjuIQ numEntries from 20 to 18". 둘 다 PR 번호는 제목에 없다. 그 전 2025-07-10 커밋 7416fb259는 ALU 읽기 포트 중재기를 없애며 큐를 20칸으로 늘렸다.</p></div>
+
+  <div class="sim" id="sim-fill">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>20칸 큐가 차오르고 enq.ready가 내려가는 순간</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="fill-cv" class="short"></canvas>
+        <div class="dom">
+          <div class="tier">enq (2)</div><div class="slots" id="fill-enq"></div>
+          <div class="tier">simp (6)</div><div class="slots" id="fill-simp"></div>
+          <div class="tier">comp (12)</div><div class="slots" id="fill-comp"></div>
+        </div>
+      </div>
+      <div class="sim-controls">
+        <div class="ctl"><label>사이클당 디스패치 <output data-for="w" data-fmt="int"></output></label>
+          <input type="range" data-k="w" min="1" max="2" step="1" value="2"></div>
+        <div class="ctl"><label>miss 의존 비율 <output data-for="dep" data-fmt="f1"></output></label>
+          <input type="range" data-k="dep" min="0" max="1" step="0.1" value="0.5"></div>
+        <div class="ctl"><label>miss 해소 사이클 <output data-for="m" data-fmt="int"></output></label>
+          <input type="range" data-k="m" min="5" max="50" step="1" value="30"></div>
+        <div class="ctl"><label>진행 (드래그로 되감기) <output id="fill-tout">0</output></label>
+          <input type="range" id="fill-t" min="0" max="59" step="1" value="0"></div>
+        <div class="btn-row"><button class="btn primary" id="fill-play">재생</button><button class="btn" id="fill-step">한 사이클</button><button class="btn" id="fill-reset">처음으로</button></div>
+        <div class="verdict grey" id="fill-verdict">대기</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>점유 enq / simp / comp</span><b id="fill-occ">0 / 0 / 0</b></div>
+      <div class="ro"><span>디스패치된 uop</span><b id="fill-disp">0</b></div>
+      <div class="ro"><span>선택된 uop</span><b id="fill-iss">0</b></div>
+      <div class="ro"><span>enq.ready = 0 누적</span><b id="fill-stall">0</b></div>
+    </div>
+    <div class="sim-note">ALU3~5 모양 큐 하나(2/6/12)에 합성 uop를 넣는다. 각 uop는 확률 "miss 의존 비율"로 로드 miss에 의존해 "miss 해소 사이클"까지 기다리고, 아니면 들어온 다음 사이클에 준비된다. 칸 색: 초록 준비, 주황 대기, 파랑 선택됨. 이동 규칙(T1·T2), 영역 우선순위(S1), enq.ready(B1), simp의 1사이클 늦음은 코드 그대로다. 출구는 하나, 선택된 칸은 다음 사이클 끝에 비운다고 단순화했다(실제 응답 시점은 7장). 그래프의 붉은 띠는 enq.ready = 0인 사이클이다. ① 디스패치 1, 의존 0이면 큐가 거의 비어 있다. ② 디스패치 2로 올리면 들어오는 수가 나가는 수의 두 배라 결국 막힌다. 막히는 순간 simp 빈칸 수를 보라. ③ 의존 1, 해소 50이면 comp가 먼저 차고 simp가 찬 뒤 멈춘다. 규칙은 5절.</div>
+  </div>
+</section>
+
+<section id="s6">
+  <h2>투기적 웨이크업과 취소</h2>
+  <p>3절의 웨이크업은 생산자가 실제로 값을 낸 뒤가 아니라 <em>선택된 순간</em>에 예정 지연을 믿고 보낸다. 그래야 소비자가 바로 뒤 사이클에 출발할 수 있다. 이것이 <span class="term" data-def="생산자의 결과가 확정되기 전에, 예정된 지연을 믿고 미리 보내는 웨이크업. 예정이 틀리면 되돌려야 한다.">투기적 웨이크업<span class="en">(speculative wakeup)</span></span>이다. 예정이 틀리는 경우가 있다. 생산자가 OG0·OG1에서 레지스터 읽기 포트를 얻지 못해 되돌아오거나, 로드가 캐시 miss를 내 정해진 사이클에 값을 못 주는 경우다. 그러면 이미 깨어난, 심지어 이미 발행된 소비자를 되돌려야 한다.</p>
+  <p>웨이크업 파이프 안에서는 세 가지가 웨이크업을 지운다. 리다이렉트, 로드 취소(<code>LoadShouldCancel</code>), 그리고 단계 1의 og0 실패와 단계 2의 og1 실패다(IssueQueue.scala:124-133). 파이프를 지날 때마다 <code>loadDependency</code>를 한 칸씩 민다(:135-142). 지연 0 웨이크업은 이미 소비자에게 닿았으므로 받는 쪽에서 <code>og0Cancel &amp;&amp; is0Lat</code>를 보고 무시한다(EntryBundles.scala:302-304).</p>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">C1 · 응답 실패</span><h4>og0·og1에서 실패한 uop는 issued를 풀고 큐에서 다시 기다린다</h4><span class="actor code">IQ entry</span></div>
+    <dl><dt>조건</dt><dd class="cond"><code>issued</code>는 <code>deqSel &amp;&amp; !cancelBypass</code>로 켜지고 <code>srcCancelByLoad || respIssueFail</code>로 꺼진다. 같은 실패로 FU 점유표(<code>FuBusyTable</code>)에 미리 찍은 예약도 지운다.</dd>
+    <dt>이유</dt><dd class="why">선택된 칸은 응답이 올 때까지 지우지 않는다(<code>deqSuccess = issued &amp;&amp; finalSuccess</code>, EntryBundles.scala:216). 실패하면 그 칸을 다시 후보로 돌리면 된다.</dd>
+    <dt>없으면</dt><dd>OG 단계에서 떨어진 uop가 영영 사라지거나, 다중 사이클 FU가 오지 않을 uop 때문에 출구를 비워 둔다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/issue/EntryBundles.scala:452-455@09453ff8, FuBusyTableWrite.scala:57@09453ff8</dd></dl></div>
+
+  <p>로드는 더 까다롭다. 로드의 결과에 의존하는 uop가 여러 단을 거쳐 퍼져 나가기 때문이다. KMHv3는 소스마다 <code>loadDependency</code>라는 작은 비트열을 단다. 로드 파이프마다 2비트(<code>LoadDependencyWidth = 2</code>, Parameters.scala:179), 로드 파이프는 3개다(<code>LoadPipelineWidth = 3</code>, :166). 로드 웨이크업을 받은 소스는 그 로드 파이프 자리에 01을 적는다. 로드가 아닌 생산자의 웨이크업을 받으면 생산자의 비트를 한 칸 밀어 물려받는다(EntryBundles.scala:317-329). 그 뒤 비트는 사이클마다 한 칸씩 밀린다(:233-235). 취소 신호가 오면 해당 비트가 켜진 소스만 지운다.</p>
+
+  <div class="gate"><div class="gate-head"><span class="gate-id">C2 · LoadShouldCancel</span><h4>ld2Cancel이 오면 dep(1)이 켜진 소스를 모두 되돌린다</h4><span class="actor code">IQ entry · BusyTable</span></div>
+    <dl><dt>조건</dt><dd class="cond">어느 로드 파이프든 <code>(ld1Cancel &amp;&amp; dep(0)) || (ld2Cancel &amp;&amp; dep(1))</code>. 현재 <code>ld1Cancel</code>은 0으로 묶여 있고(MemBlock.scala:910) <code>ld2Cancel</code>은 로드 유닛의 cancel이다(:911). 걸린 소스는 <code>srcState</code>가 풀리고(EntryBundles.scala:387) 칸의 <code>issued</code>도 풀린다(:452-455).</dd>
+    <dt>이유</dt><dd class="why">비트가 사이클마다 밀리므로, 비트 위치가 "로드 웨이크업 후 몇 사이클째인가"를 나타낸다. 취소가 오는 사이클과 비트 위치가 맞는 소스만 그 로드에 기대고 있다.</dd>
+    <dt>없으면</dt><dd>miss난 로드의 쓰레기 값으로 계산한 결과가 커밋된다. 반대로 모든 소스를 지우면 무관한 uop까지 되돌아간다.</dd>
+    <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/Bundles.scala:1838-1844@09453ff8, BusyTable.scala:112-124@09453ff8</dd></dl></div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 236" role="img" aria-label="loadDependency 비트가 밀리고 취소에 걸리는 모습">
+      <g class="lbl-mono" text-anchor="middle"><text x="170" y="16">t2</text><text x="270" y="16">t3</text><text x="370" y="16">t4</text></g>
+      <text x="6" y="44" class="lbl">L (로드)</text><rect class="box-ok" x="124" y="26" width="92" height="28" rx="6"/><text x="170" y="45" text-anchor="middle" class="lbl-mono">웨이크업</text>
+      <rect class="box-bad" x="324" y="26" width="92" height="28" rx="6"/><text x="370" y="45" text-anchor="middle" class="lbl-mono">ld2Cancel</text>
+      <text x="6" y="94" class="lbl">b = L+1</text><rect class="box-acc" x="124" y="76" width="92" height="28" rx="6"/><text x="170" y="95" text-anchor="middle" class="lbl-mono">선택 dep←01</text>
+      <rect class="box" x="224" y="76" width="92" height="28" rx="6"/><text x="270" y="95" text-anchor="middle" class="lbl-mono">dep 01</text>
+      <rect class="box-bad" x="324" y="76" width="92" height="28" rx="6"/><text x="370" y="95" text-anchor="middle" class="lbl-mono">10 → 취소</text>
+      <text x="6" y="144" class="lbl">c = b+1</text><rect class="box-acc" x="224" y="126" width="92" height="28" rx="6"/><text x="270" y="145" text-anchor="middle" class="lbl-mono">선택 dep←10</text>
+      <rect class="box-bad" x="324" y="126" width="92" height="28" rx="6"/><text x="370" y="145" text-anchor="middle" class="lbl-mono">10 → 취소</text>
+      <text x="6" y="194" class="lbl">d (무관)</text><rect class="box-grey" x="124" y="176" width="92" height="28" rx="6"/><text x="170" y="195" text-anchor="middle" class="lbl-mono">dep 00</text>
+      <rect class="box-grey" x="324" y="176" width="92" height="28" rx="6"/><text x="370" y="195" text-anchor="middle" class="lbl-mono">영향 없음</text>
+      <text x="230" y="228" text-anchor="middle" class="lbl-dim">취소 = ld2Cancel &amp;&amp; dep(1) · 사이클 정렬은 합성(추론)</text>
+    </svg>
+    <figcaption>b는 로드 웨이크업으로 01을 받고, c는 b의 01을 밀어 10을 받는다. t4에 b와 c의 레지스터 값이 모두 10이어서 둘 다 ld2Cancel에 걸린다. d는 00이라 그대로 간다.</figcaption>
+  </figure>
+
+  <p>BusyTable도 같은 규칙을 쓴다. 웨이크업이 취소 조건에 걸리면 ready로 바꾸지 않고(BusyTable.scala:112-118), 이미 ready로 바꾼 레지스터는 <code>ldCancelMask</code>로 다시 busy로 돌린다(:124, :152). 로드 웨이크업은 로드 유닛의 <code>memIO.loadWakeUp</code>을 로드 주소 이슈 큐(<code>isLdAddrIQ</code>)가 <code>RegNext</code> 한 단을 거쳐 다른 이슈 큐로 내보낸다(IssueQueue.scala:969-974). 로드 유닛이 웨이크업을 s0에서, 취소를 s3에서 낸다는 점(NewLoadUnit.scala:2111, :2180)은 위 그림의 두 사이클 간격과 맞아 보이지만, 정확한 단계 정렬은 이 장에서 확인하지 않았다(추론). 자세한 로드 단계는 <a href="ch09-loadstore.html">9장</a>에서 다룬다.</p>
+
+  <div class="sim" id="sim-cancel">
+    <div class="sim-head"><span class="sim-tag predict">Predict</span><h3>로드 L이 miss면 무엇이 되돌아가나</h3></div>
+    <div class="sim-body">
+      <p style="margin:0">b는 L의 결과를, c는 b의 결과를 쓴다. d는 L과 무관하다. 셋 다 투기적 웨이크업으로 이미 선택됐다. L이 miss로 판명되면 되돌아가는 것은?</p>
+      <div class="seg" id="cx-pick"><button class="on">b만</button><button>b와 c</button><button>b, c, d 모두</button><button>아무것도 아니다</button></div>
+      <div class="btn-row"><button class="btn primary" id="cx-run">확인</button></div>
+      <div class="verdict grey" id="cx-out">아직 확인하지 않음</div>
+      <div class="cg-wrap"><table class="cg" id="cx-grid"></table></div>
+      <div class="seg" id="cx-mode"><button>hit</button><button class="on">miss</button></div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>취소된 uop 수</span><b id="cx-n">?</b></div>
+      <div class="ro"><span>취소된 uop</span><b id="cx-who">?</b></div>
+      <div class="ro"><span>d</span><b id="cx-d">?</b></div>
+    </div>
+    <div class="sim-note">합성 시나리오다. 로드 웨이크업이 t2에 도착하고 ld2Cancel이 t4에 온다고 놓았다(사이클 정렬은 추론). dep 비트의 부여, 매 사이클 밀기, LoadShouldCancel 식은 코드 그대로다. 표의 숫자는 그 사이클 레지스터에 든 dep(1)dep(0)이다. ① 확인 뒤 hit로 바꾸면 b와 c의 dep가 10에서 00으로 빠져나가는 것을 보라. ② c가 t3에 01이 아니라 10을 받는 이유를 생각해 보라(물려받을 때 한 칸 민다). ③ d는 로드 웨이크업을 받지 않았으므로 어떤 경우에도 00이다. 규칙은 6절.</div>
+  </div>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ul>
+    <li>디스패치는 어느 큐에 넣을지만 정한다. ALU uop는 점유가 적은 큐부터 순번대로 받고, 한 큐는 한 사이클에 enq 포트 수 2개까지만 받는다.</li>
+    <li>uop는 큐 입구(D1), 스토어 짝(D2), LSQ 사슬(D3), 그룹 단위 진행(D4)을 모두 통과해야 나간다. 한 uop가 막히면 그 뒤 uop도 모두 막혀서, 그룹은 앞에서부터 이어진 묶음으로만 나간다.</li>
+    <li>웨이크업은 선택 사이클 T에 예정 지연을 믿고 보내고, T + 지연 + 1에 도착한다. comp·enq 칸은 도착 사이클에 바로 선택된다.</li>
+    <li>에이지 매트릭스는 칸 쌍마다 1비트로 나이를 기억하고, 준비된 칸 중 가장 오래된 하나를 고른다. 영역 사이는 comp &gt; simp &gt; enq 고정 우선순위다.</li>
+    <li>enq.ready는 simp 빈칸이 2개 이상이거나 enq가 비었고 enq에 발행된 칸이 없을 때만 1이다. 이것이 큐에서 디스패치로 가는 백프레셔다.</li>
+    <li>로드 miss는 dep(1) 비트가 켜진 소스만 되돌린다. 비트는 물려받을 때와 매 사이클 한 칸씩 밀린다.</li>
+  </ul>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="2">
+    <div class="q">분산 최적화가 켜진 기본 설정에서 ALU 큐 여섯 개의 점유가 모두 같다. 그룹의 첫 번째 ALU uop는 어느 큐로 가나?</div>
+    <div class="opts"><button>ALU0, 번호가 가장 작다</button><button>ALU5, 동점이면 번호가 큰 큐가 앞이다</button><button>ALU3, 3개 묶음 재정렬이 동점 순서를 뒤집는다</button><button>직전 사이클에 쓴 큐의 다음 큐</button></div>
+    <div class="explain">첫 정렬(<code>IQSort</code>)은 동점이면 큰 번호를 앞에 두어 ALU5, 4, 3, 2, 1, 0이 된다(Dispatch.scala:457-468). 최적화가 켜지면 이를 3개씩 다시 정렬하는데, 동점이면 묶음 안 순서가 뒤집혀 ALU3, 4, 5, 0, 1, 2가 된다(:474-496, 499). ALU5는 최적화를 끈 경우의 답이다. ALU0은 어느 정렬에서도 맨 앞이 아니고, 순환 포인터는 이 경로에 없다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">ALU 생산자가 사이클 10에 선택됐다. 그 결과를 쓰는 소비자가 simp 칸에 있다면 가장 빨리 선택되는 사이클은?</div>
+    <div class="opts"><button>11</button><button>12</button><button>10</button><button>13</button></div>
+    <div class="explain">웨이크업은 10 + 0 + 1 = 11에 도착한다. comp 칸이면 11에 바로 고르지만 simp 칸은 바이패스가 없어 srcState가 적힌 다음 사이클 12부터 후보다. 10은 생산자 자신의 사이클이고, 13은 Mul(지연 2)의 소비자가 comp에 있을 때다.</div>
+  </div>
+  <div class="quiz" data-answer="3">
+    <div class="q">20칸 큐에서 enq 두 칸이 유효하고 발행되지 않았으며 simp 빈칸이 1개다. comp는 꽉 찼다. enq.ready는?</div>
+    <div class="opts"><button>1, 빈칸이 하나라도 있으니까</button><button>1, comp로 직행하면 된다</button><button>0, enq에 발행된 칸이 있어서</button><button>0, simp 빈칸이 1개뿐이어서</button></div>
+    <div class="explain">simp 빈칸이 정확히 1개면 <code>simpCanotIn</code>이 참이고 enq가 비어 있지 않으므로 0이다(IssueQueue.scala:1047-1056). 한 칸으로는 두 칸을 함께 옮길 수 없다. comp 직행은 simp가 완전히 비었을 때만 가능하고, 이 문제의 enq 칸은 발행되지 않았다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">로드 L의 웨이크업으로 b가 깨어나 선택됐고, b의 웨이크업으로 c가 깨어났다. ld2Cancel이 오는 사이클에 c의 dep 비트는 10이다. 다음 중 옳은 것은?</div>
+    <div class="opts"><button>c도 취소된다. dep(1)이 켜져 있다</button><button>c는 취소되지 않는다. L의 웨이크업을 직접 받지 않았다</button><button>c는 취소되지 않는다. 이미 선택돼 issued이기 때문이다</button><button>ld1Cancel이 와야 c가 취소된다</button></div>
+    <div class="explain">LoadShouldCancel은 소스의 dep 비트만 본다(Bundles.scala:1838-1844). 간접 의존도 비트를 물려받으므로 걸린다. 취소는 issued를 풀므로 발행된 칸도 되돌린다(EntryBundles.scala:452-455). ld1Cancel은 0으로 묶여 있어 쓰이지 않는다(MemBlock.scala:910).</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08.</p>
+
+</main>
+</div>
+<script src="assets/ch06-a.js"></script>
+<script src="assets/ch06-b.js"></script>
+</body>
+</html>

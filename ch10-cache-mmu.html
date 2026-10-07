@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 10장: 캐시, TLB, 프리페처</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+.c10-row{display:grid;grid-template-columns:repeat(32,minmax(0,1fr));gap:1px;margin:3px 0 10px}
+.c10-row i{height:16px;background:var(--surface-2);border-radius:2px}
+.c10-row i.on{background:var(--accent)} .c10-row i.x{background:var(--bad)} .c10-row i.ok{background:var(--ok)}
+.c10-grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:4px}
+.c10-grid.g4{grid-template-columns:repeat(4,minmax(0,1fr))} .c10-grid.g16{grid-template-columns:repeat(16,minmax(0,1fr));gap:2px}
+.c10-cell{border:1px solid var(--border);border-radius:6px;padding:3px 4px;font:11px/1.35 var(--mono);min-height:40px;background:var(--bg-elev);overflow:hidden;color:var(--text-dim)}
+.c10-cell.L{border-color:var(--accent);background:var(--accent-soft);color:var(--text)}
+.c10-cell.P{border-color:var(--accent-2);background:var(--accent-2-soft);color:var(--text)}
+.c10-cell.X{border-color:var(--bad);background:var(--bad-soft);color:var(--text)}
+.c10-cell.V{border-color:var(--warn);background:var(--warn-soft);color:var(--text)}
+.c10-cell b{display:block;color:var(--text)} .c10-cell .bar{height:4px;background:var(--accent);margin-top:3px;border-radius:2px}
+.c10-grid.g16 .c10-cell{min-height:26px;padding:2px;text-align:center}
+.c10-in{font:14px var(--mono);padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-elev);width:100%;min-width:0}
+.c10-pad{padding:16px 18px;display:grid;gap:12px;min-width:0}
+.c10-two{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+.c10-log{font:12.5px/1.6 var(--mono);color:var(--text-dim);min-height:42px;overflow-wrap:anywhere}
+.sim .table-wrap{margin:0} .sim table.data td,.sim table.data th{font-size:13px;padding:5px 8px}
+.c10-bar{height:10px;border-radius:3px;background:var(--accent);margin-top:4px}
+.c10-bar.over{background:var(--bad)}
+</style>
+</head>
+<body data-chapter="ch10">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 10</div>
+  <h1>캐시, TLB, 프리페처</h1>
+  <p class="lead">9장에서 load는 주소를 계산해 DCache에 "이 주소의 값을 달라"고 물었다. 그 질문은 수십 사이클 걸릴 수도, 한 사이클 만에 끝날 수도 있다. 차이를 만드는 것이 캐시 계층, 주소 번역(TLB), 그리고 미리 가져오기(프리페처)다.
+    이 장에서는 L1 데이터 캐시(DCache), L1·L2 TLB, L1 프리페처를 코드 줄 단위로 다루고, L2(CoupledL2)·L3(OpenLLC)는 내부 소스가 이 체크아웃에 없어 연결 파라미터만 다룬다.</p>
+  <ul class="objectives">
+    <li>캐시를 여러 층으로 쌓는 이유를 지연과 용량의 맞바꿈으로 설명하고 AMAT를 계산할 수 있다.</li>
+    <li>KMHv3 DCache 주소를 offset·bank·set·tag로 나누고, 해시 set index와 alias가 왜 생기는지 설명할 수 있다.</li>
+    <li>hit, bank conflict, MSHR merge/reject, write-back, PLRU 교체 규칙이 각각 무엇을 막는지 말할 수 있다.</li>
+    <li>48엔트리 L1 TLB와 L2TLB 페이지 워크(Sv39/Sv48)를 따라가고 A/D 비트가 page fault가 되는 조건을 예측할 수 있다.</li>
+    <li>Stride·Stream·SMS 프리페처가 언제 요청을 내는지 실제 문턱값으로 예측할 수 있다.</li>
+  </ul>
+</div>
+
+<section>
+  <h2>왜 캐시를 여러 층으로 쌓는가</h2>
+  <p>책상 위 메모는 손만 뻗으면 읽지만 몇 장밖에 못 둔다. 책장은 더 많이 들어가지만 일어나야 하고, 도서관은 무엇이든 있지만 오가는 데 한참 걸린다. 메모리도 같다. SRAM은 클수록 선이 길어지고 비교할 칸이 늘어 느려진다. 그래서 작고 빠른 층을 코어 가까이, 크고 느린 층을 뒤에 둔다. 이것이 <span class="term" data-def="작고 빠른 저장소(L1)부터 크고 느린 저장소(L2, L3, DRAM) 순으로 쌓아 자주 쓰는 데이터를 가까이 두는 구조.">캐시 계층</span><span class="en">(cache hierarchy)</span>이다.</p>
+  <p>캐시와 메모리는 바이트 하나가 아니라 64바이트 묶음인 <span class="term" data-def="캐시가 아래 계층과 주고받는 최소 단위. KMHv3 DCache는 blockBytes = 64 (DCacheWrapper.scala:54).">캐시 라인</span><span class="en">(cache line)</span> 단위로 오간다. 한 바이트를 읽으면 그 이웃도 곧 읽힐 가능성이 높다는 공간 지역성을 이용한다. 찾는 라인이 있으면 <b>hit</b>, 없으면 <b>miss</b>이고, miss면 아래 층에서 가져와(refill) 채운다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 350" role="img" aria-label="KMHv3 메모리 계층: 코어, L1I와 L1D, L2, L3, DRAM">
+      <defs><marker id="c10a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box" x="130" y="8" width="230" height="40" rx="10"/>
+      <text x="245" y="33" text-anchor="middle" class="lbl-b">코어 (Load·Store 유닛)</text>
+      <rect class="box-grey" x="60" y="80" width="160" height="56" rx="10"/>
+      <text x="140" y="104" text-anchor="middle" class="lbl-b">L1 ICache</text>
+      <text x="140" y="124" text-anchor="middle" class="lbl-mono">4장에서 다룸</text>
+      <rect class="box-acc" x="250" y="80" width="190" height="56" rx="10"/>
+      <text x="345" y="104" text-anchor="middle" class="lbl-b">L1 DCache 64KB</text>
+      <text x="345" y="124" text-anchor="middle" class="lbl-mono">4-way · 256 set · 64B</text>
+      <line class="ln" x1="190" y1="48" x2="160" y2="78" marker-end="url(#c10a1)"/>
+      <line class="ln" x1="300" y1="48" x2="330" y2="78" marker-end="url(#c10a1)"/>
+      <line class="ln" x1="140" y1="136" x2="200" y2="176" marker-end="url(#c10a1)"/>
+      <line class="ln" x1="345" y1="136" x2="300" y2="176" marker-end="url(#c10a1)"/>
+      <text x="380" y="164" text-anchor="middle" class="lbl-acc2">TileLink ×2</text>
+      <rect class="box-2" x="60" y="178" width="380" height="50" rx="10"/>
+      <text x="250" y="200" text-anchor="middle" class="lbl-b">L2 CoupledL2 · 2MB (코어당)</text>
+      <text x="250" y="219" text-anchor="middle" class="lbl-mono">8-way · 4 bank · inclusive</text>
+      <line class="ln" x1="250" y1="228" x2="250" y2="254" marker-end="url(#c10a1)"/>
+      <text x="262" y="246" class="lbl-acc2">CHI</text>
+      <rect class="box" x="60" y="256" width="380" height="46" rx="10"/>
+      <text x="250" y="277" text-anchor="middle" class="lbl-b">L3 OpenLLC · 32MB</text>
+      <text x="250" y="295" text-anchor="middle" class="lbl-mono">16-way · 4 bank</text>
+      <line class="ln" x1="250" y1="302" x2="250" y2="318" marker-end="url(#c10a1)"/>
+      <rect class="box-grey" x="170" y="320" width="160" height="26" rx="8"/>
+      <text x="250" y="338" text-anchor="middle" class="lbl">DRAM</text>
+      <line class="ln-acc" x1="22" y1="90" x2="22" y2="336" marker-end="url(#c10a1)"/>
+      <text x="40" y="214" class="lbl-dim" transform="rotate(-90 40 214)" text-anchor="middle">아래로 갈수록 크고 느리다</text>
+    </svg>
+    <figcaption>DefaultConfig의 메모리 계층. L1과 L2는 TileLink(DCache는 채널 2개), L2와 L3는 CHI로 잇는다. 근거: top/Configs.scala:583-589, xiangshan/L2Top.scala:146, 233, 368.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <tr><th>층 (구현)</th><th class="num">용량</th><th class="num">way</th><th class="num">set (bank당)</th></tr>
+    <tr><td>L1D (DCache)</td><td class="num">64KB</td><td class="num">4</td><td class="num">256</td></tr>
+    <tr><td>L2 (CoupledL2)</td><td class="num">2MB</td><td class="num">8</td><td class="num">1024</td></tr>
+    <tr><td>L3 (OpenLLC)</td><td class="num">32MB</td><td class="num">16</td><td class="num">8192</td></tr>
+  </table></div>
+  <p>set 수는 용량 / bank 수 / way / 64B로 계산했다. L1D 64·1024/4/64 = 256 (<code>Configs.scala:300, 587</code>), L2 2MB/4/8/64 = 1024 (<code>:323, 339, 586</code>), L3 32MB/4/16/64 = 8192 (<code>:382, 584</code>). L3 기본값은 OpenLLC다(<code>system/SoC.scala:84</code>). <code>Configs.scala</code>의 경로 접두는 <code>src/main/scala/top/</code>이다. 각 층이 hit에 몇 사이클 걸리는지는 이 저장소에 없다. L2와 L3 파이프라인은 git 서브모듈(XSCache, 핀 <code>300515bc</code>) 안에 있고, 이 체크아웃에서는 서브모듈이 비어 있다. 그래서 아래 계산기의 지연값은 모두 <b>가정</b>이며 독자가 바꿀 수 있게 두었다.</p>
+
+  <div class="callout decision"><strong>2026-05-25 TileLink 전용 구성 제거 (#5992)</strong><p>커밋 <code>46fdc552b</code> "remove TileLink version of XiangShan"으로 HuanCun 기반 구성이 빠지고 L2 아래는 CHI만 남았다. 같은 달 2026-05-18에는 L2를 2MB로 정했다(<code>3931c5112</code>, #5969).</p></div>
+
+  <div class="formula">AMAT = t<sub>L1</sub> + m<sub>1</sub> × ( t<sub>L2</sub> + m<sub>2</sub> × ( t<sub>L3</sub> + m<sub>3</sub> × t<sub>DRAM</sub> ) )
+    <span class="where">m은 그 층에 도착한 요청 중 miss 비율(local miss rate), t는 그 층 응답 시간. 평균 메모리 접근 시간(Average Memory Access Time)이다.</span></div>
+
+  <div class="sim" id="sim-amat">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>AMAT 계산기 (지연값은 가정)</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="amat-cv" class="short"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>L1 miss율 % <output data-for="m1" data-fmt="int"></output></label><input type="range" data-k="m1" min="0" max="30" step="1" value="5"></div>
+        <div class="ctl"><label>L2 local miss율 % <output data-for="m2" data-fmt="int"></output></label><input type="range" data-k="m2" min="0" max="90" step="5" value="30"></div>
+        <div class="ctl"><label>L3 local miss율 % <output data-for="m3" data-fmt="int"></output></label><input type="range" data-k="m3" min="0" max="90" step="5" value="40"></div>
+        <div class="ctl"><label>t L1 (가정, 사이클) <output data-for="t1" data-fmt="int"></output></label><input type="range" data-k="t1" min="1" max="10" step="1" value="4"></div>
+        <div class="ctl"><label>t L2 (가정) <output data-for="t2" data-fmt="int"></output></label><input type="range" data-k="t2" min="5" max="40" step="1" value="15"></div>
+        <div class="ctl"><label>t L3 (가정) <output data-for="t3" data-fmt="int"></output></label><input type="range" data-k="t3" min="20" max="120" step="5" value="45"></div>
+        <div class="ctl"><label>t DRAM (가정) <output data-for="tm" data-fmt="int"></output></label><input type="range" data-k="tm" min="100" max="600" step="10" value="250"></div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">AMAT</span><span class="v acc" id="amat-v">0</span></div>
+      <div class="stat"><span class="k">L2·L3 없이 바로 DRAM</span><span class="v" id="amat-flat">0</span></div>
+      <div class="stat"><span class="k">DRAM까지 가는 비율</span><span class="v" id="amat-dram">0</span></div>
+    </div>
+    <div class="sim-note">① L1 miss율을 5%에서 10%로 올려 AMAT가 얼마나 느는지 보세요. ② L2 local miss율을 90%로 올리면 L2가 거의 쓸모없어져 "바로 DRAM" 값에 가까워집니다. ③ 막대 중 어느 칸이 가장 큰지 보세요. 대개 드문 DRAM 접근이 평균을 지배합니다. 세 지연값은 코드에서 확인할 수 없는 가정입니다(1절).</div>
+  </div>
+</section>
+
+<section>
+  <h2>주소를 자르는 법: offset, set, way, tag</h2>
+  <p>캐시는 거대한 사물함과 같다. 사물함 줄(<span class="term" data-def="같은 index를 가진 라인들이 들어갈 수 있는 한 묶음. N-way면 set 하나에 라인 N개가 들어간다.">set</span><span class="en">(set)</span>)은 주소의 일부로 정해지고, 한 줄에는 칸(<b>way</b>)이 4개 있다. 주소를 세 조각으로 자르면 된다. 맨 아래 <b>offset</b>은 라인 안의 바이트 위치, 그 위 <b>index</b>는 몇 번째 set인지, 나머지 위쪽 비트인 <b>tag</b>는 "이 칸의 라인이 정말 내 주소인가"를 비교하는 이름표다.</p>
+  <p>KMHv3 DCache의 실제 숫자로 해 보자. 라인이 64B이므로 offset은 6비트다(<code>DCacheSetOffset = 1 + log2(32) = 6</code>, <code>DCacheWrapper.scala:190</code>). set이 256개이므로 index는 8비트다. 데이터 배열은 2바이트 폭 <span class="term" data-def="데이터 SRAM을 여러 조각으로 나눠 같은 사이클에 여러 load가 서로 다른 조각을 읽게 하는 구조. KMHv3 DCache는 32 bank × 2B (DCacheWrapper.scala:165, 168).">bank</span> 32개로 나뉘어 있고 bank 번호는 <code>vaddr[5:1]</code>이다(<code>addr_to_dcache_bank</code>, <code>DCacheWrapper.scala:255-258</code>). tag는 물리주소 <code>paddr[47:12]</code>, 36비트다(<code>tagBits = 48 − 12</code>, <code>L1Cache.scala:56, 93</code>).</p>
+  <p>여기서 문제가 하나 생긴다. load가 s0에서 가진 것은 가상주소뿐이고 물리주소는 TLB가 한 사이클 뒤에 준다. 그래서 index는 가상주소로, tag는 물리주소로 비교한다. 이것을 <span class="term" data-def="Virtually Indexed, Physically Tagged. 번역 전에 SRAM 읽기를 시작하고, 번역 결과로 tag를 비교한다.">VIPT</span><span class="en">(virtually indexed, physically tagged)</span>라 한다. 4KB 페이지 안쪽 12비트는 가상·물리주소가 같지만, 256 set × 64B = 16KB라 index가 페이지 밖 2비트를 더 쓴다. 같은 물리 라인을 가리키는 두 가상주소가 이 2비트에서 달라지면 같은 라인이 서로 다른 set 두 곳에 들어갈 수 있다. 이것이 <span class="term" data-def="같은 물리 라인이 가상주소 차이 때문에 캐시의 두 위치에 동시에 들어가는 문제. KMHv3는 aliasBits = log2(16KB/4KB) = 2 (DCacheWrapper.scala:76-77).">alias</span>다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="DCache 주소 분해: 가상주소의 해시, set, offset과 물리주소의 tag">
+      <defs><marker id="c10a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="20" y="20" class="lbl-dim">가상주소 vaddr (s0에 있음)</text>
+      <text x="22" y="40" class="lbl-mono">47</text><text x="204" y="40" class="lbl-mono">12</text><text x="222" y="40" class="lbl-mono">11</text><text x="328" y="40" class="lbl-mono">6</text><text x="344" y="40" class="lbl-mono">5</text><text x="428" y="40" class="lbl-mono">0</text>
+      <rect class="box-2" x="20" y="46" width="200" height="40" rx="6"/><text x="120" y="71" text-anchor="middle" class="lbl-b">VPN 36비트</text>
+      <rect class="box-acc" x="220" y="46" width="120" height="40" rx="6"/><text x="280" y="71" text-anchor="middle" class="lbl-b">set[5:0]</text>
+      <rect class="box" x="340" y="46" width="100" height="40" rx="6"/><text x="390" y="64" text-anchor="middle" class="lbl-b">offset</text><text x="390" y="80" text-anchor="middle" class="lbl-mono">bank=[5:1]</text>
+      <line class="ln" x1="120" y1="86" x2="120" y2="112" marker-end="url(#c10a2)"/>
+      <rect class="box-warn" x="20" y="114" width="200" height="40" rx="6"/><text x="120" y="133" text-anchor="middle" class="lbl-b">⊕ 2비트씩 18쌍</text><text x="120" y="149" text-anchor="middle" class="lbl-mono">→ set[7:6] = alias</text>
+      <line class="ln-dash" x1="280" y1="86" x2="280" y2="190"/><line class="ln-dash" x1="390" y1="86" x2="390" y2="190"/>
+      <text x="20" y="184" class="lbl-dim">물리주소 paddr (s1에 TLB가 줌)</text>
+      <rect class="box-ok" x="20" y="192" width="200" height="40" rx="6"/><text x="120" y="217" text-anchor="middle" class="lbl-b">tag = paddr[47:12]</text>
+      <rect class="box" x="220" y="192" width="220" height="40" rx="6"/><text x="330" y="217" text-anchor="middle" class="lbl">페이지 안 12비트: VA와 같음</text>
+    </svg>
+    <figcaption>set 번호 8비트 = (vaddr[47:12]를 2비트씩 XOR한 2비트) ∥ vaddr[11:6]. tag는 물리 PPN 전체다. 근거: L1Cache.scala:82-102, DCacheWrapper.scala:255-258, 299-310 (경로 접두 src/main/scala/xiangshan/cache/).</figcaption>
+  </figure>
+
+  <p>set의 위쪽 2비트는 그냥 <code>vaddr[13:12]</code>를 써도 된다. 실제로 예전 방식(<code>modeId = 2</code>)이 그랬다. 하지만 16KB 간격으로 정렬된 배열 여러 개를 함께 훑으면 모두 같은 set에 몰린다. 4-way set에 5번째 배열이 들어오면 매번 누군가 쫓겨난다. 지금 기본(<code>modeId = 1</code>, <code>L1Cache.scala:81</code>)은 <code>vaddr[47:12]</code>를 2비트씩 잘라 18쌍을 XOR한다. 위쪽 비트가 다른 배열은 다른 set으로 흩어진다. 같은 2비트가 alias 값이 되어 miss 요청에 실려 L2로 간다(<code>MissQueue.scala:304</code>). L2는 L1D 클라이언트 설정의 <code>aliasBitsOpt</code>(<code>Configs.scala:349</code>)로 이를 받아 alias를 정리한다. 정리 방법 자체는 L2 소스가 없어 확인하지 못했다(추론).</p>
+  <div class="callout decision"><strong>2026-07-03 DCache set index 해시 (#6166)</strong><p>커밋 <code>07162cca0</code> "optimize L1DCache index". 메시지: 기존 <code>vaddr[13:6]</code> index가 bwaves의 순차 접근에서 잦은 eviction을 일으켰고, <code>set[7:6] = hash(vaddr[47:12])</code>로 바꿔 bwaves에서 10.64% 향상. 예전 방식은 <code>modeId = 2</code>로 남겨 두었다.</p></div>
+
+  <div class="sim" id="sim-addr">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>주소 분해기와 set 몰림 실험</h3></div>
+    <div class="sim-body">
+      <div class="c10-two">
+        <div class="ctl"><label>가상주소 vaddr (16진)</label><input class="c10-in" type="text" data-k="va" value="0x7f12345678c8" spellcheck="false"></div>
+        <div class="ctl"><label>물리 PPN = paddr[47:12] (16진)</label><input class="c10-in" type="text" data-k="ppn" value="0x80123" spellcheck="false"></div>
+      </div>
+      <div class="seg" id="addr-mode"><button class="on">modeId 1: 해시 (기본)</button><button>modeId 2: vaddr[13:6]</button></div>
+      <div class="table-wrap"><table class="data" id="addr-tbl"></table></div>
+      <div class="c10-two">
+        <div class="ctl"><label>함께 훑는 배열 수 <output data-for="n" data-fmt="int"></output></label><input type="range" data-k="n" min="1" max="16" step="1" value="8"></div>
+        <div class="ctl"><label>배열 시작 간격 2^k 바이트, k <output data-for="k" data-fmt="int"></output></label><input type="range" data-k="k" min="12" max="24" step="1" value="14"></div>
+      </div>
+      <div class="c10-grid g4" id="addr-bars"></div>
+      <div class="verdict grey" id="addr-verdict">-</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">set (10진)</span><span class="v acc" id="addr-set">-</span></div>
+      <div class="stat"><span class="k">alias 2비트</span><span class="v" id="addr-alias">-</span></div>
+      <div class="stat"><span class="k">한 set 최대 배열 수 (해시)</span><span class="v" id="addr-m1">-</span></div>
+      <div class="stat"><span class="k">한 set 최대 배열 수 (구방식)</span><span class="v" id="addr-m2">-</span></div>
+    </div>
+    <div class="sim-note">① 간격 k=14(16KB), 배열 8개에서 두 방식을 바꿔 보세요. 구방식은 8개가 한 set에 몰려 4 way를 넘습니다. ② k=12(4KB)로 줄이면 두 방식 모두 고르게 퍼집니다. ③ 위 주소의 bit 13:12만 바꿔 alias가 어떻게 바뀌는지 보세요. 배열은 같은 offset에서 시작한다고 가정한 합성 입력입니다. 규칙은 2절의 <code>get_dcache_idx</code>.</div>
+  </div>
+</section>
+
+<section>
+  <h2>hit 판정: LoadPipe 네 단계와 bank</h2>
+  <p>DCache 안에는 load 전용 <code>LoadPipe</code>가 3개 있다(<code>LoadPipelineWidth = 3</code>, <code>Parameters.scala:166</code>). 하나의 load는 네 단계를 지난다. s0에서 가상주소로 set을 정하고 4 way의 tag와 상태(meta)를 모두 읽기 시작한다(<code>way_en = ~0</code>, <code>LoadPipe.scala:154-159</code>). s1에서 TLB가 준 물리주소로 tag를 비교한다. tag가 같고 라인이 유효하면 tag match다(<code>LoadPipe.scala:213</code>). 다만 hit는 권한까지 맞아야 한다. <code>s1_hit = tag_match && has_permission && 상태 변화 없음</code>(<code>LoadPipe.scala:295</code>)이다. s2에서 데이터가 나오고, miss면 MSHR에 요청한다. s3에서 교체 정보(PLRU)를 갱신한다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 236" role="img" aria-label="LoadPipe s0부터 s3까지 단계별 동작과 TLB의 관계">
+      <defs><marker id="c10a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="64" y="18" text-anchor="middle" class="lbl-acc">s0</text><text x="172" y="18" text-anchor="middle" class="lbl-acc">s1</text><text x="280" y="18" text-anchor="middle" class="lbl-acc">s2</text><text x="388" y="18" text-anchor="middle" class="lbl-acc">s3</text>
+      <rect class="box-acc" x="12" y="28" width="104" height="86" rx="8"/><text x="64" y="54" text-anchor="middle" class="lbl-b">vaddr로</text><text x="64" y="74" text-anchor="middle" class="lbl-b">set 계산</text><text x="64" y="98" text-anchor="middle" class="lbl-dim">tag·meta 읽기</text>
+      <rect class="box-acc" x="120" y="28" width="104" height="86" rx="8"/><text x="172" y="54" text-anchor="middle" class="lbl-b">tag 비교</text><text x="172" y="74" text-anchor="middle" class="lbl-b">권한 확인</text><text x="172" y="98" text-anchor="middle" class="lbl-dim">bank 읽기 요청</text>
+      <rect class="box-acc" x="228" y="28" width="104" height="86" rx="8"/><text x="280" y="54" text-anchor="middle" class="lbl-b">데이터 응답</text><text x="280" y="74" text-anchor="middle" class="lbl-b">miss → MSHR</text><text x="280" y="98" text-anchor="middle" class="lbl-dim">nack·replay 판정</text>
+      <rect class="box-acc" x="336" y="28" width="104" height="86" rx="8"/><text x="388" y="54" text-anchor="middle" class="lbl-b">PLRU 갱신</text><text x="388" y="74" text-anchor="middle" class="lbl-b">ECC 보고</text><text x="388" y="98" text-anchor="middle" class="lbl-dim">s2 kill이면 생략</text>
+      <rect class="box-2" x="12" y="146" width="104" height="44" rx="8"/><text x="64" y="173" text-anchor="middle" class="lbl-b">TLB 조회</text>
+      <rect class="box-2" x="120" y="146" width="104" height="44" rx="8"/><text x="172" y="173" text-anchor="middle" class="lbl-b">paddr 응답</text>
+      <line class="ln" x1="116" y1="168" x2="120" y2="168"/>
+      <line class="ln" x1="172" y1="146" x2="172" y2="117" marker-end="url(#c10a3)"/>
+      <text x="230" y="214" class="lbl-dim">index는 vaddr(s0), tag는 paddr(s1)</text>
+    </svg>
+    <figcaption>DCache hit 데이터는 s2에 나온다. TLB는 요청 다음 사이클에 물리주소를 주므로 tag 비교는 s1이다. 근거: LoadPipe.scala:154-159, 213, 295, 572; cache/mmu/TLB.scala:41.</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">LoadPipe s2 · nack</span><h4>miss를 받아 줄 곳이 없으면 되돌려 보낸다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s2_nack = s1 nack || (miss && MSHR not ready) || 데이터 배열 not ready || (miss && 같은 블록이 WBQ에 있음)</dd>
+      <dt>이유</dt><dd class="why">miss를 기록할 MSHR이 없거나, 같은 라인을 아직 L2로 내보내는(Release) 중이면 지금 요청을 받을 수 없다.</dd>
+      <dt>없으면</dt><dd>MSHR이 넘치거나, Release보다 먼저 도착한 Acquire가 L2에서 낡은 데이터를 받아 온다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/dcache/loadpipe/LoadPipe.scala:384-389@09453ff8 (replay는 :461)</dd>
+    </dl>
+  </div>
+  <p>miss라도 MSHR에 성공적으로 들어가면 replay하지 않는다. load는 9장의 LoadQueue에 앉아 refill을 기다린다(<code>resp.bits.handled</code>, <code>LoadPipe.scala:469</code>). 되돌려 보내는 것은 nack, cancel, bank conflict, way 예측 실패뿐이다(<code>LoadPipe.scala:461</code>). load가 이 신호를 받아 무엇을 하는지는 <a href="ch09-loadstore.html">9장</a>에서 다뤘다.</p>
+
+  <h3>bank conflict: 한 사이클에 load 셋이 같은 bank를 원할 때</h3>
+  <p>bank 하나는 단일 포트 SRAM이고, 한 행에 같은 set의 4 way를 모두 담는다(<code>packedRowBits = DCacheWays × encDataBits</code>, <code>BankedDataArray.scala:181</code>). 8B 스칼라 load는 bank 4개(<code>DCacheWordBankCount = 8/2</code>), 16B 벡터 load는 8개를 읽는다(<code>DCacheVWordBankCount = 128/16</code>, <code>DCacheWrapper.scala:183-184</code>). 두 load가 같은 bank를 원해도 <b>같은 set</b>이면 같은 행을 함께 읽으므로 괜찮다. 다른 set이면 한 포트로 두 행을 읽을 수 없다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">BankedDataArray · rr_bank_conflict</span><h4>같은 bank·다른 set이면 가장 오래된 load만 읽는다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">x≠y, 둘 다 valid && 같은 div && (bankMask(x) & bankMask(y)) ≠ 0 && set(x) ≠ set(y) → 충돌. 충돌한 포트 중 lqIdx가 가장 오래된 하나만 통과, 나머지는 다음 사이클 bank_conflict_slow → replay</dd>
+      <dt>이유</dt><dd class="why">단일 포트 SRAM은 한 사이클에 한 행만 읽는다. 오래된 load를 우선해 프로그램 앞부분이 먼저 진행되게 한다.</dd>
+      <dt>없으면</dt><dd>두 주소가 한 SRAM 포트에 동시에 들어가 한쪽이 엉뚱한 행의 데이터를 받는다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/dcache/data/BankedDataArray.scala:740-762, 799-801@09453ff8 (selcetOldestPort :343-365)</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-06-30 32×2B bank (#6118), 2026-07-31 충돌 패자 빠른 재시도 (#6242)</strong><p><code>567d1da56</code>에서 데이터 배열을 32 bank × 2B로 바꾸고 한 SRAM 행에 모든 way를 담았다. lqIdx가 가장 오래된 load가 이기는 규칙은 그보다 앞선 2024-12-13 <code>8ffb12e45</code>(#4036)에서 들어왔다. <code>4ce2f88ae</code>는 진 load를 따로 알리는 <code>rr_bank_conflict_slow</code>(<code>BankedDataArray.scala:800</code>)와, 패자들의 빠른 재시도를 round-robin으로 고르는 중재기(<code>mem/MemBlock.scala:891-894</code>)를 더했다.</p></div>
+
+  <div class="sim" id="sim-bank">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>load 세 개의 bank conflict 판정기</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><div class="c10-pad" id="bank-view"></div></div>
+      <div class="sim-controls">
+        <div class="seg" id="bank-size"><button class="on">8B load</button><button>16B load</button></div>
+        <div class="ctl"><label>P0 라인 offset <output data-for="o0" data-fmt="int"></output></label><input type="range" data-k="o0" min="0" max="56" step="8" value="0"></div>
+        <div class="ctl"><label>P0 set <output data-for="s0" data-fmt="int"></output></label><input type="range" data-k="s0" min="0" max="7" step="1" value="3"></div>
+        <div class="ctl"><label>P1 라인 offset <output data-for="o1" data-fmt="int"></output></label><input type="range" data-k="o1" min="0" max="56" step="8" value="8"></div>
+        <div class="ctl"><label>P1 set <output data-for="s1" data-fmt="int"></output></label><input type="range" data-k="s1" min="0" max="7" step="1" value="5"></div>
+        <div class="ctl"><label>P2 라인 offset <output data-for="o2" data-fmt="int"></output></label><input type="range" data-k="o2" min="0" max="56" step="8" value="0"></div>
+        <div class="ctl"><label>P2 set <output data-for="s2" data-fmt="int"></output></label><input type="range" data-k="s2" min="0" max="7" step="1" value="4"></div>
+        <div class="seg" id="bank-old"><button class="on">P0 최고참</button><button>P1</button><button>P2</button></div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">P0</span><span class="v" id="bank-r0">-</span></div>
+      <div class="stat"><span class="k">P1</span><span class="v" id="bank-r1">-</span></div>
+      <div class="stat"><span class="k">P2</span><span class="v" id="bank-r2">-</span></div>
+    </div>
+    <div class="sim-note">① 기본값에서 P0와 P2가 bank 0-3을 두고 다투는데 set이 달라 P2가 replay됩니다. 최고참을 P2로 바꿔 보세요. ② P2의 set을 3으로 맞추면 같은 행을 함께 읽어 충돌이 사라집니다. ③ 16B load로 바꾸면 bank 8개를 써서 충돌이 잦아집니다. 나이 순서는 최고참 다음부터 포트 번호 순으로 둔 합성 입력입니다. 규칙은 3절 게이트.</div>
+  </div>
+</section>
+
+<section>
+  <h2>miss와 MSHR: 기다리는 동안 다른 일을 한다</h2>
+  <p>식당 주방에 주문서 꽂이가 있다고 하자. 재료가 떨어진 주문은 꽂이에 꽂아 두고 다음 주문을 받는다. 재료가 오면 꽂이에서 주문서를 빼 요리를 마저 한다. 이 꽂이 한 칸이 <span class="term" data-def="Miss Status Holding Register. 진행 중인 miss 하나를 기억하는 칸. 여러 개면 miss가 동시에 여러 개 진행된다(non-blocking cache).">MSHR</span><span class="en">(Miss Status Holding Register)</span>이다. KMHv3 DCache의 <code>MissQueue</code>에는 <code>MissEntry</code>가 16개 있다(<code>nMissEntries = 16</code>, <code>Configs.scala:308</code>; <code>MissQueue.scala:1242</code>).</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 300" role="img" aria-label="MSHR가 L2와 주고받는 TileLink 메시지 순서">
+      <defs><marker id="c10a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-acc" x="30" y="8" width="160" height="40" rx="8"/><text x="110" y="33" text-anchor="middle" class="lbl-b">DCache MSHR</text>
+      <rect class="box-2" x="280" y="8" width="160" height="40" rx="8"/><text x="360" y="33" text-anchor="middle" class="lbl-b">L2 (CoupledL2)</text>
+      <line class="ln-dash" x1="110" y1="48" x2="110" y2="292"/><line class="ln-dash" x1="360" y1="48" x2="360" y2="292"/>
+      <line class="ln" x1="110" y1="76" x2="356" y2="76" marker-end="url(#c10a4)"/><text x="235" y="70" text-anchor="middle" class="lbl">A: AcquireBlock / Perm</text>
+      <line class="ln" x1="360" y1="112" x2="114" y2="112" marker-end="url(#c10a4)"/><text x="235" y="106" text-anchor="middle" class="lbl">D: GrantData 1/2 (32B)</text>
+      <line class="ln" x1="360" y1="144" x2="114" y2="144" marker-end="url(#c10a4)"/><text x="235" y="138" text-anchor="middle" class="lbl">D: GrantData 2/2 (32B)</text>
+      <line class="ln" x1="110" y1="178" x2="356" y2="178" marker-end="url(#c10a4)"/><text x="235" y="172" text-anchor="middle" class="lbl">E: GrantAck</text>
+      <rect class="box-ok" x="20" y="196" width="190" height="40" rx="8"/><text x="115" y="221" text-anchor="middle" class="lbl-b">MainPipe가 라인 기록</text>
+      <line class="ln-bad" x1="110" y1="266" x2="356" y2="266" marker-end="url(#c10a4)"/><text x="235" y="258" text-anchor="middle" class="lbl-bad">C: ReleaseData (Dirty 희생자)</text>
+    </svg>
+    <figcaption>miss 하나의 일생. 버스 폭이 256비트라 64B 라인은 2 beat로 온다. 쫓겨나는 라인이 Dirty면 WritebackQueue가 C 채널로 내려 보낸다. 근거: MissQueue.scala:290-302, 573-587; Parameters.scala:890; L1Cache.scala:70; MainPipe.scala:812-815.</figcaption>
+  </figure>
+  <p>순서는 이렇다. MSHR을 할당하고 A 채널로 <code>AcquireBlock</code>(데이터가 필요할 때) 또는 <code>AcquirePerm</code>(store가 라인 전체를 덮어쓸 때)을 보낸다(<code>MissQueue.scala:290-302</code>). D 채널로 Grant가 2 beat 오면 E 채널로 <code>GrantAck</code>를 보내고, <code>MainPipe</code>에 refill을 맡긴다. MainPipe가 tag·meta·data를 기록하고 응답하면 칸이 풀린다(<code>release_entry = s_grantack && w_mainpipe_resp && w_refill_resp</code>, <code>MissQueue.scala:587</code>). L1과 L2 사이에는 채널이 2개 있고, MSHR마다 <code>paddr[6]</code>로 채널을 고정해 A·D·E가 같은 길로 다닌다(<code>MissQueue.scala:549-557</code>; 2026-07-22 <code>06f4a7404</code>, #6178).</p>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">MissEntry · should_merge / should_reject</span><h4>같은 블록의 두 번째 miss는 합치거나 돌려보낸다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">같은 블록 && alias 일치 && (데이터 첫 beat 전이고 새 요청이 load || refill 응답 전이고 기존·새 요청 모두 store) → merge. 같은 블록인데 위 조건이 아니거나 alias가 다르면 → reject</dd>
+      <dt>이유</dt><dd class="why">같은 라인을 두 번 Acquire하면 L2 대역폭이 낭비되고 두 MSHR이 같은 라인을 다른 way에 채울 수 있다. 데이터가 이미 오기 시작한 뒤에는 새 load에 데이터를 나눠 줄 시점을 놓쳤으므로 거절한다.</dd>
+      <dt>없으면</dt><dd>한 라인이 캐시에 두 벌 생기거나(LoadPipe의 "tag가 2 way에 맞으면 안 된다" assert, <code>LoadPipe.scala:265</code>), MSHR이 쓸데없이 소모된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/dcache/mainpipe/MissQueue.scala:868-907@09453ff8 (before_req_sent_can_merge는 타이밍 때문에 항상 false, :859-866)</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">MissEntry · primary_ready</span><h4>프리페치는 정해진 칸에만 들어간다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">id ≥ nMissEntries − nMaxPrefetchEntry 인 칸만 프리페치를 새로 받는다 (memset 패턴 감지 시 예외). nMaxPrefetchEntry는 Constantin 기록, 초기값 nMissEntries − 2 = 14 → id 2..15가 프리페치 수락, id 0·1은 demand 전용</dd>
+      <dt>이유</dt><dd class="why">프리페치가 몰려도 demand load가 쓸 MSHR을 남겨 둔다.</dd>
+      <dt>없으면</dt><dd>프리페치 폭주 때 모든 칸이 차서 진짜 load가 nack을 받고 replay를 반복한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/dcache/mainpipe/MissQueue.scala:910-917, 1728, 1780@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="callout warn"><strong>설정값 6은 실제로 쓰이지 않는다</strong><p><code>Configs.scala:311</code>은 <code>nMaxPrefetchEntry = 6</code>을 주지만, 이 값은 <code>DCacheWrapper.scala:171</code>에서 읽혀 <code>:1035</code>에서 출력될 뿐이다. MSHR이 실제로 비교하는 값은 <code>MissQueue.scala:1728</code>의 Constantin 기록이다. 초기값은 <code>nMissEntries − 2</code>다. Constantin이 꺼진 빌드에서 이 초기값이 그대로 상수가 된다는 점은 utility 서브모듈이 없어 확인하지 못했다(추론).</p></div>
+
+  <div class="sim" id="sim-mshr">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>MSHR 16칸: 할당, merge, reject, nack</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><div class="c10-pad"><div class="c10-grid" id="mshr-grid"></div><div class="c10-log" id="mshr-log">-</div></div></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>L2 응답 지연 (가정) <output data-for="lat" data-fmt="int"></output></label><input type="range" data-k="lat" min="8" max="80" step="2" value="30"></div>
+        <div class="ctl"><label>요청 중 프리페치 비율 <output data-for="pf" data-fmt="f2"></output></label><input type="range" data-k="pf" min="0" max="0.9" step="0.05" value="0.5"></div>
+        <div class="ctl"><label>nMaxPrefetchEntry <output data-for="npf" data-fmt="int"></output></label><input type="range" data-k="npf" min="1" max="16" step="1" value="14"></div>
+        <div class="btn-row"><button class="btn primary" id="mshr-run">재생</button><button class="btn" id="mshr-step">한 사이클</button><button class="btn" id="mshr-reset">처음으로</button></div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">사이클 / 사용 중</span><span class="v" id="mshr-use">0</span></div>
+      <div class="stat"><span class="k">merge</span><span class="v ok" id="mshr-merge">0</span></div>
+      <div class="stat"><span class="k">reject (같은 블록)</span><span class="v warn" id="mshr-rej">0</span></div>
+      <div class="stat"><span class="k">demand nack (칸 없음)</span><span class="v bad" id="mshr-nack">0</span></div>
+      <div class="stat"><span class="k">프리페치 거절</span><span class="v" id="mshr-pfrej">0</span></div>
+    </div>
+    <div class="sim-note">① 재생 후 칸 0·1(demand 전용)에 프리페치(초록)가 들어가지 않는지 보세요. ② nMaxPrefetchEntry를 6(설정값)으로 내리면 프리페치 거절이 늘고 demand nack은 줄어듭니다. ③ 지연을 80으로 올리면 칸이 오래 묶여 nack이 늘어납니다. 요청 흐름은 고정 시드 합성 입력이고, 첫 beat = 할당 + 지연, 해제 = 첫 beat + 3사이클은 가정입니다. 규칙은 4절 게이트 두 개.</div>
+  </div>
+</section>
+
+<section>
+  <h2>쓰기, 교체, 일관성</h2>
+  <p>store는 9장에서 본 Sbuffer에 모였다가 DCache <code>MainPipe</code>로 들어온다(<code>MainPipe.scala:261-262</code>). tag·일관성 상태·데이터를 <b>쓰는</b> 파이프는 MainPipe뿐이다. LoadPipe s3는 접근 표시와 프리페치 표시 비트만 고친다(<code>LoadPipe.scala:577, 586</code>). 들어오는 요청은 고정 우선순위로 고른다. <b>probe &gt; refill &gt; prefetch &gt; store &gt; atomic</b>(<code>MainPipe.scala:282-292</code>; chisel <code>Arbiter</code>는 앞 번호 우선, <code>mem/MemBlock.scala:85-95</code>). L2가 회수하려는 라인(probe)을 먼저 처리해야 다른 코어가 기다리지 않고, 도착한 데이터(refill)를 먼저 넣어야 MSHR이 풀린다.</p>
+  <p>KMHv3 L1D는 <span class="term" data-def="쓰기를 캐시에만 하고 라인에 Dirty 표시를 남겼다가, 쫓겨날 때 아래 층으로 내려 보내는 방식. 매번 아래에도 쓰는 write-through와 대비된다.">write-back</span><span class="en">(write-back)</span> 캐시다. store hit은 데이터만 고치고 상태를 Dirty로 둔다. 라인이 쫓겨날 때 Dirty면 <code>ReleaseData</code>로 L2에 내려 보낸다(<code>need_wb = miss_wb || probe_wb || replace_wb</code>, <code>MainPipe.scala:812-815</code>). WritebackQueue는 18칸이다(<code>Configs.scala:310</code>).</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">MainPipe s0 · set_conflict</span><h4>같은 set을 연달아 고치지 않는다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s0_can_go = meta·tag ready && s1_ready && !(s1·s2·s3 중 같은 set 존재)</dd>
+      <dt>이유</dt><dd class="why">s0에서 읽은 meta가 앞서 가는 요청의 쓰기(s3) 전 값이면 낡은 상태로 판단한다(RAW 위험).</dd>
+      <dt>없으면</dt><dd>같은 set에 refill 두 개가 잇달아 오면 둘 다 같은 victim way를 고를 수 있다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/dcache/mainpipe/MainPipe.scala:249-250, 305@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">WritebackQueue · block_miss_req</span><h4>내보내는 중인 라인은 다시 요청하지 않는다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">WBQ 엔트리 중 같은 블록 주소가 있으면 새 WB 요청(block_conflict)과 같은 블록 miss 요청(block_miss_req)을 막는다</dd>
+      <dt>이유</dt><dd class="why">Release가 L2에 닿기 전에 같은 라인의 Acquire가 앞지르면 L2가 아직 갱신 전 데이터를 줄 수 있다.</dd>
+      <dt>없으면</dt><dd>방금 쓴 store 값이 사라진 것처럼 보이는 일관성 오류.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/dcache/mainpipe/WritebackQueue.scala:385-391@09453ff8 → LoadPipe s2_nack_wbq_conflict (:386)</dd>
+    </dl>
+  </div>
+
+  <h3>교체: 누구를 내보낼까</h3>
+  <p>set의 4 way가 다 찼는데 새 라인이 오면 하나를 내보내야(victim) 한다. 가장 오래 안 쓴 것을 고르는 LRU가 이상적이지만, way마다 순서를 기록하는 비용이 크다. DCache는 <code>"setplru"</code>를 쓴다(<code>Configs.scala:307</code>; <code>ReplacementPolicy.fromString</code>, <code>DCacheWrapper.scala:1718</code>). 구현은 utility 서브모듈에 있어 직접 보지 못했다. 이름으로 보아 set마다 트리 비트 3개로 LRU를 흉내 내는 <span class="term" data-def="Pseudo-LRU. 4-way면 이진 트리 비트 3개로 '최근에 안 쓴 쪽'을 가리킨다. 정확한 LRU보다 싸지만 가끔 다른 victim을 고른다.">PLRU</span>로 보인다(추론). 눈여겨볼 규칙이 둘 있다.</p>
+  <ul class="check">
+    <li><b>빈 way를 먼저 고르지 않는다.</b> MainPipe s1의 victim은 <code>UIntToOH(replace_way.way)</code> 그대로다(<code>MainPipe.scala:431-435</code>). 빈 way 벡터 <code>s1_invalid_way_en</code>은 계산만 되고 쓰이지 않는다(<code>:430</code>, grep 결과 정의 1곳). 성능 카운터 <code>store_has_invalid_way_but_select_valid_way</code>(<code>:460</code>)가 바로 이 상황을 센다.</li>
+    <li><b>취소된 load는 교체 정보를 건드리지 않는다.</b> LoadPipe는 <code>s3_valid && s3_hit && !s3_kill</code>일 때만 PLRU를 갱신한다(<code>LoadPipe.scala:572</code>; 2026-07-08 <code>4f6732c0a</code>, #6185). MainPipe는 probe가 아닌 miss refill과 store·AMO hit에서 갱신한다(<code>MainPipe.scala:1108</code>).</li>
+  </ul>
+
+  <div class="sim" id="sim-plru">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>set 하나의 트리 PLRU와 진짜 LRU</h3></div>
+    <div class="sim-body">
+      <div class="btn-row" id="plru-btns"><button class="btn" data-a="A">A</button><button class="btn" data-a="B">B</button><button class="btn" data-a="C">C</button><button class="btn" data-a="D">D</button><button class="btn" data-a="E">E</button><button class="btn" data-a="F">F</button><button class="btn" id="plru-inv">way 1 Probe 무효화</button><button class="btn" id="plru-seq">A B C D A D E 넣기</button><button class="btn" id="plru-reset">처음으로</button></div>
+      <div class="c10-two"><div><b>트리 PLRU (DCache, 추론)</b><div class="c10-grid g4" id="plru-p"></div><div class="c10-log" id="plru-pbits">-</div></div><div><b>진짜 LRU (비교용)</b><div class="c10-grid g4" id="plru-l"></div><div class="c10-log" id="plru-lord">-</div></div></div>
+      <div class="verdict grey" id="plru-verdict">블록 버튼을 눌러 접근하세요</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">PLRU hit / miss</span><span class="v acc" id="plru-ph">0 / 0</span></div>
+      <div class="stat"><span class="k">LRU hit / miss</span><span class="v" id="plru-lh">0 / 0</span></div>
+      <div class="stat"><span class="k">다음 victim (PLRU / LRU)</span><span class="v" id="plru-next">-</span></div>
+    </div>
+    <div class="sim-note">① "A B C D A D E 넣기"를 누르고 E가 어떤 블록을 쫓아내는지 두 방식에서 비교하세요. PLRU는 C, LRU는 B를 내보냅니다. ② 4개를 채운 뒤 "way 1 무효화"를 누르고 새 블록을 넣어 보세요. PLRU는 빈 way 1이 있어도 트리가 가리키는 다른 way를 쫓아낼 수 있습니다. ③ A, B를 번갈아 눌러 hit이 트리 비트를 어떻게 뒤집는지 보세요. 트리 비트 의미는 표준 트리 PLRU로 가정했습니다(5절).</div>
+  </div>
+
+  <h3>일관성: 사본이 여럿일 때</h3>
+  <p>코어마다 L1이 있으면 같은 주소의 사본이 여러 곳에 생긴다. 한 코어가 쓰는 동안 다른 코어가 낡은 사본을 읽으면 안 된다. 이를 지키는 규칙이 <span class="term" data-def="여러 캐시가 같은 주소 사본을 가질 때 값이 어긋나지 않게 하는 규칙. 대표적으로 MESI(Modified/Exclusive/Shared/Invalid).">캐시 일관성</span><span class="en">(coherence)</span>이다. TileLink는 라인마다 권한 상태를 둔다. DCache의 meta 배열이 이 상태(<code>Meta.coh: ClientMetadata</code>, <code>meta/AsynchronousMetaArray.scala:24-26</code>)를 들고 있고, s1의 hit 판정이 "권한까지 맞는가"를 보는 이유가 이것이다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 196" role="img" aria-label="TileLink 권한 상태 Nothing, Branch, Trunk, Dirty와 전이">
+      <defs><marker id="c10a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-grey" x="12" y="60" width="96" height="62" rx="8"/><text x="60" y="84" text-anchor="middle" class="lbl-b">Nothing</text><text x="60" y="104" text-anchor="middle" class="lbl-mono">I · 없음</text>
+      <rect class="box-2" x="128" y="60" width="96" height="62" rx="8"/><text x="176" y="84" text-anchor="middle" class="lbl-b">Branch</text><text x="176" y="104" text-anchor="middle" class="lbl-mono">S · 읽기만</text>
+      <rect class="box-acc" x="244" y="60" width="96" height="62" rx="8"/><text x="292" y="84" text-anchor="middle" class="lbl-b">Trunk</text><text x="292" y="104" text-anchor="middle" class="lbl-mono">E · 쓰기 가능</text>
+      <rect class="box-warn" x="360" y="60" width="90" height="62" rx="8"/><text x="405" y="84" text-anchor="middle" class="lbl-b">Dirty</text><text x="405" y="104" text-anchor="middle" class="lbl-mono">M · 고쳐짐</text>
+      <path class="ln" d="M60,60 Q118,14 172,58" marker-end="url(#c10a5)"/><text x="118" y="26" text-anchor="middle" class="lbl-dim">Acquire</text>
+      <path class="ln" d="M176,60 Q234,14 288,58" marker-end="url(#c10a5)"/><text x="234" y="26" text-anchor="middle" class="lbl-dim">BtoT</text>
+      <path class="ln" d="M292,60 Q348,14 402,58" marker-end="url(#c10a5)"/><text x="348" y="26" text-anchor="middle" class="lbl-dim">store</text>
+      <path class="ln-bad" d="M405,122 Q232,176 64,124" marker-end="url(#c10a5)"/><text x="232" y="184" text-anchor="middle" class="lbl-bad">Probe → ProbeAck / 교체 → Release</text>
+    </svg>
+    <figcaption>TileLink 클라이언트 상태와 MESI의 대응(일반 개념). 권한을 올릴 때는 Acquire, L2가 회수할 때는 Probe, 스스로 내놓을 때는 Release다. Branch 라인에 store하면 BtoT 권한 상승이 필요하므로 tag가 맞아도 hit가 아니다.</figcaption>
+  </figure>
+  <p>L2는 inclusive여야 한다(<code>require(inclusive, "L2 must be inclusive")</code>, <code>Configs.scala:333</code>). L1D에 있는 라인은 반드시 L2에도 있으므로, L2만 보면 누가 사본을 가졌는지 안다. L2는 L1D 몫으로 bank당 128 set × 6 way의 디렉터리 설정을 받는다(<code>sets = 2 × 256 / 4</code>, <code>ways = 4 + 2</code>, <code>Configs.scala:347-348</code>). 디렉터리 동작 자체는 L2 소스가 없어 확인하지 못했다. L2가 보낸 Probe는 8칸 <code>ProbeQueue</code>(<code>Configs.scala:309</code>)가 받아 MainPipe 최우선 입력으로 넣는다. L2와 L3 사이는 CHI 패킷 프로토콜이다(<code>L2Top.scala:233, 368</code>).</p>
+</section>
+
+<section>
+  <h2>가상 메모리와 TLB</h2>
+  <p>프로그램이 쓰는 주소는 <b>가상주소</b>다. 운영체제가 관리하는 <span class="term" data-def="가상 페이지 번호(VPN)를 물리 페이지 번호(PPN)로 바꾸는 여러 단계 트리. 한 단계 항목(PTE)은 8바이트다.">페이지 테이블</span><span class="en">(page table)</span>이 4KB 페이지 단위로 가상주소를 물리주소로 바꾼다. 테이블은 트리라서 VPN을 9비트씩 잘라 단계마다 PTE 하나(8바이트)를 메모리에서 읽는다. Sv39는 3단계, Sv48은 4단계다. KMHv3는 Sv48과 H 확장을 켠다(<code>EnableSv48 = true</code>, <code>HasHExtension = true</code>, <code>Parameters.scala:78, 60</code>). <code>satp.mode</code> 8이 Sv39, 9가 Sv48이다(<code>MMUConst.scala:192-193</code>).</p>
+  <p>load마다 메모리를 4번 더 읽을 수는 없다. 최근 번역 결과를 담는 작은 캐시가 <span class="term" data-def="Translation Lookaside Buffer. 최근 VPN→PPN 번역을 담는 캐시. miss면 페이지 워크를 한다.">TLB</span><span class="en">(Translation Lookaside Buffer)</span>다. KMHv3의 L1 TLB는 모두 <b>48엔트리 완전연관</b>이다(<code>NWays = 48</code>, <code>NSets = 1</code>, <code>Parameters.scala:218-275</code>; 2023-09-14 <code>f9ac118cd</code>, #2289). 엔트리 하나는 연속한 가상 페이지 8개를 담는 섹터다(<code>tlbcontiguous = 8</code>, <code>MMUConst.scala:167</code>). 모두 4KB 페이지로 꽉 차면 48 × 8 × 4KB = 1.5MB를 덮는다(계산). DTLB는 load용(포트 4), store용(포트 2), 프리페치용(포트 3) 세 개이고(<code>mem/MemBlock.scala:654-656</code>), ITLB는 1개다. 응답은 요청 다음 사이클이다(<code>TLB.scala:41</code>; <code>TLBStorage.scala:125</code>).</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">TLB · handle_nonblock</span><h4>miss면 워크를 부탁하거나, 막 채워졌으면 다시 해 보라고 한다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">miss && (이 VPN의 PTW 응답이 이번/직전 사이클에 옴) → tlbreplay; 다른 VPN의 gpa를 기다리는 중 → tlbreplay; 그 외 → io.ptw.req.valid</dd>
+      <dt>이유</dt><dd class="why">방금 채워지는 중인 번역을 또 워크하면 같은 페이지를 두 번 걷는다. 재시도하면 hit가 된다.</dd>
+      <dt>없으면</dt><dd>같은 페이지에 대한 중복 워크로 L2TLB 대역폭이 낭비된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/mmu/TLB.scala:556-594@09453ff8 (refill 조건 :251, flush 지연 fenceDelay=2 :66-67)</dd>
+    </dl>
+  </div>
+
+  <h3>L2TLB: 페이지 테이블 캐시와 두 종류의 워커</h3>
+  <p>L1 TLB가 놓친 요청은 ITLB·DTLB가 공유하는 <code>L2TLB</code>로 간다. 앞단 필터가 같은 VPN 요청을 합친다(DTLB 쪽 <code>PTWNewFilter</code>, <code>Repeater.scala:348</code>). L2TLB 안의 <code>PtwCache</code>는 레벨마다 따로 PTE를 기억한다. 메모리에서 64B를 한 번에 읽으면 PTE가 8개 오므로 이웃 페이지 번역이 함께 들어온다(<code>L2TLB.scala:471, 559-570</code>). 크기는 아래 표와 같다(<code>MMUConst.scala:48, 52, 56-57, 61-62, 71</code>; 엔트리당 PTE 8개 = 512/64, <code>:305, 313</code>). l3는 Sv48 최상위, sp는 큰 페이지와 무효 결과를 담고, 완전연관 레벨은 plru로 교체한다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>레벨</th><th>구성</th><th class="num">PTE 수</th></tr>
+    <tr><td>l3</td><td>완전연관</td><td class="num">16</td></tr>
+    <tr><td>l2</td><td>완전연관</td><td class="num">16</td></tr>
+    <tr><td>l1</td><td>4set×2way×8</td><td class="num">64</td></tr>
+    <tr><td>l0 (leaf)</td><td>64set×4way×8</td><td class="num">2048</td></tr>
+    <tr><td>sp</td><td>완전연관</td><td class="num">16</td></tr>
+  </table></div>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 330" role="img" aria-label="Sv48 페이지 워크: VPN 네 조각이 레벨 3부터 0까지 테이블을 고른다">
+      <defs><marker id="c10a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-2" x="20" y="10" width="84" height="34" rx="5"/><text x="62" y="32" text-anchor="middle" class="lbl-mono">VPN3 47:39</text>
+      <rect class="box-2" x="104" y="10" width="84" height="34" rx="5"/><text x="146" y="32" text-anchor="middle" class="lbl-mono">VPN2 38:30</text>
+      <rect class="box-2" x="188" y="10" width="84" height="34" rx="5"/><text x="230" y="32" text-anchor="middle" class="lbl-mono">VPN1 29:21</text>
+      <rect class="box-2" x="272" y="10" width="84" height="34" rx="5"/><text x="314" y="32" text-anchor="middle" class="lbl-mono">VPN0 20:12</text>
+      <rect class="box" x="356" y="10" width="84" height="34" rx="5"/><text x="398" y="32" text-anchor="middle" class="lbl-mono">offset 11:0</text>
+      <rect class="box-acc" x="20" y="70" width="112" height="42" rx="7"/><text x="76" y="88" text-anchor="middle" class="lbl-b">레벨 3</text><text x="76" y="104" text-anchor="middle" class="lbl-mono">satp.ppn 시작</text>
+      <rect class="box-acc" x="100" y="128" width="112" height="42" rx="7"/><text x="156" y="146" text-anchor="middle" class="lbl-b">레벨 2</text><text x="156" y="162" text-anchor="middle" class="lbl-mono">PtwCache l2</text>
+      <rect class="box-acc" x="180" y="186" width="112" height="42" rx="7"/><text x="236" y="204" text-anchor="middle" class="lbl-b">레벨 1</text><text x="236" y="220" text-anchor="middle" class="lbl-mono">PtwCache l1</text>
+      <rect class="box-2" x="260" y="244" width="112" height="42" rx="7"/><text x="316" y="262" text-anchor="middle" class="lbl-b">레벨 0 leaf</text><text x="316" y="278" text-anchor="middle" class="lbl-mono">PtwCache l0</text>
+      <line class="ln" x1="76" y1="112" x2="110" y2="126" marker-end="url(#c10a6)"/><line class="ln" x1="156" y1="170" x2="190" y2="184" marker-end="url(#c10a6)"/><line class="ln" x1="236" y1="228" x2="270" y2="242" marker-end="url(#c10a6)"/>
+      <line class="ln-dash" x1="62" y1="44" x2="62" y2="68"/><line class="ln-dash" x1="146" y1="44" x2="146" y2="126"/><line class="ln-dash" x1="230" y1="44" x2="230" y2="184"/><line class="ln-dash" x1="314" y1="44" x2="314" y2="242"/>
+      <rect class="box-ok" x="388" y="244" width="60" height="42" rx="7"/><text x="418" y="270" text-anchor="middle" class="lbl-b">PA</text>
+      <line class="ln" x1="372" y1="265" x2="386" y2="265" marker-end="url(#c10a6)"/>
+      <text x="20" y="222" class="lbl-acc">PTW 1개: 레벨 3·2·1</text>
+      <text x="20" y="244" class="lbl-acc2">LLPTW 6개: 레벨 0</text>
+      <text x="20" y="316" class="lbl-dim">PTE 주소 = ppn × 4096 + VPN[i] × 8 (64B 단위로 읽음)</text>
+    </svg>
+    <figcaption>Sv48 페이지 워크. 위 세 레벨의 non-leaf는 PTW가, 마지막 레벨은 LLPTW가 읽는다. Sv39는 레벨 2에서 시작한다. 근거: cache/mmu/PageTableWalker.scala:202-216, 367-386; MMUConst.scala:140, 372-387.</figcaption>
+  </figure>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">L2TLB · 라우팅</span><h4>어디까지 알고 있느냐에 따라 워커를 고른다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">PtwCache hit(leaf) → 즉시 응답; l1Hit(레벨 0 테이블 위치를 앎) → LLPTW; 그 외 → PTW. 단 PTW는 !isFirst일 때만 받으므로 첫 miss는 MissQueue를 거쳐 캐시를 한 번 더 본다</dd>
+      <dt>이유</dt><dd class="why">마지막 한 번만 읽으면 되는 요청이 많으니, 메모리 1회짜리 워커(LLPTW)를 6개 두어 병렬로 처리한다. 긴 워크는 PTW 1개(<code>io.req.ready := idle</code>)가 맡는다.</dd>
+      <dt>없으면</dt><dd>모든 miss가 워커 하나를 기다리거나, 이미 아는 상위 레벨을 다시 읽는다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/mmu/L2TLB.scala:349-353, 405-408@09453ff8; PageTableWalker.scala:258, 809-810</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">TLB perm_check · A/D</span><h4>하드웨어는 A/D 비트를 고치지 않는다: page fault로 알린다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">load·fetch: A=0 → page fault. store·AMO: A=0 또는 D=0 → page fault (권한 r/w/x, U/S, SUM/MXR 위반도 page fault)</dd>
+      <dt>이유</dt><dd class="why">A(접근함)·D(고쳐짐) 비트 갱신을 운영체제에 맡겨 하드웨어가 메모리의 PTE를 직접 다시 쓰지 않게 한다. 코드 주석은 "update A/D through exception".</dd>
+      <dt>없으면</dt><dd>OS가 어떤 페이지가 쓰였는지 몰라 Dirty 페이지를 디스크에 쓰지 않고 버릴 수 있다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/cache/mmu/TLB.scala:462-464@09453ff8 (PTE 형식 검사 isPf: MMUBundle.scala:805-825)</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-walk">
+    <div class="sim-head"><span class="sim-tag anim">Stepper</span><h3>페이지 워크 한 단계씩</h3></div>
+    <div class="sim-body">
+      <div class="c10-two">
+        <div class="ctl"><label>가상주소 (16진)</label><input class="c10-in" type="text" data-k="wva" value="0x3fc0123456" spellcheck="false"></div>
+        <div class="ctl"><label>모드 / 접근</label><div class="seg" id="walk-mode"><button class="on">Sv48</button><button>Sv39</button></div> <div class="seg" id="walk-op"><button class="on">load</button><button>store</button></div></div>
+      </div>
+      <div class="ctl"><label>L2TLB PtwCache가 이미 아는 것</label><div class="seg" id="walk-hit"><button class="on">없음</button><button>l2Hit</button><button>l1Hit</button><button>leaf hit</button></div></div>
+      <div class="ctl"><label>leaf PTE 비트</label><div class="seg" id="walk-ad"><button class="on">A=1 D=1</button><button>A=0</button><button>A=1 D=0</button></div></div>
+      <div class="btn-row"><button class="btn primary" id="walk-next">다음 단계</button><button class="btn" id="walk-all">끝까지</button><button class="btn" id="walk-reset">처음으로</button></div>
+      <div class="table-wrap"><table class="data" id="walk-tbl"></table></div>
+      <div class="verdict grey" id="walk-verdict">다음 단계를 누르세요</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">메모리 읽기 횟수</span><span class="v acc" id="walk-mem">0</span></div>
+      <div class="stat"><span class="k">맡은 워커</span><span class="v" id="walk-who">-</span></div>
+      <div class="stat"><span class="k">단계</span><span class="v" id="walk-step">0</span></div>
+    </div>
+    <div class="sim-note">① 캐시 "없음"에서 Sv48과 Sv39의 메모리 읽기 횟수(4와 3)를 비교하세요. ② l1Hit를 고르면 LLPTW가 한 번만 읽습니다. ③ store에 A=1 D=0을 고르면 번역은 성공해도 L1 TLB가 page fault를 냅니다. 테이블 PPN 값(0x80000부터)은 합성 데이터이고, 주소 공식과 레벨 규칙은 6절 그림과 게이트의 코드 규칙입니다.</div>
+  </div>
+</section>
+
+<section>
+  <h2>프리페처: 부르기 전에 가져다 놓기</h2>
+  <p>책을 읽는 사람은 다음 장을 넘길 것이 거의 확실하다. 손가락을 미리 다음 장 귀퉁이에 대 두면 넘기는 시간이 줄어든다. <span class="term" data-def="앞으로 쓸 주소를 예측해 캐시에 미리 가져다 놓는 하드웨어. 맞으면 miss가 사라지고, 틀리면 쓸모 있는 라인을 쫓아내고 대역폭을 쓴다.">프리페처</span><span class="en">(prefetcher)</span>는 접근 패턴을 보고 앞으로 쓸 라인을 미리 요청한다. 너무 늦으면 소용없고, 틀리면 쓸모 있는 라인을 쫓아낸다.</p>
+  <p>기본 목록은 <code>Seq(StreamStrideParams(), BertiParams(), SMSParams())</code>, 모드는 <code>modeStrideBerti = 0b01</code>이다(<code>Parameters.scala:163-164</code>). 이 모드에서 Stream과 Stride는 켜지고 Berti는 생성되지만 꺼진다(<code>PrefetcherWrapper.scala:163-167</code>; 값은 Constantin 초기값). SMS는 L2 요청만 낸다(<code>l1_req.ready := false</code>, <code>PrefetcherWrapper.scala:215</code>). L1 프리페치는 load 포트가 아니라 DCache MainPipe로 들어간다(<code>mem/MemBlock.scala:841-848</code>).</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 230" role="img" aria-label="프리페처별 요청이 가는 캐시 층">
+      <defs><marker id="c10a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="20" y="18" class="lbl-dim">학습 입력: 첫 발행 load 중 아래 조건</text>
+      <rect class="box-acc" x="20" y="34" width="130" height="40" rx="8"/><text x="85" y="52" text-anchor="middle" class="lbl-b">Stream</text><text x="85" y="68" text-anchor="middle" class="lbl-mono">miss·자기 pf hit</text>
+      <rect class="box-acc" x="20" y="92" width="130" height="40" rx="8"/><text x="85" y="110" text-anchor="middle" class="lbl-b">Stride</text><text x="85" y="126" text-anchor="middle" class="lbl-mono">miss·자기 pf hit</text>
+      <rect class="box-2" x="20" y="150" width="130" height="40" rx="8"/><text x="85" y="168" text-anchor="middle" class="lbl-b">SMS</text><text x="85" y="184" text-anchor="middle" class="lbl-mono">miss·L1 pf hit</text>
+      <rect class="box-grey" x="20" y="198" width="130" height="28" rx="8"/><text x="85" y="217" text-anchor="middle" class="lbl-dim">Berti (꺼짐)</text>
+      <rect class="box" x="300" y="34" width="140" height="40" rx="8"/><text x="370" y="59" text-anchor="middle" class="lbl-b">L1D MainPipe</text>
+      <rect class="box" x="300" y="92" width="140" height="40" rx="8"/><text x="370" y="117" text-anchor="middle" class="lbl-b">L2</text>
+      <rect class="box" x="300" y="150" width="140" height="40" rx="8"/><text x="370" y="175" text-anchor="middle" class="lbl-b">L3</text>
+      <line class="ln-acc" x1="150" y1="50" x2="298" y2="50" marker-end="url(#c10a7)"/><line class="ln-acc" x1="150" y1="58" x2="298" y2="106" marker-end="url(#c10a7)"/><line class="ln-acc" x1="150" y1="66" x2="298" y2="164" marker-end="url(#c10a7)"/>
+      <line class="ln" x1="150" y1="108" x2="298" y2="60" marker-end="url(#c10a7)"/><line class="ln" x1="150" y1="114" x2="298" y2="114" marker-end="url(#c10a7)"/>
+      <line class="ln-dash" x1="150" y1="170" x2="298" y2="122" marker-end="url(#c10a7)"/>
+    </svg>
+    <figcaption>Stream은 L1·L2·L3, Stride는 L1·L2, SMS는 L2로만 요청한다. 같은 슬롯에서 Stream과 Stride가 겹치면 Stream이 이긴다. L2·L3 요청은 L2가 주는 fdbkDegree가 0보다 클 때만 유효하다. 학습 조건: Stride는 PrefetcherWrapper.scala:240-242, Stream은 모듈 입구 L1StreamPrefetcher.scala:215, SMS는 L1D_PF_TRAIN_ON_HIT 리셋값 false일 때 PrefetcherWrapper.scala:189-193 (CSRCustom.scala:95). 근거: mem/prefetch/L1PrefetchComponent.scala:1044-1063, L1StreamPrefetcher.scala:403-451, PrefetcherWrapper.scala:213-216.</figcaption>
+  </figure>
+  <div class="callout decision"><strong>2026-06-04 L1 프리페치를 MainPipe로 (#5997)</strong><p>커밋 <code>fd1b0136f</code> "move prefetch from LDU to mainPipe". 하드웨어 프리페치가 load 파이프 포트를 빌려 쓰지 않게 했다. MainPipe 우선순위에서 prefetch는 refill 다음, store 앞이다(5절).</p></div>
+
+  <h3>Stride: 같은 PC가 일정 간격으로 걸을 때</h3>
+  <p>Stride 프리페처는 load 명령의 PC마다 직전 주소, 간격(stride), 신뢰도(0~7)를 기억하는 16엔트리 표다(<code>STRIDE_ENTRY_NUM = 16</code>, <code>STRIDE_CONF_BITS = 3</code>, <code>L1StridePrefetcher.scala:40, 44</code>). 새 주소가 오면 Δ = 새 주소 − 직전 주소를 구한다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">StrideMetaArray · update</span><h4>간격이 세 번 확인돼야 요청한다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">stride_valid = (|Δ| &gt;&gt; 6) ∉ {0, 1}. valid && Δ==stride → conf+1 (최대 7). valid && 불일치 → conf−1 (최소 0), 갱신 전 conf ≤ 1이면 stride 교체. 요청 = valid && 일치 && 갱신 전 conf ≥ 3. 목표: L1 = vaddr ± (stride &lt;&lt; 2), L2 = vaddr ± (stride &lt;&lt; 5)</dd>
+      <dt>이유</dt><dd class="why">우연히 한 번 맞은 간격으로 요청하면 틀린 라인을 가져온다. |Δ|가 128B 미만(블록 차 0 또는 1)인 촘촘한 접근은 Stream 몫으로 남긴다(설계 의도는 추론).</dd>
+      <dt>없으면</dt><dd>무작위 접근에도 프리페치가 나가 캐시를 오염시킨다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/mem/prefetch/L1StridePrefetcher.scala:60-61, 101-140, 225-244@09453ff8 (배율 Constantin 초기값 2·5)</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-stride">
+    <div class="sim-head"><span class="sim-tag predict">Predict</span><h3>같은 PC가 일정 간격으로 miss할 때, 첫 프리페치는 몇 번째 접근에서?</h3></div>
+    <div class="sim-body">
+      <p style="margin:0">먼저 답을 고른 뒤 실행하세요. 모든 접근이 miss라고 둡니다.</p>
+      <div class="seg" id="stride-pick"><button class="on">3번째</button><button>4번째</button><button>6번째</button><button>안 나감</button></div>
+      <div class="c10-two">
+        <div class="ctl"><label>간격 (바이트) <output data-for="st" data-fmt="int"></output></label><input type="range" data-k="st" min="64" max="1024" step="64" value="256"></div>
+        <div class="ctl"><label><input type="checkbox" data-k="jump"> 7번째 접근만 4KB 튀기</label></div>
+      </div>
+      <div class="btn-row"><button class="btn primary" id="stride-run">실행</button></div>
+      <div class="verdict grey" id="stride-out">아직 실행하지 않음</div>
+      <div class="table-wrap"><table class="data" id="stride-tbl"></table></div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">첫 프리페치 접근</span><span class="v acc" id="stride-first">-</span></div>
+      <div class="stat"><span class="k">L1 목표 (첫 요청)</span><span class="v" id="stride-l1">-</span></div>
+      <div class="stat"><span class="k">발행 횟수 / 12</span><span class="v" id="stride-n">-</span></div>
+    </div>
+    <div class="sim-note">① 간격 256에서 예측을 확인하세요. 할당(1), stride 학습(2), conf 0→3(3~5)을 거쳐 6번째가 첫 요청입니다. ② 간격을 64로 내리면 |Δ|&gt;&gt;6 = 1이라 아무 일도 일어나지 않습니다. ③ "4KB 튀기"를 켜면 신뢰도가 깎였다가 몇 번 만에 회복하는지 보세요. 주소 수열은 합성 입력이고 갱신 규칙은 7절 게이트 그대로입니다.</div>
+  </div>
+
+  <h3>Stream: 1KB 구역을 꽉 채워 가는 접근</h3>
+  <p>Stream 프리페처는 1KB 구역(라인 16개)마다 "어느 라인을 건드렸나" 비트 16개를 둔다(<code>REGION_SIZE = 1024</code>, <code>L1PrefetchComponent.scala:22-25</code>; 표 16엔트리, <code>L1StreamPrefetcher.scala:17</code>). 새 라인이면 카운트가 오르고, 12개에 닿으면(<code>cnt_next &gt;= 12</code>, <code>L1StreamPrefetcher.scala:109</code>) 구역이 active가 된다. active 구역의 새 라인 접근마다 한 번씩 멀리 앞을 요청한다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">StreamBitVectorArray · active</span><h4>구역의 라인 12개를 보면 흐름으로 인정한다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">할당 시 cnt=1, active = 이웃 구역(±1)이 active && cnt ≥ 12. 갱신 시 새 비트면 cnt+1, cnt ≥ ACTIVE_THRESHOLD(16−4=12) 또는 이웃 active면 active. 발행 = active && 그 라인 비트가 처음 켜짐. 구역+1이 이미 표에 있으면 감소 방향. 목표 = 블록 ± 64 (L1, 2라인) / ± 640 (L2, 4라인) / ± 960 (L3, 8라인)</dd>
+      <dt>이유</dt><dd class="why">구역의 3/4을 훑었다면 순차 흐름일 가능성이 높다. 같은 라인 재접근으로는 요청을 다시 내지 않아 중복을 막는다.</dd>
+      <dt>없으면</dt><dd>몇 라인만 건드린 구역에도 4KB 앞까지 요청해 대역폭을 낭비한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/mem/prefetch/L1StreamPrefetcher.scala:19, 86-118, 284-286, 311-343, 390@09453ff8 (깊이는 Constantin 초기값)</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-stream">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>Stream 비트벡터: 구역 하나가 active가 되기까지</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><div class="c10-pad"><div class="c10-grid g16" id="stream-grid"></div><div class="c10-log" id="stream-log">-</div></div></div>
+      <div class="sim-controls">
+        <div class="seg" id="stream-pat"><button class="on">증가</button><button>감소</button><button>무작위</button></div>
+        <div class="ctl"><label><input type="checkbox" data-k="nb"> 이웃 구역이 이미 active</label></div>
+        <div class="btn-row"><button class="btn primary" id="stream-run">재생</button><button class="btn" id="stream-step">한 접근</button><button class="btn" id="stream-reset">처음으로</button></div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">cnt / active</span><span class="v acc" id="stream-cnt">0</span></div>
+      <div class="stat"><span class="k">발행 횟수</span><span class="v" id="stream-n">0</span></div>
+      <div class="stat"><span class="k">마지막 L1 목표 블록</span><span class="v" id="stream-l1">-</span></div>
+    </div>
+    <div class="sim-note">① 증가 패턴에서 몇 번째 접근에 첫 요청이 나가는지 세어 보세요(cnt가 12에 닿는 접근). ② "이웃 구역이 이미 active"를 켜면 첫 접근부터 요청합니다. ③ 무작위 순서여도 새 라인 12개면 active가 됩니다. 감소 패턴에서 이웃을 끄면 위 구역(+1)이 표에 없어 감소 방향을 몰라 + 방향으로 요청합니다. 구역 시작 블록 0x400과 접근 순서는 합성 입력입니다(7절 게이트).</div>
+  </div>
+
+  <h3>SMS: 페이지 안의 공간 패턴</h3>
+  <p>SMS는 1KB 구역마다 접근한 라인 모양을 기억했다가 같은 PC·오프셋으로 다시 시작하면 그 모양대로 L2에 요청한다(PHT 64엔트리·2way, <code>SMSPrefetcher.scala:42-57</code>). 활성 생성 표(AGT)에서 접근 수가 문턱을 넘은 구역은 바로 ±30블록 앞을 요청한다. 조건은 <code>access_cnt &gt; act_threshold</code>(<code>SMSPrefetcher.scala:485</code>)이고 문턱 12와 거리 30은 CSR <code>spfctl</code> 리셋값이다(<code>backend/fu/NewCSR/CSRCustom.scala:142-148</code>; <code>PrefetcherWrapper.scala:177-178</code>). SMS 안의 자체 stride 기능은 꺼져 있다(<code>pf.io_stride_en := false.B</code>, <code>:179</code>).</p>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ol>
+    <li>DefaultConfig의 계층은 L1D 64KB 4-way, L2 2MB 8-way 4 bank(inclusive), L3 OpenLLC 32MB 16-way다. L1↔L2는 TileLink, L2↔L3는 CHI다. 층별 hit 지연은 이 저장소에 없다.</li>
+    <li>DCache set 8비트 = vaddr[47:12]를 2비트씩 XOR한 값 ∥ vaddr[11:6]이다. 위 2비트가 페이지 밖이라 alias가 생기고, 그 값을 L2에 실어 보낸다(2026-07-03, #6166).</li>
+    <li>hit는 s1의 tag+권한 판정, 데이터는 s2다. 같은 bank·다른 set인 load는 가장 오래된 하나만 통과한다. miss는 16개 MSHR에 들어가 merge·reject 규칙을 따른다.</li>
+    <li>MainPipe가 유일한 쓰기 경로이며 victim은 PLRU 결과 그대로(빈 way 우선 없음)다. Dirty victim과 Probe 응답은 WritebackQueue가 L2로 보낸다.</li>
+    <li>L1 TLB는 48엔트리 완전연관 섹터(8페이지) 구조다. L2TLB는 레벨별 캐시와 PTW 1개·LLPTW 6개로 걷고, A/D 갱신은 page fault로 OS에 맡긴다.</li>
+    <li>Stride는 갱신 전 conf ≥ 3(여섯 번째 접근), Stream은 구역 라인 12개, SMS는 접근 수 &gt; 12에서 요청을 낸다.</li>
+  </ol>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="1">
+    <div class="q">KMHv3 DCache set index의 위 2비트가 만드는 문제는 무엇인가?</div>
+    <div class="opts"><button>bank conflict가 생긴다</button><button>같은 물리 라인이 두 set에 들어갈 수 있다(alias)</button><button>TLB miss가 늘어난다</button><button>write-back이 불가능해진다</button></div>
+    <div class="explain">256 set × 64B = 16KB라 index가 4KB 페이지 밖 2비트를 쓴다. 가상주소가 달라도 물리주소가 같을 수 있으니 같은 라인이 두 set에 들어갈 위험이 있다. bank는 vaddr[5:1]로 정해져 set과 무관하고, TLB miss는 번역 문제이며, write-back 여부와도 관계없다.</div>
+  </div>
+  <div class="quiz" data-answer="2">
+    <div class="q">같은 사이클에 P0는 bank 0-3·set 5, P1은 bank 2-5·set 5, P2는 bank 8-11·set 9를 읽는다. 결과는?</div>
+    <div class="opts"><button>P1이 replay된다</button><button>P0와 P1 중 어린 쪽이 replay된다</button><button>아무도 replay되지 않는다</button><button>P2가 replay된다</button></div>
+    <div class="explain">P0와 P1은 bank가 겹치지만 같은 set이라 같은 SRAM 행을 함께 읽는다. 충돌 조건에는 set이 다르다는 항이 있다(BankedDataArray.scala:740-750). P2는 bank가 겹치지 않는다. 그래서 나이를 비교할 일 자체가 없다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">A=1, D=0인 PTE가 가리키는 페이지에 store를 하면 KMHv3는 어떻게 하는가?</div>
+    <div class="opts"><button>store page fault를 내 OS가 D를 세우게 한다</button><button>하드웨어가 메모리의 PTE에 D=1을 써 넣고 진행한다</button><button>D 비트를 무시하고 진행한다</button><button>L2TLB가 PTE를 다시 읽어 올 때까지 기다린다</button></div>
+    <div class="explain">perm_check의 <code>stUpdate = (!a || !d) && isSt</code>(TLB.scala:463)가 page fault를 만든다. 주석이 "update A/D through exception"이다. 하드웨어가 PTE를 고치는 방식이 아니고, 무시하면 OS가 Dirty 페이지를 모른다. 다시 읽어도 D는 0 그대로다.</div>
+  </div>
+  <div class="quiz" data-answer="3">
+    <div class="q">같은 PC의 load가 64바이트 간격으로 계속 miss한다. Stride 프리페처는?</div>
+    <div class="opts"><button>세 번째 접근부터 요청한다</button><button>여섯 번째 접근부터 요청한다</button><button>L2에만 요청한다</button><button>요청하지 않는다(stride_valid가 거짓)</button></div>
+    <div class="explain">Δ=64이면 Δ&gt;&gt;6 = 1이라 <code>stride_valid</code>가 거짓이다(L1StridePrefetcher.scala:108). 신뢰도가 오르지 않으니 몇 번째든 요청이 없다. 여섯 번째는 간격이 128B 이상일 때의 답이고, L2 요청도 같은 발행 조건을 거친다. 이런 촘촘한 순차 접근은 Stream이 맡는다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">MSHR에 블록 X의 load miss가 있고 데이터 첫 beat가 이미 도착했다. 같은 블록 X의 새 load miss는?</div>
+    <div class="opts"><button>기존 MSHR에 merge된다</button><button>reject되어 다시 시도한다</button><button>새 MSHR을 하나 더 할당한다</button><button>프리페치 칸으로 옮겨진다</button></div>
+    <div class="explain">load merge는 데이터 첫 beat 전(<code>data_not_refilled</code>)에만 된다(MissQueue.scala:868-871). 그 뒤 같은 블록은 should_reject로 거절된다. 같은 블록에 MSHR을 둘 쓰면 라인이 두 벌 생길 수 있어 새로 할당하지 않는다. 프리페치 칸 규칙은 새 할당에만 해당한다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08. 경로는 저장소 루트 기준이며 줄 번호는 모두 이 커밋 기준이다. 예: <a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/cache/L1Cache.scala#L82" target="_blank" rel="noopener">L1Cache.scala:82 hashBitPairs</a>. 명령어 캐시는 <a href="ch04-fetch.html">4장</a>, load·store 파이프라인과 Sbuffer는 <a href="ch09-loadstore.html">9장</a>에서 다룬다.</p>
+
+</main>
+</div>
+<script src="assets/ch10-a.js"></script>
+<script src="assets/ch10-b.js"></script>
+</body>
+</html>

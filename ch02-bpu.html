@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 2장 · BPU 파이프라인과 BTB</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+.seg { flex-wrap: wrap; }
+.pad { padding: 14px 16px; overflow-x: auto; }
+.slots { display: grid; grid-template-columns: 54px repeat(32, minmax(0, 1fr)); gap: 2px; margin: 4px 0; align-items: center; }
+.slots > b { font-size: 11.5px; color: var(--text-dim); font-weight: 600; white-space: nowrap; overflow: hidden; }
+.slots > i { height: 20px; border-radius: 3px; background: var(--surface-2); font: 600 9px/20px var(--mono); text-align: center; color: var(--text-faint); font-style: normal; overflow: hidden; }
+.slots > i.pre { background: transparent; border: 1px dashed var(--border); }
+.slots > i.in { background: var(--accent-soft); }
+.slots > i.end { background: var(--accent); color: var(--on-accent); }
+.slots > i.out { background: var(--grey-soft); opacity: .5; }
+.slots > i.c { background: var(--accent-2-soft); color: var(--accent-2); outline: 1.5px solid var(--accent-2); }
+.slots > i.j { background: var(--warn-soft); color: var(--warn); outline: 1.5px solid var(--warn); }
+.slots > i.pick { background: var(--ok); color: var(--bg-elev); outline: 0; }
+.bits { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 1px; font: 600 10px/1 var(--mono); margin: 6px 0 2px; }
+.bits span { text-align: center; padding: 5px 0; background: var(--surface); color: var(--text-faint); border-radius: 2px; }
+.bits .f1 { background: var(--accent-soft); color: var(--accent); } .bits .f2 { background: var(--accent-2-soft); color: var(--accent-2); }
+.bits .f3 { background: var(--warn-soft); color: var(--warn); } .bits .f4 { background: var(--ok-soft); color: var(--ok); }
+.tl { width: 100%; border-collapse: collapse; table-layout: fixed; font: 12px var(--mono); }
+.tl th, .tl td { border: 1px solid var(--border); text-align: center; padding: 5px 0; overflow: hidden; white-space: nowrap; }
+.tl th { background: var(--surface); color: var(--text-dim); font-weight: 600; }
+.tl th:first-child { width: 42px; }
+.tl td.ok { background: var(--ok-soft); color: var(--ok); } .tl td.w { background: var(--bad-soft); color: var(--bad); }
+.tl td.fl { background: var(--bad); color: var(--bg-elev); } .tl td.st { background: var(--warn-soft); color: var(--warn); }
+.tl td.now { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mini { font-size: 13px; color: var(--text-dim); margin: 6px 0 0; }
+</style>
+</head>
+<body data-chapter="ch02">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 02</div>
+  <h1>분기 예측 I: BPU 파이프라인과 BTB</h1>
+  <p class="lead">CPU의 앞단은 명령어를 해석하기도 전에 "다음에는 어느 주소에서 명령어를 가져올지"를 정해야 한다. 이 일을 하는 장치가 <strong>분기 예측기(BPU)</strong>다. KMHv3의 BPU는 매 사이클 64바이트 블록 하나를 예측하고, 빠른 예측기가 먼저 답한 뒤 느리고 정확한 예측기가 2·3사이클째에 그 답을 고친다. 이 장에서는 BPU의 4단 파이프라인(s0-s3), 세 가지 BTB, 경로 히스토리, 학습 경로까지만 다룬다. 방향 예측기(TAGE·SC·ITTAGE·RAS)의 내부는 <a href="ch03-predictors.html">3장</a>, 예측 결과를 받아 쓰는 FTQ와 IFU는 <a href="ch04-fetch.html">4장</a>에서 다룬다.</p>
+  <ul class="objectives">
+    <li>분기 결과를 기다리지 않고 예측하는 이유를 파이프라인 거품으로 설명할 수 있다.</li>
+    <li>페치 블록 하나의 예측 결과(끝 위치, taken 여부, 목적지)와 fall-through 규칙을 계산할 수 있다.</li>
+    <li>uBTB·aBTB·MainBTB가 PC의 어느 비트로 찾는지, 왜 세 개나 필요한지 설명할 수 있다.</li>
+    <li>s2/s3 override가 몇 개의 거품을 만드는지 사이클 단위로 따라갈 수 있다.</li>
+    <li>경로 히스토리(PHR) 갱신 규칙과 두 가지 학습 경로(fast train, resolve train)를 구분할 수 있다.</li>
+  </ul>
+</div>
+
+<section>
+  <h2>왜 예측하는가: 기다리면 생기는 빈칸</h2>
+  <p>식당 주방을 떠올려 보자. 요리사 여러 명이 한 줄로 서서 접시를 넘긴다. 맨 앞 사람은 다음 주문서를 집어 재료를 꺼낸다. 그런데 어떤 주문서에는 "앞 요리 맛을 보고 다음 요리를 정하겠다"고 적혀 있다. 맛은 줄의 끝에서야 볼 수 있다. 앞사람이 그때까지 손을 놓고 기다리면 줄 전체에 빈 접시가 흐른다.</p>
+  <p>CPU도 같다. 명령어는 <span class="term" data-def="명령어 처리를 인출·해석·실행 같은 단계로 나누고, 단계마다 다른 명령어를 동시에 처리하는 방식.">파이프라인<span class="en">pipeline</span></span>을 따라 흐른다. <span class="term" data-def="조건에 따라 다음 실행 주소가 바뀌는 명령어. beq/bne 같은 조건 분기, jal/jalr 같은 점프가 있다.">분기<span class="en">branch</span></span> 명령어는 다음에 실행할 주소를 바꾼다. 분기를 실제로 계산하는 곳은 파이프라인 뒤쪽의 실행 단계다. 맨 앞의 인출 단계가 그 결과를 기다리면 그 사이 사이클은 모두 빈칸, 즉 <span class="term" data-def="파이프라인 단계가 쓸모 있는 일을 하지 못하고 비어 있는 사이클.">거품<span class="en">bubble</span></span>이 된다. 고성능 코어는 분기 결과가 10단계 이상 뒤에서 나오는 것이 보통이고(일반론), 분기는 명령어 몇 개마다 하나씩 나온다. 기다리는 방식으로는 파이프라인을 채울 수 없다.</p>
+  <p>그래서 앞단은 결과를 <em>추측</em>한다. 추측이 맞으면 거품이 없다. 틀리면 뒤에서 <span class="term" data-def="실행 단계가 예측이 틀렸음을 발견하고 앞단에 올바른 주소로 다시 시작하라고 알리는 신호. 그 사이 가져온 명령어는 모두 버린다.">리다이렉트<span class="en">redirect</span></span>가 와서 잘못 가져온 명령어를 모두 버리고 다시 시작한다. 예측기가 정확할수록 버리는 양이 줄어든다. 이 장치가 <span class="term" data-def="Branch Prediction Unit. 명령어를 가져와 해석하기 전에 다음 인출 주소를 추측하는 장치. KMHv3에서는 src/main/scala/xiangshan/frontend/bpu/Bpu.scala.">BPU<span class="en">Branch Prediction Unit</span></span>다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 236" role="img" aria-label="분기 결과를 기다릴 때와 예측할 때의 인출 타임라인">
+      <text x="70" y="18" class="lbl-mono">t1</text><text x="118" y="18" class="lbl-mono">t2</text><text x="166" y="18" class="lbl-mono">t3</text><text x="214" y="18" class="lbl-mono">t4</text><text x="262" y="18" class="lbl-mono">t5</text><text x="310" y="18" class="lbl-mono">t6</text><text x="358" y="18" class="lbl-mono">t7</text><text x="406" y="18" class="lbl-mono">t8</text>
+      <text x="6" y="56" class="lbl-b">기다림</text>
+      <rect class="box-acc" x="66" y="34" width="42" height="34" rx="6"/><text x="87" y="56" text-anchor="middle" class="lbl-b">B</text>
+      <rect class="box-grey" x="114" y="34" width="42" height="34" rx="6"/><rect class="box-grey" x="162" y="34" width="42" height="34" rx="6"/><rect class="box-grey" x="210" y="34" width="42" height="34" rx="6"/><rect class="box-grey" x="258" y="34" width="42" height="34" rx="6"/>
+      <text x="207" y="56" text-anchor="middle" class="lbl-dim">빈칸 4개</text>
+      <rect class="box" x="306" y="34" width="42" height="34" rx="6"/><text x="327" y="56" text-anchor="middle" class="lbl">C</text>
+      <rect class="box" x="354" y="34" width="42" height="34" rx="6"/><text x="375" y="56" text-anchor="middle" class="lbl">D</text>
+      <rect class="box" x="402" y="34" width="42" height="34" rx="6"/><text x="423" y="56" text-anchor="middle" class="lbl">E</text>
+      <text x="6" y="122" class="lbl-b">적중</text>
+      <rect class="box-acc" x="66" y="100" width="42" height="34" rx="6"/><text x="87" y="122" text-anchor="middle" class="lbl-b">B</text>
+      <rect class="box-ok" x="114" y="100" width="42" height="34" rx="6"/><text x="135" y="122" text-anchor="middle" class="lbl">C</text>
+      <rect class="box-ok" x="162" y="100" width="42" height="34" rx="6"/><text x="183" y="122" text-anchor="middle" class="lbl">D</text>
+      <rect class="box-ok" x="210" y="100" width="42" height="34" rx="6"/><text x="231" y="122" text-anchor="middle" class="lbl">E</text>
+      <rect class="box-ok" x="258" y="100" width="42" height="34" rx="6"/><text x="279" y="122" text-anchor="middle" class="lbl">F</text>
+      <rect class="box-ok" x="306" y="100" width="42" height="34" rx="6"/><text x="327" y="122" text-anchor="middle" class="lbl">G</text>
+      <rect class="box-ok" x="354" y="100" width="42" height="34" rx="6"/><text x="375" y="122" text-anchor="middle" class="lbl">H</text>
+      <rect class="box-ok" x="402" y="100" width="42" height="34" rx="6"/><text x="423" y="122" text-anchor="middle" class="lbl">I</text>
+      <text x="6" y="188" class="lbl-b">실패</text>
+      <rect class="box-acc" x="66" y="166" width="42" height="34" rx="6"/><text x="87" y="188" text-anchor="middle" class="lbl-b">B</text>
+      <rect class="box-bad" x="114" y="166" width="42" height="34" rx="6"/><rect class="box-bad" x="162" y="166" width="42" height="34" rx="6"/><rect class="box-bad" x="210" y="166" width="42" height="34" rx="6"/><rect class="box-bad" x="258" y="166" width="42" height="34" rx="6"/>
+      <text x="207" y="188" text-anchor="middle" class="lbl-bad">틀린 길, 버림</text>
+      <rect class="box" x="306" y="166" width="42" height="34" rx="6"/><text x="327" y="188" text-anchor="middle" class="lbl">C</text>
+      <rect class="box" x="354" y="166" width="42" height="34" rx="6"/><text x="375" y="188" text-anchor="middle" class="lbl">D</text>
+      <rect class="box" x="402" y="166" width="42" height="34" rx="6"/><text x="423" y="188" text-anchor="middle" class="lbl">E</text>
+      <text x="230" y="226" text-anchor="middle" class="lbl-dim">분기 B의 결과가 4사이클 뒤에 나온다고 가정한 예</text>
+    </svg>
+    <figcaption>기다리면 매번 빈칸이 생긴다. 예측하면 맞힌 만큼 빈칸이 사라지고, 틀리면 기다린 것과 같은 손해를 본다. 그래서 예측은 "정확할수록 이득"이다.</figcaption>
+    <div class="legend"><span><i style="--c:var(--ok)"></i>맞게 가져온 블록</span><span><i style="--c:var(--bad)"></i>버려지는 블록</span><span><i style="--c:var(--grey)"></i>거품</span></div>
+  </figure>
+
+  <p>KMHv3의 BPU는 명령어 하나가 아니라 <em>블록</em> 단위로 예측한다. 예측 결과는 바로 명령어 캐시로 가지 않고 <span class="term" data-def="Fetch Target Queue. BPU가 낸 블록 예측을 순서대로 쌓아 두는 큐. IFU는 여기서 꺼내 명령어를 가져온다. 4장에서 다룬다.">FTQ<span class="en">Fetch Target Queue</span></span>라는 큐에 쌓인다(<code>BpuToFtqIO</code>, <code>src/main/scala/xiangshan/frontend/Bundles.scala:53-62</code>). 그래서 BPU는 명령어 인출보다 앞서 달릴 수 있다. 큐가 가득 차면 BPU가 멈춘다(4절 G3).</p>
+  <div class="callout tip"><strong>예측해야 하는 것은 세 가지다</strong><p>"분기가 taken인가"만으로는 부족하다. 앞단은 아직 명령어를 해석하지 않았으므로 (1) 블록 안 <em>어디에</em> 분기가 있는지, (2) <em>어떤 종류</em>인지(조건 분기, 직접 점프, 간접 점프, 호출·복귀), (3) taken이면 <em>어디로</em> 가는지까지 모두 추측해야 한다. 1은 BTB, 2는 BTB에 함께 저장된 속성, 3은 BTB의 목적지(간접 점프와 복귀는 3장의 ITTAGE와 RAS)가 맡는다.</p></div>
+</section>
+
+<section>
+  <h2>페치 블록: 한 번에 예측하는 단위</h2>
+  <p>BPU는 한 번에 최대 64바이트를 다룬다(<code>FetchBlockSize = 64</code>, <code>src/main/scala/xiangshan/frontend/FrontendParameters.scala:28</code>). KMHv3는 압축 명령어(C 확장)를 지원해서 명령어가 2바이트 단위로 놓인다(<code>instBytes = 2</code>, <code>src/main/scala/xiangshan/Parameters.scala:874</code>). 그래서 블록 안에는 2바이트 칸이 64/2 = 32개 있고, 칸 번호는 5비트다(<code>CfiPositionWidth</code>, <code>FrontendParameters.scala:82</code>). 이렇게 연속된 명령어 덩어리를 <span class="term" data-def="BPU가 한 번에 예측하는 연속된 명령어 구간. KMHv3에서는 최대 64바이트, 시작 주소와 끝 위치, 다음 블록 주소로 표현한다.">페치 블록<span class="en">fetch block</span></span>이라 한다.</p>
+  <p>예측 하나는 네 값으로 FTQ에 간다(<code>BpuPrediction</code>, <code>src/main/scala/xiangshan/frontend/bpu/Bundles.scala:205-220</code>). 블록 시작 주소 <code>startPc</code>, 블록 안 첫 taken 분기의 칸 번호 <code>endPosition</code>, taken 여부 <code>taken</code>, 다음 블록 시작 주소 <code>target</code>이다. taken 분기가 없으면 블록은 끝까지 흘러가고 다음 블록은 바로 뒤 주소에서 시작한다. 이를 <span class="term" data-def="블록 안에 taken 분기가 없을 때 순서대로 다음 주소로 넘어가는 것. 그때의 다음 블록 주소를 fall-through 주소라 한다.">fall-through<span class="en">fall-through</span></span>라 부른다.</p>
+  <p>칸 번호는 <code>startPc</code>가 아니라 32바이트로 내림 정렬한 주소를 기준으로 센다. 64바이트 블록을 32바이트 반쪽 두 개로 보는 <em>half-align</em> 설계 때문이다(<code>FetchBlockAlignSize</code> 기본값 = 64/2 = 32, <code>src/main/scala/xiangshan/frontend/bpu/Parameters.scala:62</code>). 블록의 끝도 32바이트 경계에 맞춘다. 그래서 시작 주소가 32바이트 경계에서 멀수록 블록이 짧아진다. 시작이 경계에 있으면 64바이트, 경계에서 30바이트 떨어져 있으면 34바이트다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 214" role="img" aria-label="페치 블록 32칸과 시작, 끝 위치">
+      <defs><marker id="f22-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="18" class="lbl-dim">정렬 기준 0x000부터 64바이트, 2바이트 칸 32개</text>
+      <text x="10" y="44" class="lbl-b">① taken 없음</text>
+      <rect class="box-grey" x="10" y="54" width="108" height="26"/><rect class="box-acc" x="118" y="54" width="324" height="26"/><rect class="box-2" x="428.5" y="54" width="13.5" height="26"/>
+      <text x="64" y="72" text-anchor="middle" class="lbl-mono">0..7 건너뜀</text><text x="270" y="72" text-anchor="middle" class="lbl-mono">startPc 0x010부터 칸 31까지</text>
+      <text x="118" y="96" text-anchor="middle" class="lbl-mono">0x010</text><text x="442" y="96" text-anchor="end" class="lbl-acc2">끝=31, 다음 0x040</text>
+      <text x="10" y="128" class="lbl-b">② 칸 20에 taken 분기</text>
+      <rect class="box-grey" x="10" y="138" width="108" height="26"/><rect class="box-acc" x="118" y="138" width="162" height="26"/><rect class="box-ok" x="280" y="138" width="13.5" height="26"/><rect class="box-grey" x="293.5" y="138" width="148.5" height="26"/>
+      <text x="199" y="156" text-anchor="middle" class="lbl-mono">칸 8..19</text><text x="368" y="156" text-anchor="middle" class="lbl-mono">이 블록에서 안 씀</text>
+      <path class="ln" d="M287,166 v18 h30" marker-end="url(#f22-a)"/><text x="442" y="188" text-anchor="end" class="lbl-acc2">끝=20 → BTB 목적지</text>
+      <line class="ln-dash" x1="226" y1="48" x2="226" y2="170"/><text x="226" y="206" text-anchor="middle" class="lbl-mono">32B 경계(반쪽 0 | 반쪽 1)</text>
+    </svg>
+    <figcaption>칸 번호는 32바이트 정렬 주소 기준이다. taken 분기가 없으면 끝은 칸 31, 있으면 그 분기 칸이 끝이 된다. <code>bpu/FallThroughPredictor.scala:44-92</code>.</figcaption>
+    <div class="legend"><span><i style="--c:var(--accent)"></i>블록에 포함</span><span><i style="--c:var(--accent-2)"></i>fall-through 끝</span><span><i style="--c:var(--ok)"></i>taken 분기</span></div>
+  </figure>
+
+  <p>한 가지 예외가 있다. 블록은 4KB 페이지 경계를 넘지 못한다. 넘으면 끝을 페이지 끝으로 자른다. 그래서 페이지 끝 근처의 블록은 2바이트까지 짧아질 수 있다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">F1 · fall-through</span><h4>taken이 없을 때의 다음 블록</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">next = align32(startPc + 64). startPc와 next의 페이지 번호 최하위 비트(pc[12])가 다르면 target = next의 페이지 시작, 끝 칸 = ~(next − 페이지 시작)[5:1]. 아니면 target = next, 끝 칸 = 31. taken = false.</dd>
+      <dt>이유</dt><dd class="why">BTB가 아무 분기도 모르는 블록에도 다음 주소가 있어야 한다. 이 예측기는 항상 켜져 있어 다른 예측기가 모두 빗나가도 BPU가 멈추지 않는다(<code>Bpu.scala:99</code>).</dd>
+      <dt>없으면</dt><dd>한 블록이 두 페이지에 걸친다. 코드 주석은 이것이 "IFU/ICache의 요구"라고만 적는다(<code>mbtb/MainBtbAlignBank.scala:154</code>). 주소 변환을 블록당 한 번으로 묶으려는 것으로 보인다(추론). 커밋 3732740ac(2025-07-04) "disallow fallthrough a cross-page fetch block".</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/FallThroughPredictor.scala:65-94@09453ff8</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-ft">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>fall-through 계산기</h3></div>
+    <div class="sim-body">
+      <div class="ctl"><label>startPc = 0x8000_0000 + <output id="ft-off">0x000</output></label>
+        <input type="range" id="ft-k" data-k="k" min="0" max="4094" step="2" value="16"></div>
+      <div class="seg" id="ft-pre"><button>0x000</button><button class="on">0x010</button><button>0x03E</button><button>0xFC0</button><button>0xFE0</button><button>0xFFE</button></div>
+      <div class="slots" id="ft-slots"></div>
+      <div class="verdict grey" id="ft-verdict">-</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">정렬 시작</span><span class="v" id="ft-al">-</span></div>
+      <div class="stat"><span class="k">다음 블록 target</span><span class="v acc" id="ft-tg">-</span></div>
+      <div class="stat"><span class="k">끝 칸(cfiPosition)</span><span class="v" id="ft-pos">-</span></div>
+      <div class="stat"><span class="k">블록 길이</span><span class="v" id="ft-len">-<small>B</small></span></div>
+    </div>
+    <div class="sim-note">F1의 식을 그대로 계산한다(주소는 합성 값). ① 0x000과 0x010을 비교해 길이가 64에서 48로 주는 것을 보세요. ② 0xFC0과 0xFE0을 눌러 페이지 끝에서 target이 0x...1000으로 잘리는지 확인하세요. ③ 0xFFE에서는 블록이 2바이트뿐이다. 왜 끝 칸이 15인지는 F1의 ~(next − 페이지 시작) 식으로 손계산해 보세요.</div>
+  </div>
+</section>
+
+<section>
+  <h2>BTB: 분기가 어디 있는지 기억하는 표</h2>
+  <p>앞단은 명령어 바이트를 아직 받지 못했다. 그러니 블록 안에 분기가 있는지조차 모른다. 해결책은 기억이다. 지난번에 이 블록을 지날 때 몇 번째 칸에 어떤 분기가 있었고 어디로 갔는지를 표에 적어 둔다. 이 표가 <span class="term" data-def="Branch Target Buffer. 블록 주소를 키로 '분기 위치, 종류, 목적지'를 저장하는 캐시. 명령어를 해석하기 전에 분기의 존재를 알게 해 준다.">BTB<span class="en">Branch Target Buffer</span></span>다. 우편함에 비유하면, 주소의 일부(인덱스)로 칸을 고르고, 칸 안의 몇 통(way) 중 이름표(tag)가 맞는 것을 꺼낸다. 이런 구조를 <span class="term" data-def="주소 일부로 세트(set)를 고르고, 세트 안 여러 way 중 tag가 일치하는 항목을 찾는 캐시 구조. 세트가 하나뿐이면 완전 연관(fully associative)이다.">집합 연관<span class="en">set-associative</span></span> 구조라 한다.</p>
+  <p>BTB는 크게 만들수록 많이 기억하지만 느려진다. KMHv3는 그래서 크기와 속도가 다른 BTB 세 개를 둔다. 아래 표의 값은 모두 기본 설정(<code>DefaultConfig</code>은 BPU 파라미터를 바꾸지 않는다, <code>src/main/scala/top/Configs.scala:583-589</code>)이다.</p>
+  <div class="table-wrap"><table class="data" style="min-width:580px">
+    <tr><th>BTB</th><th>구성</th><th class="num">엔트리</th><th>찾는 법</th><th>결과 시점</th></tr>
+    <tr><td>uBTB</td><td>레지스터, 완전 연관</td><td class="num">32</td><td>tag = pc[22:1], 32개 동시 비교</td><td>s1</td></tr>
+    <tr><td>aBTB</td><td>SRAM, 4뱅크 × 64세트 × 4way</td><td class="num">1024</td><td>(pc[7:0] ⊕ PHR 해시)로 세트·뱅크, tag = <em>다음</em> 블록 pc[24:1]</td><td>s1</td></tr>
+    <tr><td>MainBTB</td><td>SRAM, 반쪽 2 × 내부 뱅크 4 × 256세트 × 4way</td><td class="num">8192</td><td>set = pc[15:8], tag = pc[31:16]</td><td>s2(위치·종류), s3(목적지 비교)</td></tr>
+  </table></div>
+  <p class="mini">근거: <code>bpu/ubtb/Parameters.scala:22-29</code>, <code>bpu/abtb/Parameters.scala:24-42</code>, <code>bpu/mbtb/Parameters.scala:23-50</code>, 필드 배치 <code>bpu/mbtb/Helpers.scala:30-45</code>, <code>bpu/abtb/AheadBtb.scala:95-98</code>, <code>bpu/ubtb/Helpers.scala:25-37</code> (모두 @09453ff8, 경로 앞 <code>src/main/scala/xiangshan/frontend/</code> 생략).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="MainBTB 주소 비트 분해와 뱅크 구조">
+      <defs><marker id="f23-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="18" class="lbl-dim">MainBTB가 보는 PC 비트 (31 → 0)</text>
+      <rect class="box-acc" x="10" y="28" width="220" height="34"/><text x="120" y="50" text-anchor="middle" class="lbl-acc">tag [31:16]</text>
+      <rect class="box-2" x="230" y="28" width="110" height="34"/><text x="285" y="50" text-anchor="middle" class="lbl-acc2">set [15:8]</text>
+      <rect class="box-warn" x="340" y="28" width="28" height="34"/><text x="354" y="50" text-anchor="middle" class="lbl-mono">7:6</text>
+      <rect class="box-ok" x="368" y="28" width="14" height="34"/>
+      <rect class="box-grey" x="382" y="28" width="68" height="34"/><text x="416" y="50" text-anchor="middle" class="lbl-mono">[4:0]</text>
+      <text x="354" y="78" text-anchor="middle" class="lbl-mono">내부뱅크</text><text x="384" y="94" text-anchor="middle" class="lbl-mono">반쪽 pc[5]</text><text x="420" y="78" text-anchor="middle" class="lbl-mono">칸</text>
+      <rect class="box" x="10" y="112" width="210" height="96" rx="10"/><text x="115" y="132" text-anchor="middle" class="lbl-b">반쪽 0 (pc[5]=0)</text>
+      <rect class="box" x="240" y="112" width="210" height="96" rx="10"/><text x="345" y="132" text-anchor="middle" class="lbl-b">반쪽 1 (pc[5]=1)</text>
+      <rect class="box-warn" x="22" y="142" width="42" height="26" rx="4"/><rect class="box-warn" x="70" y="142" width="42" height="26" rx="4"/><rect class="box-warn" x="118" y="142" width="42" height="26" rx="4"/><rect class="box-warn" x="166" y="142" width="42" height="26" rx="4"/>
+      <rect class="box-warn" x="252" y="142" width="42" height="26" rx="4"/><rect class="box-warn" x="300" y="142" width="42" height="26" rx="4"/><rect class="box-warn" x="348" y="142" width="42" height="26" rx="4"/><rect class="box-warn" x="396" y="142" width="42" height="26" rx="4"/>
+      <text x="115" y="192" text-anchor="middle" class="lbl-mono">뱅크마다 256세트 × 4way</text><text x="345" y="192" text-anchor="middle" class="lbl-mono">뱅크마다 256세트 × 4way</text>
+      <text x="230" y="236" text-anchor="middle" class="lbl-dim">한 블록 = 두 반쪽을 동시에 읽어 최대 8개 분기(4way × 2)</text>
+    </svg>
+    <figcaption>64바이트 블록은 32바이트 반쪽 두 개에 걸친다. 한 반쪽은 원래 startPc로, 다른 반쪽은 align32(startPc+32)로 읽고, pc[5]에 맞춰 물리 뱅크로 돌려 보낸다. <code>bpu/mbtb/MainBtb.scala:74-100</code>.</figcaption>
+  </figure>
+
+  <p>세트 안에서 tag가 맞아도 다 쓰지는 않는다. 시작 주소보다 앞 칸에 있는 분기는 이번 블록에서 실행되지 않으니 버린다. 다른 반쪽이 다음 페이지에 걸리면 그 반쪽의 결과도 모두 버린다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">B1 · MainBTB hit</span><h4>시작 오프셋과 페이지로 거르기</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">hit = tag 일치 &amp;&amp; position ≥ pc[4:1](시작 칸) &amp;&amp; !crossPage. 두 번째 반쪽은 정렬 주소로 읽으므로 시작 칸이 0이라 위치 조건이 항상 참이다.</dd>
+      <dt>이유</dt><dd class="why">블록은 startPc부터 실행된다. 그보다 앞 칸의 분기는 이번에 지나가지 않는다. 페이지를 넘는 블록은 F1이 금지한다.</dd>
+      <dt>없으면</dt><dd>지나가지도 않을 앞쪽 분기를 taken으로 골라 블록을 시작하자마자 엉뚱한 곳으로 뛴다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/mbtb/MainBtbAlignBank.scala:139-162@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="callout deep"><strong>목적지는 일부만 저장한다</strong><p>MainBTB는 목적지 전체가 아니라 하위 20비트(pc[20:1])만 저장한다(<code>TargetWidth = 20</code>). 대신 "윗부분이 startPc와 같은가, 1 큰가, 1 작은가"를 2비트 <code>TargetCarry</code>(Fit/Overflow/Underflow)로 기억한다. 읽을 때 startPc의 윗부분에 ±1을 더해 붙인다(<code>bpu/Helpers.scala:131-183</code>). 분기 목적지는 대개 가까이 있다는 점을 이용해 공간을 아낀다. uBTB와 aBTB는 22비트를 저장하고 이 보정을 쓰지 않는다(<code>EnableTargetFix = false</code>).</p></div>
+
+  <div class="sim" id="sim-addr">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>BTB 주소 분해기</h3></div>
+    <div class="sim-body">
+      <div class="ctl"><label>PC 하위 16비트 <output id="ad-pc">-</output></label>
+        <input type="range" id="ad-k" data-k="k" min="0" max="65534" step="2" value="4176"></div>
+      <div class="ctl"><label>aBTB용 PHR 해시 4비트 <output data-for="h" data-fmt="int"></output></label>
+        <input type="range" data-k="h" min="0" max="15" step="1" value="0"></div>
+      <div class="btn-row"><button class="btn" id="ad-32">+32B</button><button class="btn" id="ad-256">+256B</button><button class="btn" id="ad-64k">+64KB</button><button class="btn" id="ad-rst">처음으로</button></div>
+      <div class="bits" id="ad-bits"></div>
+      <div class="legend"><span><i style="--c:var(--accent)"></i>tag</span><span><i style="--c:var(--accent-2)"></i>set</span><span><i style="--c:var(--warn)"></i>내부 뱅크</span><span><i style="--c:var(--ok)"></i>반쪽</span><span><i style="--c:var(--grey)"></i>칸</span></div>
+      <div class="table-wrap"><table class="data" id="ad-tab"></table></div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">MainBTB set·뱅크</span><span class="v" id="ad-m">-</span></div>
+      <div class="stat"><span class="k">aBTB set·뱅크</span><span class="v acc" id="ad-a">-</span></div>
+      <div class="stat"><span class="k">uBTB tag</span><span class="v" id="ad-u">-</span></div>
+    </div>
+    <div class="sim-note">실제 필드 배치(<code>mbtb/Helpers.scala:30-45</code>, <code>abtb/AheadBtb.scala:95-98</code>)로 합성 PC를 분해한다. ① 처음 주소(0x1050)에서 +32B를 누르면 pc[5]만 바뀌어 반쪽이 바뀌고 세트는 그대로다(자리올림이 생기는 주소에서는 뱅크도 바뀐다). ② +64KB는 세트·뱅크는 그대로 두고 tag만 바꾼다. 같은 세트에 4개를 넘게 넣으면 교체가 일어난다. ③ PHR 해시를 움직이면 같은 PC라도 aBTB 세트가 달라진다. 왜 그런지는 6절에서.</div>
+  </div>
+</section>
+
+<section>
+  <h2>s0→s3 파이프라인과 override</h2>
+  <p>큰 BTB와 정교한 방향 예측기는 SRAM을 읽고 결과를 합치는 데 2-3사이클이 걸린다. 그 결과를 기다렸다가 다음 블록을 시작하면 블록 하나에 3사이클이 든다. KMHv3는 이를 이렇게 푼다. 작고 빠른 예측기가 1사이클 만에 일단 답을 내고, BPU는 그 답으로 바로 다음 블록을 시작한다. 2·3사이클째에 정확한 답이 나와 앞선 답과 다르면, 그 사이 시작한 블록을 버리고 다시 시작한다. 이것이 <span class="term" data-def="뒤 단계의 더 정확한 예측이 앞 단계의 빠른 예측과 다를 때, 앞 예측을 취소하고 덮어쓰는 것. 그 사이 시작한 블록은 버려져 거품이 된다.">override<span class="en">덮어쓰기</span></span>다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="BPU s0부터 s3까지의 단계와 override 경로">
+      <defs><marker id="f24-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker>
+        <marker id="f24-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--bad)"/></marker></defs>
+      <rect class="box-acc" x="10" y="96" width="98" height="92" rx="10"/><text x="59" y="118" text-anchor="middle" class="lbl-b">s0</text>
+      <text x="59" y="140" text-anchor="middle" class="lbl-dim">PC 고르기</text><text x="59" y="158" text-anchor="middle" class="lbl-dim">SRAM 읽기</text><text x="59" y="176" text-anchor="middle" class="lbl-dim">시작</text>
+      <rect class="box" x="124" y="96" width="98" height="92" rx="10"/><text x="173" y="118" text-anchor="middle" class="lbl-b">s1</text>
+      <text x="173" y="140" text-anchor="middle" class="lbl-dim">uBTB·aBTB</text><text x="173" y="158" text-anchor="middle" class="lbl-dim">fall-through</text><text x="173" y="176" text-anchor="middle" class="lbl-acc">첫 예측</text>
+      <rect class="box" x="238" y="96" width="98" height="92" rx="10"/><text x="287" y="118" text-anchor="middle" class="lbl-b">s2</text>
+      <text x="287" y="140" text-anchor="middle" class="lbl-dim">MainBTB</text><text x="287" y="158" text-anchor="middle" class="lbl-dim">TAGE fast</text><text x="287" y="176" text-anchor="middle" class="lbl-acc">위치·종류</text>
+      <rect class="box" x="352" y="96" width="98" height="92" rx="10"/><text x="401" y="118" text-anchor="middle" class="lbl-b">s3</text>
+      <text x="401" y="140" text-anchor="middle" class="lbl-dim">TAGE·SC</text><text x="401" y="158" text-anchor="middle" class="lbl-dim">RAS·ITTAGE</text><text x="401" y="176" text-anchor="middle" class="lbl-acc">최종</text>
+      <line class="ln" x1="108" y1="142" x2="122" y2="142" marker-end="url(#f24-a)"/><line class="ln" x1="222" y1="142" x2="236" y2="142" marker-end="url(#f24-a)"/><line class="ln" x1="336" y1="142" x2="350" y2="142" marker-end="url(#f24-a)"/>
+      <path class="ln-acc" d="M173,96 V76 H70 V94" marker-end="url(#f24-a)"/><text x="122" y="70" text-anchor="middle" class="lbl-acc">target (매 사이클)</text>
+      <path class="ln-bad" d="M287,96 V50 H59 V94" marker-end="url(#f24-b)"/><text x="173" y="44" text-anchor="middle" class="lbl-bad">s2 override: s1 버림</text>
+      <path class="ln-bad" d="M401,96 V22 H48 V94" marker-end="url(#f24-b)"/><text x="225" y="16" text-anchor="middle" class="lbl-bad">s3 override: s1·s2 버림</text>
+      <path class="ln-dash" d="M10,226 H34 V190" marker-end="url(#f24-a)"/><text x="40" y="232" class="lbl-dim">redirect(백엔드·IFU): 전부 버림</text>
+      <path class="ln" d="M401,188 V212 H330" marker-end="url(#f24-a)"/><text x="324" y="216" text-anchor="end" class="lbl-mono">FTQ로 예측·수정</text>
+    </svg>
+    <figcaption>s1의 목적지는 같은 사이클에 다음 블록의 s0 PC가 된다. 그래서 매 사이클 블록 하나를 낸다. s2·s3가 다른 답을 내면 앞 단계를 비우고 그 답으로 다시 시작한다. <code>bpu/Bpu.scala:248-278, 533-541</code>.</figcaption>
+  </figure>
+
+  <p>단계마다 하는 일은 다음과 같다. <b>s0</b>에서 이번 블록의 시작 PC를 정하고 각 예측기가 SRAM 읽기를 시작한다. <b>s1</b>에서 uBTB·aBTB·fall-through로 첫 예측을 낸다. <b>s2</b>에서 MainBTB의 위치·종류와 TAGE의 빠른 방향으로 다시 계산한다. <b>s3</b>에서 TAGE·SC의 최종 방향과 RAS·ITTAGE의 목적지로 마지막 계산을 한다. 방향 예측기 내부는 <a href="ch03-predictors.html">3장</a>의 몫이다. 아래 게이트들이 이 흐름을 지킨다.</p>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G1 · s0_startPc</span><h4>다음 블록 주소 고르기</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">우선순위 redirect.target &gt; s3 target(s3_override) &gt; s2 target(s2_override) &gt; s1 target(s1_valid) &gt; 레지스터에 남은 값.</dd>
+      <dt>이유</dt><dd class="why">늦게 나온 정보일수록 정확하다. 실제 실행 결과(redirect)가 가장 늦고 가장 정확하다.</dd>
+      <dt>없으면</dt><dd>더 정확한 답이 나와도 틀린 길을 계속 가져온다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:533-541@09453ff8 (레지스터 :139, 리셋 벡터 :141-143)</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G2 · flush 사슬</span><h4>틀린 블록 비우기</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s3_flush = redirect, s2_flush = s3_flush || s3_override, s1_flush = s2_flush || s2_override. flush된 단계의 valid는 다음 사이클에 0이 된다.</dd>
+      <dt>이유</dt><dd class="why">override가 난 블록보다 뒤에 시작한 블록들은 틀린 PC에서 출발했다.</dd>
+      <dt>없으면</dt><dd>틀린 경로의 블록이 FTQ로 흘러가 잘못된 명령어를 가져온다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:248-250, 263-273@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G3 · ready/fire</span><h4>FTQ가 차면 s1에서 멈춘다</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s0_fire = s1_ready &amp;&amp; sramResetDone, s1_fire = s1_valid &amp;&amp; s2_ready &amp;&amp; FTQ.ready, s2_fire = s2_valid &amp;&amp; s3_ready, s3_fire = s3_valid. s1_ready = s1_fire || !s1_valid || s1_flush.</dd>
+      <dt>이유</dt><dd class="why">FTQ가 가득 차면 예측을 받아 줄 곳이 없다(역압). SRAM이 리셋으로 0을 다 쓰기 전에는 예측을 시작하지 않는다.</dd>
+      <dt>없으면</dt><dd>FTQ가 넘치거나, 초기화되지 않은 SRAM 값으로 예측한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:252-275@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G4 · s2_override</span><h4>MainBTB가 s1과 다르게 볼 때</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s2_valid &amp;&amp; (taken이 다름 || (taken일 때) 첫 taken 칸이 다름 || 종류가 다름). s2 taken = 점프이거나, 조건 분기면 TAGE fast 결과(없으면 MainBTB 카운터). 목적지는 비교하지 않는다.</dd>
+      <dt>이유</dt><dd class="why">MainBTB는 8192개를 기억해 uBTB(32)·aBTB(1024)보다 정확하다. 위치와 종류는 s2에 이미 확정된다.</dd>
+      <dt>없으면</dt><dd>같은 실수를 s3까지 기다려 고치게 되어 거품이 1개에서 2개로 는다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:356-380@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G5 · s3_override</span><h4>최종 방향·목적지가 s2와 다를 때</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s3_valid &amp;&amp; (taken이 s2와 다름 || 첫 taken 분기가 다름 || 목적지가 다름). 조건 분기 방향은 SC &gt; TAGE &gt; MainBTB 카운터 순. 목적지는 복귀면 RAS, ITTAGE가 필요한 간접 점프면 ITTAGE, 아니면 MainBTB. MainBTB 목적지는 하위 비트만 비교하고, s2 override가 이미 났으면 비교하지 않는다.</dd>
+      <dt>이유</dt><dd class="why">TAGE·SC·RAS·ITTAGE는 3사이클째에야 답이 나온다. 그 정확도를 쓰려면 한 번 더 고칠 기회가 필요하다.</dd>
+      <dt>없으면</dt><dd>3장의 정교한 예측기들이 결과를 내도 BPU가 쓰지 못한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:396-474@09453ff8</dd>
+    </dl>
+  </div>
+  <p>FTQ 쪽에서는 s1 예측이 먼저 들어가고, override가 나면 s2·s3 단계 블록이 들어 있는 FTQ 칸을 고쳐 쓴다(<code>prediction.valid = s1_valid &amp;&amp; s2_ready || s2_override || s3_override</code>, <code>Bpu.scala:510-525</code>). 덮어쓰기를 FTQ가 어떻게 처리하는지는 <a href="ch04-fetch.html">4장</a>에서 본다.</p>
+
+  <div class="sim" id="sim-ovr">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>override 거품 타임라인</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="ov-sc"><button class="on">모두 맞음</button><button>s2가 고침</button><button>s3가 고침</button><button>redirect</button><button>FTQ 가득</button></div>
+      <div class="ctl"><label>사이클 (드래그로 되감기) <output id="ov-t">0</output></label>
+        <input type="range" id="ov-k" data-k="t" min="0" max="11" step="1" value="0"></div>
+      <div class="btn-row"><button class="btn primary" id="ov-play">재생</button><button class="btn" id="ov-step">한 사이클</button><button class="btn" id="ov-reset">처음으로</button></div>
+      <div class="pad" style="padding:0"><table class="tl" id="ov-tab"></table></div>
+      <div class="verdict grey" id="ov-verdict">-</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">FTQ로 보낸 예측</span><span class="v" id="ov-sent">0</span></div>
+      <div class="stat"><span class="k">버려진 블록(거품)</span><span class="v acc" id="ov-bub">0</span></div>
+      <div class="stat"><span class="k">맞는 블록 진행</span><span class="v" id="ov-good">-</span></div>
+    </div>
+    <div class="sim-note">G1-G5의 valid/fire/flush 식(<code>Bpu.scala:248-278, 533-541</code>)을 사이클마다 그대로 계산한다. 블록 이름과 "누가 틀리는가"만 합성이다. 정답 경로는 A→B→C→D…, x1·x2…는 블록 B 뒤의 틀린 경로다. ① "s2가 고침"과 "s3가 고침"에서 버려진 블록 수를 비교하세요(1과 2). ② "redirect"는 셋 다 틀린 경우다. 사이클 7에 뒤에서 고치러 오기까지 틀린 블록이 쌓인다(실제 지연은 훨씬 길다). FTQ 줄의 *는 override가 이미 보낸 칸을 고쳐 쓴 것이다. ③ "FTQ 가득"에서는 3·4사이클에 FTQ.ready가 0이다. s1이 같은 블록을 붙잡고 있는 모습을 보세요.</div>
+  </div>
+  <div class="callout decision"><strong>2025-07-16 → 2026-09-11 s2 override를 뺐다가 다시 넣었다</strong><p>커밋 304332fec(2025-07-16, "remove s2 override")가 s2 override를 없앴고, s3 override는 099962cd8(2025-09-23, "enable s3 override")로 켜졌다. 이후 e948ffa9f(2026-09-11, #6423 "add s2_override")가 s2 override를 다시 넣었다. 지금 코드는 두 단계 모두에서 덮어쓴다. 2026-08-31 #6431(368198ec2)은 타이밍을 위해 BTB 목적지를 하위 비트만 비교하게 바꿨다.</p></div>
+</section>
+
+<section>
+  <h2>s1의 세 목소리: uBTB, aBTB, fall-through</h2>
+  <p>s1은 1사이클 안에 답해야 한다. 여기에 참여하는 것은 세 예측기다. <b>uBTB</b>는 32개 엔트리를 레지스터에 두고 s0에서 tag를 한꺼번에 비교한다. 방향 카운터가 없다. 맞으면 무조건 taken이라고 답한다(<code>bpu/ubtb/MicroBtb.scala:92-97</code>). <b>fall-through</b>는 2절의 F1이다. 남은 하나가 <b>aBTB</b>다.</p>
+  <p>aBTB는 1024개짜리 SRAM이라 읽는 데 2사이클이 걸린다. 그런데도 s1에 답을 낸다. 비결은 이름의 <em>ahead</em>에 있다. 블록 N+1을 예측할 SRAM 읽기를 한 블록 <em>앞서</em>, 블록 N이 s0에 있을 때 시작한다. 그래서 엔트리는 이전 블록(N)의 PC와 경로 히스토리로 인덱스되고, 지금 블록(N+1)의 PC로 tag를 비교한다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 214" role="img" aria-label="aBTB가 한 블록 앞서 읽는 타이밍">
+      <defs><marker id="f25-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="150" y="18" text-anchor="middle" class="lbl-b">사이클 t</text><text x="270" y="18" text-anchor="middle" class="lbl-b">t+1</text><text x="390" y="18" text-anchor="middle" class="lbl-b">t+2</text>
+      <text x="8" y="50" class="lbl-b">BPU s0</text><text x="8" y="94" class="lbl-b">BPU s1</text><text x="8" y="150" class="lbl-b">aBTB</text>
+      <rect class="box-acc" x="100" y="30" width="100" height="30" rx="6"/><text x="150" y="50" text-anchor="middle" class="lbl">블록 N</text>
+      <rect class="box-2" x="220" y="30" width="100" height="30" rx="6"/><text x="270" y="50" text-anchor="middle" class="lbl">블록 N+1</text>
+      <rect class="box-acc" x="220" y="74" width="100" height="30" rx="6"/><text x="270" y="94" text-anchor="middle" class="lbl">블록 N</text>
+      <rect class="box-2" x="340" y="74" width="100" height="30" rx="6"/><text x="390" y="94" text-anchor="middle" class="lbl">블록 N+1</text>
+      <rect class="box" x="100" y="122" width="100" height="46" rx="6"/><text x="150" y="142" text-anchor="middle" class="lbl-dim">읽기 시작</text><text x="150" y="160" text-anchor="middle" class="lbl-mono">N[7:0]⊕해시</text>
+      <rect class="box" x="220" y="122" width="100" height="46" rx="6"/><text x="270" y="142" text-anchor="middle" class="lbl-dim">tag 비교</text><text x="270" y="160" text-anchor="middle" class="lbl-mono">N+1[24:1]</text>
+      <rect class="box-ok" x="340" y="122" width="100" height="46" rx="6"/><text x="390" y="142" text-anchor="middle" class="lbl-dim">결과 출력</text><text x="390" y="160" text-anchor="middle" class="lbl-mono">N+1의 분기</text>
+      <line class="ln" x1="200" y1="145" x2="218" y2="145" marker-end="url(#f25-a)"/><line class="ln" x1="320" y1="145" x2="338" y2="145" marker-end="url(#f25-a)"/>
+      <path class="ln-dash" d="M270,104 V120" marker-end="url(#f25-a)"/><path class="ln-acc" d="M390,122 V106" marker-end="url(#f25-a)"/>
+      <text x="230" y="200" text-anchor="middle" class="lbl-dim">N의 s1 target(=N+1 시작)이 tag 비교에 들어간다</text>
+    </svg>
+    <figcaption>aBTB는 2사이클 SRAM을 블록 하나만큼 앞당겨 읽어, BPU에는 1사이클 예측기처럼 보인다. 배선은 <code>bpu/abtb/AheadBtb.scala:95-99, 133, 184</code>와 <code>bpu/Bpu.scala:190-196, 201</code>. "SRAM 지연을 숨기려는 것"이라는 설명은 배선에서 읽은 해석이다(추론).</figcaption>
+  </figure>
+
+  <p>override가 나면 "앞서 읽어 둔" 것이 틀린 블록 기준이 된다. aBTB는 그래서 s2 override 때는 직전 s2 상태를, s3 override 때는 따로 저장해 둔 상태를 새 PC로 다시 비교해 쓴다(<code>AheadBtb.scala:141-147, 218-223</code>). 2025-11-21 #5222(2861024c5)가 s3 override 직후에도 aBTB가 예측을 낼 수 있게 한 변경이다.</p>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G6 · s1 선택</span><h4>aBTB가 맞으면 aBTB, 아니면 uBTB, 아니면 fall-through</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">aBTB taken[i] = valid &amp;&amp; (점프 || 조건 분기 &amp;&amp; (uTAGE hit ? uTAGE 방향 : 카운터 ≥ 2)). 첫 taken = CompareMatrix로 고른 가장 앞 칸. s1 = aBTB 엔트리가 하나라도 hit면 (taken 있음 ? aBTB 첫 taken : fall-through), 하나도 없으면 (uBTB hit ? uBTB : fall-through). 복귀(ret)면 목적지를 uRAS로 바꾼다.</dd>
+      <dt>이유</dt><dd class="why">aBTB는 블록당 4way를 보고 조건 분기 방향 카운터도 있어 uBTB보다 정보가 많다. uBTB는 aBTB가 모르는 블록을 위한 예비다.</dd>
+      <dt>없으면</dt><dd>s1이 늘 fall-through만 내면 taken 분기가 있는 블록마다 s2 override 거품이 생긴다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/Bpu.scala:280-329@09453ff8</dd>
+    </dl>
+  </div>
+  <p>"가장 앞 칸 고르기"는 <code>CompareMatrix</code>가 한다. 후보 N개의 칸 번호를 두 개씩 미리 비교해 둔 표(<code>m(i)(j) = pos(i) &lt; pos(j)</code>)를 만들고, "자기는 taken이고, 다른 taken 후보 모두보다 앞선" 후보 하나를 원핫으로 고른다(<code>bpu/CompareMatrix.scala:69-77, 116-134</code>). 블록 안에서는 가장 앞의 taken 분기가 실제로 먼저 실행되기 때문이다.</p>
+
+  <div class="sim" id="sim-s1">
+    <div class="sim-head"><span class="sim-tag predict">Predict</span><h3>s1은 누구 말을 듣나, s2는 고치나</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="s1-case"><button class="on">사례 1</button><button>사례 2</button><button>사례 3</button><button>사례 4</button></div>
+      <div class="pad" id="s1-view" style="padding:0"></div>
+      <p style="margin:0">s1 예측은 어디서 오는가? 먼저 고른 뒤 실행하세요.</p>
+      <div class="seg" id="s1-pick"><button class="on">aBTB</button><button>uBTB</button><button>fall-through</button></div>
+      <div class="btn-row"><button class="btn primary" id="s1-run">실행</button></div>
+      <div class="verdict grey" id="s1-out">아직 실행하지 않음</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">s1 예측</span><span class="v" id="s1-s1">-</span></div>
+      <div class="stat"><span class="k">s2 예측</span><span class="v" id="s1-s2">-</span></div>
+      <div class="stat"><span class="k">s2_override</span><span class="v acc" id="s1-ov">-</span></div>
+    </div>
+    <div class="sim-note">G6과 G4의 식을 그대로 돌린다. 엔트리는 합성이며 uTAGE와 TAGE fast는 hit하지 않는다고 둔다(그러면 카운터 ≥ 2가 taken). C는 조건 분기(숫자는 2비트 카운터), J는 직접 점프. ① 사례 3에서 uBTB가 hit인데도 s1이 uBTB를 안 쓰는 이유를 G6에서 찾으세요. ② 사례 1은 s1과 s2가 다른 칸을 고른다. 거품 1개짜리 s2 override다. ③ 사례 4에서 칸 9와 칸 3이 모두 taken일 때 누가 이기는지 보세요.</div>
+  </div>
+  <div class="callout decision"><strong>2025-11-21 s1은 uBTB와 aBTB의 첫 taken 위치를 쓴다</strong><p>커밋 5966c9d71("s1 prediction use first taken position from ubtb &amp; abtb", PR 번호 없음)이 s1이 CompareMatrix로 첫 taken을 고르는 지금의 형태를 만들었다.</p></div>
+</section>
+
+<section>
+  <h2>경로 히스토리: 어떤 길로 왔는가</h2>
+  <p>같은 분기라도 어떤 길로 왔는지에 따라 결과가 달라지는 경우가 많다. "로그인했으면 장바구니로, 아니면 로그인 화면으로" 같은 코드에서, 앞에서 어느 쪽 분기를 탔는지가 뒤 분기의 결과를 거의 정해 준다. 그래서 예측기는 최근에 지나온 분기들의 흔적을 입력으로 쓴다. KMHv3의 BPU는 이 흔적을 <span class="term" data-def="Path History Register. taken 분기의 (분기 PC, 목적지)를 해시해 시프트 레지스터에 쌓은 것. KMHv3 기본값 532비트.">PHR<span class="en">Path History Register</span></span>에 쌓는다.</p>
+  <p>규칙은 단순하다. taken 분기를 만날 때마다 분기 PC와 목적지로 15비트 해시를 만들고, PHR을 2비트 왼쪽으로 밀면서 아래쪽에 해시를 XOR한다. not-taken은 PHR을 바꾸지 않는다. 길이는 532비트다. TAGE·ITTAGE·SC 테이블 중 가장 긴 히스토리 397(TAGE)에, 아직 확정되지 않은 블록 64개(FTQ 크기) × 2비트와 여유 4비트를 더해 4의 배수로 올린 값이다(<code>src/main/scala/xiangshan/frontend/FrontendParameters.scala:40-58</code>). 실제 하드웨어는 시프트 대신 원형 버퍼와 포인터로 구현하지만(<code>history/phr/Helpers.scala:84-95</code>, <code>Phr.scala:44-74</code>), 결과는 아래 시프트 모델과 같다.</p>
+  <div class="formula">hash = ( pc[9:1] · 2<sup>4</sup> ) ⊕ target[16:2] 의 하위 15비트<br>taken이면 PHR ← (PHR · 2<sup>2</sup>) ⊕ hash, not-taken이면 그대로
+    <span class="where">pc는 분기 명령어 주소, target은 목적지. 근거 <code>bpu/history/phr/Helpers.scala:60-63, 84-95</code>, Shamt = 2, PathHashWidth = 15 (<code>history/phr/Parameters.scala:21-23</code>).</span></div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 200" role="img" aria-label="PHR 갱신: 2비트 시프트 후 해시 XOR">
+      <defs><marker id="f26-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="18" class="lbl-dim">PHR (532비트 중 아래쪽만 그림)</text>
+      <rect class="box" x="10" y="28" width="330" height="30"/><text x="175" y="48" text-anchor="middle" class="lbl">이전 PHR</text>
+      <rect class="box-grey" x="340" y="28" width="110" height="30"/><text x="395" y="48" text-anchor="middle" class="lbl-mono">(밀려 나감)</text>
+      <path class="ln" d="M175,58 V78" marker-end="url(#f26-a)"/><text x="185" y="74" class="lbl-dim">2비트 왼쪽으로</text>
+      <rect class="box" x="10" y="82" width="410" height="30"/><rect class="box-grey" x="420" y="82" width="30" height="30"/><text x="215" y="102" text-anchor="middle" class="lbl">이전 PHR</text><text x="435" y="102" text-anchor="middle" class="lbl-mono">00</text>
+      <rect class="box-acc" x="240" y="128" width="210" height="30"/><text x="345" y="148" text-anchor="middle" class="lbl-acc">hash 15비트 ⊕</text>
+      <rect class="box-2" x="10" y="166" width="440" height="30"/><text x="125" y="186" text-anchor="middle" class="lbl-acc2">새 PHR</text><text x="345" y="186" text-anchor="middle" class="lbl-mono">아래 15비트에 경로가 섞임</text>
+    </svg>
+    <figcaption>taken 분기 하나가 PHR의 아래 15비트를 바꾸고, 오래된 흔적은 2비트씩 위로 밀려 532비트 뒤에 사라진다. 예측기들은 필요한 길이만 잘라 "접어서"(XOR로 줄여서) 쓴다.</figcaption>
+  </figure>
+
+  <p>예측기마다 필요한 히스토리 길이가 다르다. 532비트를 그대로 해시에 넣을 수 없으니 필요한 길이 L만 잘라 F비트 조각으로 나눠 XOR한다. 이를 <span class="term" data-def="긴 히스토리를 F비트 조각으로 나눠 XOR해 짧게 만든 값. 인덱스와 tag 계산에 쓴다. bpu/Helpers.scala:185-191.">접힌 히스토리<span class="en">folded history</span></span>라 한다. aBTB는 uTAGE 0번 테이블용 접힌 값(L = 5, F = 5)의 아래 4비트를 인덱스 해시로 쓴다(<code>bpu/abtb/Parameters.scala:54-64</code>). L = F라서 이 값은 PHR[3:0] 그 자체다.</p>
+  <p>PHR은 s1의 예측으로 <em>추측 갱신</em>된다. 확정되지 않은 예측으로 바꿨으니 틀리면 되돌려야 한다. s2·s3 override와 redirect는 각 블록이 들고 다니는 메타(포인터와 아래 비트)로 PHR을 그 블록 시점으로 되돌린 뒤 올바른 분기로 다시 갱신한다. 우선순위는 redirect &gt; s3 &gt; s2 &gt; s1이다(<code>history/phr/Phr.scala:181-198, 283-298</code>). SC가 쓰는 전역 히스토리(GHR)·IMLI 같은 다른 히스토리는 <code>CommonHR</code>이 따로 관리한다. 3장에서 SC와 함께 다룬다.</p>
+
+  <div class="sim" id="sim-phr">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>PHR 갱신과 aBTB 인덱스</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="ph-path"><button class="on">경로 P</button><button>경로 Q</button></div>
+      <div class="table-wrap"><table class="data" id="ph-tab"></table></div>
+      <div class="mini">PHR 아래 24비트 (왼쪽이 23번 비트)</div>
+      <div class="bits" id="ph-bits" style="grid-template-columns:repeat(24,minmax(0,1fr))"></div>
+      <div class="btn-row"><button class="btn primary" id="ph-step">한 분기</button><button class="btn" id="ph-all">끝까지</button><button class="btn" id="ph-reset">처음으로</button></div>
+      <div class="verdict grey" id="ph-verdict">-</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">진행</span><span class="v" id="ph-k">0</span></div>
+      <div class="stat"><span class="k">PHR[15:0]</span><span class="v" id="ph-v">0x0000</span></div>
+      <div class="stat"><span class="k">N=0x8000_1800에서 aBTB</span><span class="v acc" id="ph-ab">-</span></div>
+    </div>
+    <div class="sim-note">해시와 갱신 식은 위 공식 그대로이고, 분기 주소와 PHR 초깃값 0은 합성이다. 두 경로 모두 마지막 분기가 같은 블록 N(0x8000_1800)으로 뛴다. ① 두 경로를 끝까지 돌려 N에서 aBTB가 읽는 세트가 다른지 보세요. N의 PC는 같다. 다른 것은 경로뿐이다. ② 경로 Q의 not-taken 분기에서 PHR이 그대로인지 확인하세요. ③ aBTB는 N의 s0에서 <code>oldFoldedPhr</code>, 즉 N으로 뛰어든 마지막 분기를 넣기 <em>전</em> 값을 쓴다(<code>Phr.scala:91-92, 329-337</code>, <code>Bpu.scala:201</code>). 그래서 표의 "aBTB에 쓰인 PHR"은 마지막 줄 직전 값이다.</div>
+  </div>
+  <div class="callout decision"><strong>2025-11-20 · 2025-12-05 해시와 시프트 폭을 바꿨다</strong><p>#5209(9ee983476, "change phr hash logic")가 지금의 해시 식을, #5315(cbca1ab1e, "change shamt to 2")가 taken당 2비트 시프트를 들여왔다. PHR 자체는 2025-07-17 e6a7d9593("implement phr")에서 처음 구현됐다.</p></div>
+</section>
+
+<section>
+  <h2>학습: 예측기는 어떻게 배우나</h2>
+  <p>BTB와 카운터는 처음에 비어 있다. 예측기는 결과를 보고 배워야 한다. KMHv3에는 학습 경로가 둘이다. 빠른 쪽은 <span class="term" data-def="BPU s3의 최종 예측을 곧바로 s1 예측기(uBTB, aBTB, uTAGE)에 가르치는 경로. 실제 실행 결과를 기다리지 않는다.">fast train<span class="en">빠른 학습</span></span>이다. s3가 낸 최종 예측을 매 블록 s1 예측기(uBTB, aBTB, uTAGE)에 바로 가르친다(<code>fastTrain.valid = s3_valid</code>, <code>Bpu.scala:169-174</code>). 백엔드 결과를 수십 사이클 기다리지 않고, MainBTB와 TAGE가 아는 것을 작은 예측기에 옮겨 담는 것이다. 느린 쪽은 <span class="term" data-def="백엔드가 분기를 실제로 실행한 결과(resolve)를 FTQ를 거쳐 BPU의 모든 예측기에 보내는 학습 경로.">resolve train<span class="en">실행 결과 학습</span></span>이다. 백엔드가 분기를 실제로 실행한 결과가 FTQ를 거쳐 모든 예측기로 간다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 224" role="img" aria-label="fast train과 resolve train 두 학습 경로">
+      <defs><marker id="f27-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-acc" x="10" y="20" width="110" height="44" rx="8"/><text x="65" y="47" text-anchor="middle" class="lbl-b">BPU s3</text>
+      <rect class="box-2" x="300" y="20" width="150" height="44" rx="8"/><text x="375" y="40" text-anchor="middle" class="lbl-b">uBTB·aBTB</text><text x="375" y="57" text-anchor="middle" class="lbl-mono">uTAGE</text>
+      <line class="ln-acc" x1="120" y1="42" x2="298" y2="42" marker-end="url(#f27-a)"/><text x="210" y="34" text-anchor="middle" class="lbl-acc">fast train (매 블록)</text>
+      <rect class="box" x="10" y="100" width="90" height="44" rx="8"/><text x="55" y="127" text-anchor="middle" class="lbl-b">백엔드</text>
+      <rect class="box" x="122" y="100" width="98" height="44" rx="8"/><text x="171" y="119" text-anchor="middle" class="lbl">Resolve</text><text x="171" y="136" text-anchor="middle" class="lbl-mono">Queue</text>
+      <rect class="box" x="242" y="100" width="98" height="44" rx="8"/><text x="291" y="119" text-anchor="middle" class="lbl">FTQ</text><text x="291" y="136" text-anchor="middle" class="lbl-mono">trainCache</text>
+      <rect class="box-2" x="362" y="100" width="88" height="44" rx="8"/><text x="406" y="119" text-anchor="middle" class="lbl-b">모든</text><text x="406" y="136" text-anchor="middle" class="lbl-b">예측기</text>
+      <line class="ln" x1="100" y1="122" x2="120" y2="122" marker-end="url(#f27-a)"/><line class="ln" x1="220" y1="122" x2="240" y2="122" marker-end="url(#f27-a)"/><line class="ln" x1="340" y1="122" x2="360" y2="122" marker-end="url(#f27-a)"/>
+      <text x="171" y="168" text-anchor="middle" class="lbl-dim">백엔드 결과 중 맞힌</text><text x="171" y="186" text-anchor="middle" class="lbl-dim">직접 점프·복귀 버림</text>
+      <text x="291" y="168" text-anchor="middle" class="lbl-dim">첫 오예측 뒤</text><text x="291" y="186" text-anchor="middle" class="lbl-dim">분기는 지움</text>
+      <text x="406" y="168" text-anchor="middle" class="lbl-dim">하나라도 바쁘면</text><text x="406" y="186" text-anchor="middle" class="lbl-dim">전체 대기</text>
+      <text x="230" y="216" text-anchor="middle" class="lbl-mono">같은 블록(ftqIdx)의 결과는 합쳐서 한 번에 보낸다</text>
+    </svg>
+    <figcaption>두 학습 경로. fast train은 BPU 안에서 끝나고, resolve train은 백엔드에서 FTQ를 거쳐 돌아온다. IFU가 보내는 resolve는 거르지 않고 그대로 들어간다. <code>ftq/ResolveQueue.scala:86-96, 160-177</code>, <code>ftq/Ftq.scala:397-445</code>, <code>bpu/Bpu.scala:169-198</code>.</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">T1 · 첫 오예측 마스크</span><h4>틀린 분기 뒤는 배우지 않는다</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">한 블록의 resolve 결과 중 오예측 분기가 있으면, 칸 번호가 그보다 뒤인 분기는 valid를 지운다(<code>CompareMatrix.getLowerElementMask</code>). 그래서 블록당 오예측은 많아야 하나다.</dd>
+      <dt>이유</dt><dd class="why">첫 오예측 뒤의 분기는 실제로는 실행되지 않을 틀린 경로에 있었다.</dd>
+      <dt>없으면</dt><dd>존재하지 않는 경로의 결과로 카운터와 BTB가 오염된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ftq/Ftq.scala:405-410, 432-436@09453ff8 (2025-09-18 커밋 c36ed09ee)</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">T2 · uBTB 갱신</span><h4>쓸모 카운터로 살리고 죽인다</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">miss이고 taken이면 새로 할당, usefulCnt = 3. hit인데 위치·종류·목적지가 다르거나 not-taken이면 usefulCnt − 1. 모두 같고 taken이면 + 1. usefulCnt = 0이면 무효다. 교체 대상은 usefulCnt = 0인 첫 엔트리, 없으면 PLRU. 학습 입력은 resolve 오예측이 있으면 그것, 없으면 fast train.</dd>
+      <dt>이유</dt><dd class="why">uBTB는 32칸뿐이라 자주 taken인 분기만 남겨야 한다. "항상 taken"으로 답하므로 not-taken을 자주 보이는 분기는 빨리 빼는 것이 낫다.</dd>
+      <dt>없으면</dt><dd>한 번 taken이었던 분기가 계속 남아 매번 taken이라고 틀린다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/ubtb/MicroBtb.scala:103-193@09453ff8, ubtb/MicroBtbReplacer.scala:40-46</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">T3 · MainBTB 쓰기</span><h4>엔트리는 오예측 때만 쓴다</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">엔트리 쓰기 = 오예측 &amp;&amp; (miss || ITTAGE가 필요한 간접 점프 || 종류가 바뀜). way는 hit way 또는 LRU victim. 카운터는 새로 쓴 엔트리면 WeakPositive(2), 아니면 같은 칸 조건 분기의 실제 결과로 ±1.</dd>
+      <dt>이유</dt><dd class="why">맞힌 분기는 이미 잘 기억하고 있다. SRAM 쓰기는 예측 읽기와 포트를 다투므로 꼭 필요할 때만 쓴다.</dd>
+      <dt>없으면</dt><dd>매 resolve마다 SRAM 쓰기가 생겨 쓰기 대기열이 넘치고 학습이 유실된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/mbtb/MainBtbAlignBank.scala:220-281@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">T4 · 읽기 우선</span><h4>SRAM 쓰기는 읽기가 없는 사이클에만</h4></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">SRAM은 한 사이클에 읽기 또는 쓰기 하나만 한다. 쓰기 요청은 버퍼에 쌓였다가 그 SRAM에 읽기가 없는 사이클에 나간다. 엔트리 쓰기는 WriteBuffer(MainBTB는 내부 뱅크마다 way별 4칸, aBTB는 뱅크마다 4칸)에 들어간다. WriteBuffer는 역압이 없어서, 가득 찬 줄에 새 요청이 오면 PLRU로 고른 기존 요청을 덮어쓴다. MainBTB의 카운터 쓰기는 4칸짜리 Queue를 쓰는데, 가득 차면 새 쓰기를 버린다.</dd>
+      <dt>이유</dt><dd class="why">예측(읽기)은 매 사이클 필요하다. 학습(쓰기) 때문에 예측을 멈추면 모든 블록이 느려진다.</dd>
+      <dt>없으면</dt><dd>학습할 때마다 BPU 파이프라인이 멈춘다. 대신 지금 구조는 학습 하나를 잃을 수 있다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/bpu/mbtb/MainBtbInternalBank.scala:121-133, 146-160, 205-208@09453ff8, bpu/WriteBuffer.scala:34, 254, bpu/abtb/AheadBtbBank.scala:73-87</dd>
+    </dl>
+  </div>
+  <p>방향을 기억하는 기본 부품은 2비트 <span class="term" data-def="최댓값·최솟값에서 더 움직이지 않는 작은 카운터. 2비트면 0-3이고 2 이상을 taken으로 읽는다. 한 번의 예외로 예측이 뒤집히지 않게 한다.">포화 카운터<span class="en">saturating counter</span></span>다. 0·1은 not-taken, 2·3은 taken이다(맨 위 비트가 1이면 taken, <code>bpu/SaturateCounter.scala:38</code>). 한 번 틀렸다고 바로 뒤집히지 않는다. uBTB는 이런 방향 카운터가 없고 쓸모 카운터만 있다. 두 방식이 분기 패턴마다 어떻게 다른지 직접 비교해 보자.</p>
+
+  <div class="sim" id="sim-ctr">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>2비트 카운터 대 uBTB(항상 taken)</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="ct-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="seg" id="ct-pat"><button class="on">루프 T…TN</button><button>드문 taken N…NT</button><button>교대 TN</button></div>
+        <div class="ctl"><label>반복 주기 n <output data-for="n" data-fmt="int"></output></label>
+          <input type="range" data-k="n" min="2" max="12" step="1" value="4"></div>
+        <div class="verdict grey" id="ct-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">2비트 카운터 틀림</span><span class="v" id="ct-a">0</span></div>
+      <div class="stat"><span class="k">uBTB 틀림</span><span class="v acc" id="ct-b">0</span></div>
+      <div class="stat"><span class="k">분기 실행 수</span><span class="v" id="ct-n">48</span></div>
+    </div>
+    <div class="sim-note">한 분기를 48번 실행한다. 2비트 카운터는 MainBTB 규칙(miss면 not-taken 예측, 첫 taken 오예측 때 2로 할당, 이후 ±1 포화)이고, uBTB는 T2 규칙이다. 학습 지연은 없다고 두고, uBTB도 실제 결과로 배운다고 단순화했다(실제 uBTB는 주로 s3 예측으로 배운다). ① 루프에서는 둘이 비슷하다. ② "드문 taken"에서 uBTB가 주기마다 여러 번 틀리는 이유를 T2의 usefulCnt로 설명해 보세요. ③ 교대 TN에서는 오히려 2비트 카운터가 매번 틀린다. 시작값 2(약한 taken)에서 따라가 보세요.</div>
+  </div>
+  <div class="callout decision"><strong>2026-01-13 · 2026-08-18 · 2026-08-21 교체와 학습 정책</strong><p>7df2ef5fb(2026-01-13, "use lru replacer by default")가 MainBTB 교체를 LRU로 바꿨다. #6348(6de780379, 2026-08-18)은 BTB 교체 정보를 예측 때가 아니라 학습 때 갱신하게 했다. #6237(53a957667, 2026-08-21)은 uBTB가 resolve와 fast train을 함께 쓰게 했다.</p></div>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ol>
+    <li>분기 결과는 파이프라인 뒤에서 나온다. 기다리면 거품이므로 앞단은 블록 단위로 "끝 위치·taken·다음 주소"를 추측한다.</li>
+    <li>페치 블록은 최대 64바이트(2바이트 칸 32개)이고 칸 번호는 32바이트 정렬 주소 기준이다. taken이 없으면 align32(start+64)로 넘어가되 페이지를 넘지 않는다.</li>
+    <li>uBTB(32, 레지스터)와 aBTB(1024, 한 블록 앞서 읽음)가 s1에서 1사이클 예측을 내고, MainBTB(8192)가 s2에서 위치·종류를, TAGE·SC·RAS·ITTAGE가 s3에서 방향·목적지를 확정한다.</li>
+    <li>s2 override는 거품 1개, s3 override는 2개, redirect는 그 사이 시작한 블록 전부를 버린다. s0 PC 우선순위는 redirect &gt; s3 &gt; s2 &gt; s1.</li>
+    <li>PHR은 taken마다 2비트 밀고 15비트 해시를 XOR한다. aBTB 인덱스에도 섞여 같은 PC라도 경로에 따라 다른 세트를 쓴다.</li>
+    <li>fast train은 s3 결과로 s1 예측기를 매 블록 가르치고, resolve train은 실제 결과로 모두를 가르친다. MainBTB 엔트리는 오예측 때만 쓰고, SRAM 쓰기는 읽기에 양보한다.</li>
+  </ol>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="2">
+    <div class="q">블록 B가 s3에 있을 때 s3_override가 났다. 이번 사이클에 버려지는 블록은 몇 개인가? (redirect 없음, FTQ 여유 있음)</div>
+    <div class="opts"><button>0개</button><button>1개</button><button>2개</button><button>3개</button></div>
+    <div class="explain">G2에 따라 s3_override면 s2_flush와 s1_flush가 모두 켜져 s1·s2에 있던 블록 2개가 버려진다. 0개는 override가 없을 때, 1개는 s2_override일 때다. 3개는 s3 자신까지 버리는 redirect의 경우인데, s3_override는 s3 블록의 예측을 고칠 뿐 블록 자체는 FTQ에 남긴다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">aBTB 엔트리의 인덱스와 tag에 쓰이는 PC는?</div>
+    <div class="opts"><button>둘 다 지금 예측하는 블록의 PC</button><button>인덱스는 이전 블록 PC(⊕ PHR 해시), tag는 지금 블록 PC</button><button>인덱스는 지금 블록 PC, tag는 이전 블록 PC</button><button>인덱스는 PHR만, tag는 없음</button></div>
+    <div class="explain">aBTB는 블록 N의 s0에 N의 PC로 읽기를 시작하고, 한 사이클 뒤 N의 s1 target(= N+1 시작)으로 tag를 비교한다(<code>AheadBtb.scala:95-99, 133</code>). 그래서 첫 보기처럼 같은 PC를 쓰면 2사이클 SRAM을 1사이클처럼 쓸 수 없다. 세 번째는 순서가 거꾸로다. PHR은 인덱스에 섞일 뿐 PC를 대신하지 않고 tag도 있다.</div>
+  </div>
+  <div class="quiz" data-answer="3">
+    <div class="q">startPc = 0x8000_0FE0인 블록에 taken 분기가 없다. 다음 블록 주소는?</div>
+    <div class="opts"><button>0x8000_1020</button><button>0x8000_1000 + 0x40</button><button>0x8000_0FE0 + 0x40</button><button>0x8000_1000</button></div>
+    <div class="explain">align32(0xFE0 + 0x40) = 0x1020이지만 pc[12]가 0에서 1로 바뀌어 페이지를 넘는다. 그래서 target은 그 페이지의 시작 0x8000_1000이다(F1). 0x1020과 0xFE0+0x40(= 0x1020)은 페이지 처리를 빼먹은 값이고, 0x1040은 근거가 없다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">MainBTB가 엔트리를 새로 쓰는 경우는?</div>
+    <div class="opts"><button>그 블록에 오예측이 있었고, miss였거나 종류가 바뀌었거나 ITTAGE가 필요한 간접 점프일 때</button><button>resolve 결과가 올 때마다</button><button>fast train이 올 때마다</button><button>카운터가 0이 될 때</button></div>
+    <div class="explain">T3: 엔트리 쓰기는 오예측일 때만 일어난다. 맞힌 resolve는 카운터만 고친다. MainBTB는 fast train을 받지 않는다(fast train은 uBTB·aBTB·uTAGE용). 카운터가 0이 되어도 엔트리를 지우지 않고 not-taken으로 예측할 뿐이다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08. 코드 원문은 <a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/Bpu.scala#L533" target="_blank" rel="noopener">Bpu.scala</a>, <a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/abtb/AheadBtb.scala#L95" target="_blank" rel="noopener">AheadBtb.scala</a>, <a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/frontend/bpu/FallThroughPredictor.scala#L65" target="_blank" rel="noopener">FallThroughPredictor.scala</a>에서 볼 수 있다.</p>
+
+</main>
+</div>
+<script src="assets/ch02-a.js"></script>
+<script src="assets/ch02-b.js"></script>
+</body>
+</html>

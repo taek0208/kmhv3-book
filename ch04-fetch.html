@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 4장: 명령어 인출</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+.dom { padding: 14px 16px; }
+.cells { display: grid; gap: 3px; grid-template-columns: repeat(8, minmax(0, 1fr)); }
+.cells.c16 { grid-template-columns: repeat(16, minmax(0, 1fr)); }
+.cells.c12 { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+.cell { font: 600 10px/1.25 var(--mono); text-align: center; padding: 4px 0; border-radius: 5px; background: var(--surface); color: var(--text-faint); border: 1px solid var(--border); min-width: 0; overflow: hidden; white-space: nowrap; }
+.cell b { display: block; font-size: 9.5px; color: var(--accent); min-height: 12px; }
+.cell.k1 { background: var(--grey-soft); color: var(--text-dim); }
+.cell.k2 { background: var(--accent-2-soft); color: var(--accent-2); }
+.cell.k3 { background: var(--accent-soft); color: var(--accent); }
+.cell.dash { border-style: dashed; border-color: var(--accent); }
+.cell.ok { background: var(--ok-soft); color: var(--ok); border-color: var(--ok); }
+.cell.bad { background: var(--bad-soft); color: var(--bad); border-color: var(--bad); }
+.cell.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+.cell.off { opacity: 0.35; }
+.cell.click { cursor: pointer; }
+.rowlbl { font-size: 12px; color: var(--text-dim); margin: 10px 0 4px; }
+.bits { display: flex; gap: 2px; font: 600 11px var(--mono); }
+.bits span { flex: var(--w) 1 0; min-width: 0; padding: 6px 2px; border-radius: 5px; text-align: center; background: var(--surface); border: 1px solid var(--border); overflow: hidden; white-space: nowrap; }
+.mini { font-size: 13px; color: var(--text-dim); margin: 8px 0 0; line-height: 1.6; }
+</style>
+</head>
+<body data-chapter="ch04">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 04</div>
+  <h1>명령어 인출: FTQ·ICache·IFU</h1>
+  <p class="lead"><a href="ch02-bpu.html">2장</a>과 <a href="ch03-predictors.html">3장</a>의 분기 예측기는 "다음에 어느 주소부터 어디까지 읽을지"만 말한다. 그 주소의 바이트를 캐시에서 꺼내고, 16비트와 32비트가 섞인 바이트 더미에서 명령어를 잘라 내고, 디코더 앞에 줄 세우는 일은 다른 부품이 한다. 이 장에서는 BPU의 예측이 FTQ에 들어간 순간부터 IBuffer에서 디코드로 나가는 순간까지만 다룬다.</p>
+  <ul class="objectives">
+    <li>예측기와 인출기 사이에 FTQ라는 큐를 두는 이유를 설명할 수 있다.</li>
+    <li>FTQ의 다섯 포인터와 BPU 수락 조건 세 가지를 코드 줄과 함께 말할 수 있다.</li>
+    <li>64 KiB ICache 주소가 set·bank·태그로 나뉘는 방식(VIPT)을 계산할 수 있다.</li>
+    <li>2-fetch가 허용되는 조건과 막히는 조건을 예측할 수 있다.</li>
+    <li>RVC 명령어 경계 계산, PredChecker redirect, IBuffer 역압을 손으로 따라갈 수 있다.</li>
+  </ul>
+</div>
+
+<section id="sec-decoupled">
+  <h2>분리형 프런트엔드: 예측기는 앞서 달린다</h2>
+  <p>식당을 떠올려 보자. 주문을 받는 직원이 주문서를 레일에 꽂는다. 재료 담당은 레일 앞쪽 주문서를 보고 창고에서 재료를 미리 꺼내 둔다. 요리사는 레일 순서대로 요리한다. 요리사가 재료를 기다리는 동안에도 주문 접수는 멈추지 않는다. 손님이 주문을 바꾸면 그 뒤에 꽂힌 주문서는 모두 버린다.</p>
+  <p>KMHv3 프런트엔드가 바로 이 구조다. 주문 접수는 BPU, 레일은 <span class="term" data-def="예측된 fetch block을 순서대로 담는 64칸 원형 큐. BPU가 쓰고 프리페치·인출·커밋이 각자의 포인터로 읽는다. src/main/scala/xiangshan/frontend/ftq/Ftq.scala">FTQ<span class="en">(Fetch Target Queue)</span></span>, 재료 창고는 ICache, 요리사는 IFU, 배식대는 IBuffer다. 이렇게 예측과 인출을 큐로 떼어 놓은 구조를 <span class="term" data-def="분기 예측기와 명령어 인출기 사이에 큐를 둔 구조. 예측기가 인출기보다 앞서 달릴 수 있고, 캐시 미스 중에도 예측은 계속된다.">분리형 프런트엔드<span class="en">(decoupled frontend)</span></span>라고 한다. BPU가 한 번에 내놓는 단위는 <span class="term" data-def="예측기가 '여기부터 여기까지 연속으로 실행된다'고 한 덩어리로 예측한 명령어 바이트 구간. KMHv3에서 최대 64B(2B 슬롯 32개)다.">fetch block<span class="en">(인출 블록)</span></span>이며 최대 64B다(<code>FetchBlockSize = 64</code>, src/main/scala/xiangshan/frontend/FrontendParameters.scala:28@09453ff8).</p>
+  <p>떼어 놓지 않으면 두 가지가 깨진다. ICache 미스가 나면 수십 사이클 동안 예측도 멈춘다. 반대로 예측이 늦으면 캐시는 할 일이 없다. 큐가 있으면 BPU는 미스 중에도 앞으로 갈 길을 계속 예측하고, 그 주소들은 프리페치 요청이 되어 미스를 미리 숨긴다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 236" role="img" aria-label="BPU, FTQ, ICache, IFU, IBuffer로 이어지는 프런트엔드와 redirect 경로">
+      <defs><marker id="f41a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker>
+      <marker id="f41b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--bad)"/></marker></defs>
+      <rect class="box-2" x="8" y="34" width="74" height="54" rx="9"/><text x="45" y="58" text-anchor="middle" class="lbl-b">BPU</text><text x="45" y="77" text-anchor="middle" class="lbl-mono">2·3장</text>
+      <rect class="box-acc" x="100" y="34" width="74" height="54" rx="9"/><text x="137" y="58" text-anchor="middle" class="lbl-b">FTQ</text><text x="137" y="77" text-anchor="middle" class="lbl-mono">64칸</text>
+      <rect class="box" x="192" y="34" width="74" height="54" rx="9"/><text x="229" y="58" text-anchor="middle" class="lbl-b">ICache</text><text x="229" y="77" text-anchor="middle" class="lbl-mono">64 KiB</text>
+      <rect class="box" x="284" y="34" width="74" height="54" rx="9"/><text x="321" y="58" text-anchor="middle" class="lbl-b">IFU</text><text x="321" y="77" text-anchor="middle" class="lbl-mono">s0~WB</text>
+      <rect class="box" x="376" y="34" width="74" height="54" rx="9"/><text x="413" y="58" text-anchor="middle" class="lbl-b">IBuffer</text><text x="413" y="77" text-anchor="middle" class="lbl-mono">48칸</text>
+      <line class="ln" x1="82" y1="52" x2="100" y2="52" marker-end="url(#f41a)"/><line class="ln-dash" x1="100" y1="74" x2="82" y2="74" marker-end="url(#f41a)"/>
+      <line class="ln" x1="174" y1="61" x2="192" y2="61" marker-end="url(#f41a)"/><line class="ln" x1="266" y1="61" x2="284" y2="61" marker-end="url(#f41a)"/><line class="ln" x1="358" y1="61" x2="376" y2="61" marker-end="url(#f41a)"/>
+      <text x="45" y="20" text-anchor="middle" class="lbl-dim">주문 접수</text><text x="137" y="20" text-anchor="middle" class="lbl-dim">주문서 레일</text><text x="229" y="20" text-anchor="middle" class="lbl-dim">창고</text><text x="321" y="20" text-anchor="middle" class="lbl-dim">요리사</text><text x="413" y="20" text-anchor="middle" class="lbl-dim">배식대</text>
+      <rect class="box-grey" x="376" y="150" width="74" height="38" rx="9"/><text x="413" y="174" text-anchor="middle" class="lbl-b">디코드</text>
+      <line class="ln" x1="413" y1="88" x2="413" y2="150" marker-end="url(#f41a)"/>
+      <path class="ln-bad" d="M321,88 V124 H150 V90" marker-end="url(#f41b)"/><text x="236" y="118" text-anchor="middle" class="lbl-dim">IFU redirect (6절)</text>
+      <path class="ln-bad" d="M413,188 V210 H128 V90" marker-end="url(#f41b)"/><text x="270" y="228" text-anchor="middle" class="lbl-dim">백엔드 redirect (8장)</text>
+      <text x="62" y="108" text-anchor="middle" class="lbl-mono">학습·redirect</text>
+    </svg>
+    <figcaption>예측은 FTQ에 쌓이고, ICache·IFU는 FTQ에서 꺼내 간다. 틀린 경로는 IFU나 백엔드가 FTQ 포인터를 되감아 바로잡는다(src/main/scala/xiangshan/frontend/ftq/Ftq.scala:145, 366-373@09453ff8).</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <tr><th>모듈</th><th>파일 (frontend/ 아래)</th><th>하는 일</th></tr>
+    <tr><td><code>Ftq</code></td><td>ftq/Ftq.scala</td><td>예측 저장, 포인터 관리, redirect 선택, 학습 전달</td></tr>
+    <tr><td><code>ICache</code></td><td>icache/ICacheImp.scala</td><td>meta·data 배열, PrefetchPipe, WayLookup, MainPipe, MissUnit, replacer (102-108줄)</td></tr>
+    <tr><td><code>Ifu</code></td><td>ifu/Ifu.scala</td><td>경계 계산, 모으기, RVC 확장, PredChecker (87-93줄)</td></tr>
+    <tr><td><code>IBuffer</code></td><td>ibuffer/IBuffer.scala</td><td>디코드 앞 48칸 FIFO</td></tr>
+  </table></div>
+  <div class="callout warn"><strong>읽지 않아도 되는 파일</strong><p><code>ftq/</code> 아래 <code>MetaQueue</code>, <code>EntryQueue</code>, <code>SpeculationQueue</code>, <code>CfiQueue</code>와 <code>ifu/</code> 아래 <code>PreDecode</code>, <code>F3PreDecode</code>, <code>InstrCompact</code>는 소스에 있지만 어디서도 생성되지 않는다(<code>grep -rn 'new \(MetaQueue\|...\|InstrCompact\)\b' src/main/scala</code> → 0건). 실제 predecode는 Ifu.scala 안에 인라인으로 있다. 이 장은 이 파일들을 다루지 않는다.</p></div>
+</section>
+
+<section id="sec-ftq">
+  <h2>FTQ: 다섯 포인터가 도는 원형 큐</h2>
+  <p>레일에는 주문서를 꽂는 사람, 재료를 꺼내는 사람, 요리하는 사람, 다 먹은 접시를 치우는 사람이 각자 자기 위치를 기억한다. FTQ도 같다. 64칸 링 버퍼 <code>entryQueue</code> 하나에 포인터 다섯 개가 돈다(Ftq.scala:93-101, 111@09453ff8). 각 포인터는 <span class="term" data-def="링 버퍼 위치(value)에 한 바퀴 돌 때마다 뒤집히는 flag 비트를 붙인 포인터. 두 포인터가 같은 칸일 때 '비었다'와 '꽉 찼다'를 flag로 구분한다.">flag + value 포인터<span class="en">(circular queue pointer)</span></span>이며, 코드 주석대로 "가리키는 칸은 아직 처리 전"이라는 뜻이다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>포인터</th><th>가리키는 칸</th><th>누가 민다</th></tr>
+    <tr><td><code>bpuPtr</code></td><td>BPU가 다음에 쓸 칸</td><td>예측 수락 시 +1, override 시 해당 칸+1</td></tr>
+    <tr><td><code>pfPtr</code></td><td>다음에 프리페치할 칸</td><td>ICache PrefetchPipe 수락 시 +1 또는 +2</td></tr>
+    <tr><td><code>fetchPtr</code></td><td>다음에 인출할 칸</td><td>ICache MainPipe 수락 시 +1 또는 +2</td></tr>
+    <tr><td><code>commitPtr</code></td><td>다음에 커밋될 칸</td><td>백엔드 커밋 시 사이클당 +1</td></tr>
+    <tr><td><code>pnrPtr</code></td><td>BPU가 아직 고쳐 쓸 수 있는 가장 오래된 칸</td><td>BPU s3를 떠날 때 +1</td></tr>
+  </table></div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 176" role="img" aria-label="FTQ 칸들 위의 commit, fetch, pf, pnr, bpu 포인터와 두 거리 제한">
+      <defs><marker id="f42a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <line class="ln" x1="100" y1="22" x2="412" y2="22"/><line class="ln" x1="100" y1="16" x2="100" y2="28"/><line class="ln" x1="412" y1="16" x2="412" y2="28"/><text x="256" y="14" text-anchor="middle" class="lbl-acc">bpu − commit &lt; 64</text>
+      <line class="ln" x1="204" y1="48" x2="412" y2="48"/><line class="ln" x1="204" y1="42" x2="204" y2="54"/><line class="ln" x1="412" y1="42" x2="412" y2="54"/><text x="308" y="41" text-anchor="middle" class="lbl-acc2">bpu − fetch &lt; 32</text>
+      <g>
+        <rect class="box" x="22" y="64" width="24" height="34" rx="4"/><rect class="box" x="48" y="64" width="24" height="34" rx="4"/><rect class="box" x="74" y="64" width="24" height="34" rx="4"/>
+        <rect class="box-grey" x="100" y="64" width="24" height="34" rx="4"/><rect class="box-grey" x="126" y="64" width="24" height="34" rx="4"/><rect class="box-grey" x="152" y="64" width="24" height="34" rx="4"/><rect class="box-grey" x="178" y="64" width="24" height="34" rx="4"/>
+        <rect class="box-2" x="204" y="64" width="24" height="34" rx="4"/><rect class="box-2" x="230" y="64" width="24" height="34" rx="4"/><rect class="box-2" x="256" y="64" width="24" height="34" rx="4"/>
+        <rect class="box-acc" x="282" y="64" width="24" height="34" rx="4"/><rect class="box-acc" x="308" y="64" width="24" height="34" rx="4"/><rect class="box-acc" x="334" y="64" width="24" height="34" rx="4" stroke-dasharray="4 3"/><rect class="box-acc" x="360" y="64" width="24" height="34" rx="4" stroke-dasharray="4 3"/>
+        <rect class="box" x="386" y="64" width="24" height="34" rx="4"/><rect class="box" x="412" y="64" width="24" height="34" rx="4"/>
+      </g>
+      <line class="ln" x1="112" y1="124" x2="112" y2="102" marker-end="url(#f42a)"/><text x="112" y="140" text-anchor="middle" class="lbl-b">commit</text>
+      <line class="ln" x1="216" y1="124" x2="216" y2="102" marker-end="url(#f42a)"/><text x="216" y="140" text-anchor="middle" class="lbl-b">fetch</text>
+      <line class="ln" x1="294" y1="124" x2="294" y2="102" marker-end="url(#f42a)"/><text x="294" y="140" text-anchor="middle" class="lbl-b">pf</text>
+      <line class="ln" x1="346" y1="124" x2="346" y2="102" marker-end="url(#f42a)"/><text x="346" y="140" text-anchor="middle" class="lbl-b">pnr</text>
+      <line class="ln" x1="398" y1="124" x2="398" y2="102" marker-end="url(#f42a)"/><text x="398" y="140" text-anchor="middle" class="lbl-b">bpu</text>
+      <text x="230" y="166" text-anchor="middle" class="lbl-dim">점선 칸 = pnr 이후, BPU s2/s3가 아직 고쳐 쓸 수 있다</text>
+    </svg>
+    <figcaption>링을 펼쳐 그린 FTQ. 포인터 순서는 언제나 commit ≤ fetch ≤ pf ≤ bpu이고, BPU는 두 거리 제한 안에서만 새 칸을 쓴다.</figcaption>
+    <div class="legend"><span><i style="--c:var(--grey)"></i>인출됨, 커밋 대기</span><span><i style="--c:var(--accent-2)"></i>프리페치됨</span><span><i style="--c:var(--accent)"></i>예측만 됨</span></div>
+  </figure>
+
+  <p>BPU가 새 칸을 쓰려면 FTQ가 받아 줘야 한다. 이 수락 신호가 프런트엔드 전체의 첫 번째 브레이크다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">FTQ-1 · prediction.ready</span><h4>BPU 예측 수락</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">dist(bpu, commit) &lt; 64 &amp;&amp; dist(bpu, fetch) &lt; PrefetchDepth(32) &amp;&amp; bpTrainStallCnt &lt; 8 일 때만 새 예측을 받는다</dd>
+      <dt>이유</dt><dd class="why">첫째는 커밋 전 칸을 덮어쓰지 않게 한다. 둘째는 BPU가 인출보다 32블록 넘게 앞서지 않게 하여 WayLookup(32칸)과 맞춘다. 셋째는 BPU 학습 쓰기가 8사이클 연속 막히면 예측을 쉬어 학습에 틈을 준다.</dd>
+      <dt>없으면</dt><dd>아직 커밋되지 않은 블록의 시작 PC가 사라져 백엔드 redirect 때 되돌아갈 곳을 잃는다. 또는 학습이 영영 BPU에 쓰이지 못한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ftq/Ftq.scala:181-183@09453ff8 (카운터 172-177)</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-08-29 BP 앞섬 거리를 WayLookup 크기로 (#6425)</strong><p>커밋 066950d0f는 BPU가 인출보다 앞설 수 있는 거리를 ICache WayLookup 크기와 같은 <code>PrefetchDepth = 32</code>로 묶었다. 학습 정지 횟수 제한(<code>BpTrainStallLimit = 8</code>)은 2025-11-10 커밋 b8255c466에서 추가되었다(제목에 PR 번호 없음).</p></div>
+  <p>카운터는 4비트(<code>log2Ceil(8)+1</code>)이고 막힌 사이클마다 1씩 늘어나며, 막힘이 풀리면 0으로 돌아간다(Ftq.scala:171-177@09453ff8).</p>
+
+  <h3>override와 pnr: 고쳐 쓸 수 있는 칸의 경계</h3>
+  <p>2장에서 본 것처럼 BPU는 s1에서 빠른 예측을 먼저 쓰고, s2·s3에서 더 정확한 예측으로 같은 칸을 고쳐 쓴다. 이것이 <em>override</em>다. s3 override가 오면 FTQ는 그 칸에 새 예측을 쓰고 <code>bpuPtr := s3FtqPtr + 1</code>로 되감는다. 이미 그 칸 이후를 프리페치·인출하던 중이었다면 <code>pfPtr</code>, <code>fetchPtr</code>도 그 칸으로 되돌리고 ICache·IFU에 flush를 보낸다(Ftq.scala:200-214, 258-275@09453ff8).</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">FTQ-2 · pnrPtr</span><h4>Point of No Return</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s3 meta가 유효하면 pnrPtr := s3FtqPtr + 1. redirect가 오면 pnrPtr := newFtqIdx. passedPnr(p) = pnrPtr &gt; p</dd>
+      <dt>이유</dt><dd class="why">pnr보다 앞선 칸은 BPU의 마지막 override 단계를 지났으므로 더는 바뀌지 않는다. 2-prefetch·2-fetch의 두 번째 블록은 반드시 이 경계를 지난 칸이어야 한다.</dd>
+      <dt>없으면</dt><dd>한 번에 읽은 두 블록 중 두 번째만 나중에 override되면 ICache·IFU가 "반쪽 flush"를 처리해야 한다. 그 로직을 없애려고 둔 규칙이다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ftq/Ftq.scala:98-108, 228-234, 286-290, 372@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">FTQ-3 · redirect</span><h4>백엔드 우선 redirect</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">redirect = Mux(backend.valid, backend, ifu). redirect가 오면 bpu·pf·fetch·pnr를 모두 newFtqIdx로 되감는다. newFtqIdx는 보통 틀린 블록의 다음 칸(ftqIdx+1)이고, 블록 첫 명령어가 자기 자신을 flush하는 경우만 ftqIdx다</dd>
+      <dt>이유</dt><dd class="why">백엔드 redirect는 더 오래된 명령어에서 오므로 IFU redirect보다 항상 옳다. 틀린 블록 이후 칸은 모두 틀린 경로의 예측이다.</dd>
+      <dt>없으면</dt><dd>틀린 경로의 블록이 계속 인출되어 IBuffer와 백엔드를 오염시킨다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ftq/Ftq.scala:145, 366-373@09453ff8; src/main/scala/xiangshan/Bundle.scala:214-218@09453ff8</dd>
+    </dl>
+  </div>
+  <p>커밋은 단순하다. 백엔드가 알려 준 커밋 위치를 <code>robCommitPtr</code>로 붙잡아 두고, <code>commitPtr ≤ robCommitPtr</code>인 동안 사이클당 한 칸씩 민다(Ftq.scala:498-506@09453ff8). 커밋된 칸이 생겨야 FTQ-1의 첫 조건에 여유가 생긴다.</p>
+
+  <div class="sim" id="sim-ftq">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>FTQ 64칸과 다섯 포인터</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view dom"><div class="cells" id="ftq-cells"></div>
+        <p class="mini">칸 위 숫자는 value(0~63), 아래 글자는 포인터: C=commit, F=fetch, P=pf, N=pnr, B=bpu. 점선 = pnr 이후.</p></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>백엔드 커밋 지연(사이클) <output data-for="lat" data-fmt="int"></output></label>
+          <input type="range" data-k="lat" min="2" max="100" step="1" value="12"></div>
+        <div class="ctl"><label><input type="checkbox" data-k="stall"> BPU 학습 쓰기 막힘</label></div>
+        <div class="btn-row"><button class="btn primary" id="ftq-play">재생</button><button class="btn" id="ftq-step">한 사이클</button><button class="btn" id="ftq-reset">처음으로</button></div>
+        <div class="btn-row"><button class="btn" id="ftq-miss">ICache 미스 40사이클</button><button class="btn" id="ftq-ovr">s3 override</button><button class="btn" id="ftq-redir">백엔드 redirect</button></div>
+        <div class="verdict grey" id="ftq-verdict">대기</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>사이클</span><b id="ftq-t">0</b></div>
+      <div class="ro"><span>bpu − fetch (&lt;32)</span><b id="ftq-df" class="acc">0</b></div>
+      <div class="ro"><span>bpu − commit (&lt;64)</span><b id="ftq-dc">0</b></div>
+      <div class="ro"><span>인출 횟수 (2-fetch)</span><b id="ftq-nf">0</b></div>
+    </div>
+    <div class="sim-note">① 재생한 뒤 커밋 지연을 100으로 올리면 bpu − commit이 64에 닿아 BPU가 멈춘다. 60에서는 62에 머문다. ② ICache 미스를 걸면 fetch는 멈추지만 BPU는 계속 쓰고, bpu − fetch가 32에 닿아야 멈춘다. 미스가 끝나면 pnr을 지난 블록이 쌓여 있어 2-fetch로 따라잡는다. 평소처럼 BPU가 바로 앞에 있으면 둘째 블록이 pnr 이전이라 2-fetch가 없다. ③ s3 override를 눌러 pnr 칸보다 앞서 간 pf(드물게 fetch)가 그 칸으로 되감기는 것을 보세요. 블록 크기·페이지는 합성 데이터이고 규칙과 상수는 Ftq.scala 그대로다. 왜 그런지는 이 절의 FTQ-1~3과 4절에서.</div>
+  </div>
+</section>
+
+<section id="sec-icache">
+  <h2>인출 지시 프리페치와 ICache의 모양</h2>
+  <p>IFU가 블록을 요청한 뒤에야 미스를 알면 늦다. FTQ에는 이미 "곧 읽을 주소"가 줄지어 있으므로, 그 주소를 먼저 캐시에 물어보면 된다. 이것이 <span class="term" data-def="FTQ에 쌓인 '곧 인출할 주소'를 미리 캐시에 요청하는 방식. 예측이 맞으면 실제 인출 때는 데이터가 이미 와 있다.">인출 지시 프리페치<span class="en">(fetch-directed prefetching)</span></span>다. <code>pfPtr</code>가 <code>fetchPtr</code>보다 앞서 달리며 ICache의 <code>ICachePrefetchPipe</code>에 블록을 넣는다. 조건은 <code>bpuPtr &gt; pfPtr &amp;&amp; !redirect</code>뿐이다(Ftq.scala:301@09453ff8). CSR로 프리페치를 끄면 s1까지만 돌고 미스 요청은 나가지 않는다(<code>s1_realFire = s1_fire &amp;&amp; csrPfEnable</code>, ICachePrefetchPipe.scala:425@09453ff8).</p>
+  <p>캐시의 모양부터 보자. 기본값은 256 set × 4 way × 64B 라인 = <strong>64 KiB</strong>다(icache/Parameters.scala:29-32@09453ff8). 라인 안 위치에 6비트(2<sup>6</sup>=64), set 번호에 8비트(2<sup>8</sup>=256)가 필요하므로 set 번호는 주소의 13:6 비트다(<code>get_idx = addr(untagBits-1, blockOffBits)</code>, src/main/scala/xiangshan/cache/L1Cache.scala:107@09453ff8).</p>
+  <p>여기서 문제가 하나 생긴다. 가상 주소와 물리 주소는 페이지 오프셋 12비트(11:0)만 같다. set 번호 13:6 중 13:12는 페이지 오프셋 밖이다. ICache는 TLB 변환을 기다리지 않으려고 set은 <em>가상</em> 주소로 고르고, 태그는 변환이 끝난 <em>물리</em> 주소로 비교한다. 이것이 <span class="term" data-def="Virtually Indexed, Physically Tagged. set index는 가상 주소로, 태그는 물리 주소로 비교한다. TLB 조회와 SRAM 읽기를 동시에 시작할 수 있다.">VIPT</span>다. 태그는 <code>paddr(47,12)</code>, 36비트다(<code>tagBits = PAddrBits − pgUntagBits = 48 − 12</code>, L1Cache.scala:55-56@09453ff8). 페이지 밖으로 나간 2비트는 같은 물리 라인이 서로 다른 set에 들어갈 수 있다는 뜻이며, 코드는 이를 <code>AliasTagBits = 14 − 12 = 2</code>로 따로 관리한다(icache/Parameters.scala:103@09453ff8). 주석은 ICache 데이터가 dirty해지지 않고 fence.i로 일관성을 맞추므로 기능 문제는 아닐 수 있다고 적고 있다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 190" role="img" aria-label="가상 주소와 물리 주소의 비트 분할">
+      <text x="30" y="30" class="lbl-b">vaddr (50비트)</text>
+      <rect class="box" x="30" y="40" width="150" height="36" rx="5"/><text x="105" y="63" text-anchor="middle" class="lbl-mono">[49:14]</text>
+      <rect class="box-warn" x="180" y="40" width="60" height="36" rx="5"/><text x="210" y="63" text-anchor="middle" class="lbl-mono">[13:12]</text>
+      <rect class="box-acc" x="240" y="40" width="80" height="36" rx="5"/><text x="280" y="63" text-anchor="middle" class="lbl-mono">[11:6]</text>
+      <rect class="box-2" x="320" y="40" width="60" height="36" rx="5"/><text x="350" y="63" text-anchor="middle" class="lbl-mono">[5:3]</text>
+      <rect class="box" x="380" y="40" width="50" height="36" rx="5"/><text x="405" y="63" text-anchor="middle" class="lbl-mono">[2:0]</text>
+      <line class="ln-acc" x1="180" y1="86" x2="320" y2="86"/><text x="250" y="102" text-anchor="middle" class="lbl-acc">set 번호 [13:6]</text>
+      <text x="350" y="102" text-anchor="middle" class="lbl-acc2">data bank</text>
+      <line class="ln-dash" x1="240" y1="76" x2="240" y2="122"/><line class="ln-dash" x1="430" y1="76" x2="430" y2="122"/>
+      <text x="30" y="116" class="lbl-b">paddr (48비트)</text>
+      <rect class="box-ok" x="30" y="124" width="210" height="36" rx="5"/><text x="135" y="147" text-anchor="middle" class="lbl-mono">[47:12] 태그 36비트</text>
+      <rect class="box" x="240" y="124" width="190" height="36" rx="5"/><text x="335" y="147" text-anchor="middle" class="lbl-mono">[11:0] 페이지 오프셋</text>
+      <text x="210" y="180" text-anchor="middle" class="lbl-dim">[13:12]는 페이지 밖: 같은 물리 라인이 다른 set에 갈 수 있다(alias)</text>
+    </svg>
+    <figcaption>set 번호는 가상 주소 13:6, 태그는 물리 주소 47:12. 오프셋 11:0만 두 주소에서 같다(L1Cache.scala:47-57,107@09453ff8).</figcaption>
+  </figure>
+
+  <p>배열은 두 갈래로 나뉜다. 태그를 담은 meta 배열은 set 번호의 최하위 비트로 짝수·홀수 두 bank로 나뉘며, bank마다 128 set × 4 way다(<code>NumInterleavedBank = 2</code>, icache/Parameters.scala:49, 125-127@09453ff8). 연속한 두 라인은 홀짝이 반드시 다르므로 서로 다른 bank에서 동시에 읽힌다. 데이터 배열은 64B 라인을 8B씩 8개 bank로 자른다(<code>DataBanks = 512/64</code>). bank 번호는 라인 안 오프셋을 8로 나눈 값, 즉 주소 5:3이다(icache/Helpers.scala:118-119@09453ff8). 각 라인이 들어올 때 MissUnit은 2B 슬롯 32개마다 "하위 2비트가 11이 아니다"라는 1비트 <code>maybeRvcMap</code>을 계산해 meta에 함께 저장한다(ICacheMissUnit.scala:224-226@09453ff8). 이 비트들이 5절에서 명령어 경계를 찾는 재료다.</p>
+  <div class="callout warn"><strong>주석과 코드가 반대인 곳</strong><p><code>ICacheMetadata</code>의 주석은 RVC를 "data(1,0) === b11"이라고 적지만, 실제 계산은 <code>_(1, 0) =/= 3.U</code>다(icache/Bundles.scala:51 대 ICacheMissUnit.scala:226@09453ff8). RISC-V에서 하위 2비트가 11이면 32비트 명령어이므로 코드가 맞다.</p></div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 236" role="img" aria-label="ICache 내부: PrefetchPipe, WayLookup, MainPipe, meta와 data 배열, MissUnit">
+      <defs><marker id="f44a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-2" x="10" y="16" width="130" height="52" rx="9"/><text x="75" y="38" text-anchor="middle" class="lbl-b">PrefetchPipe</text><text x="75" y="57" text-anchor="middle" class="lbl-mono">ITLB·meta·히트</text>
+      <rect class="box-acc" x="165" y="16" width="120" height="52" rx="9"/><text x="225" y="38" text-anchor="middle" class="lbl-b">WayLookup</text><text x="225" y="57" text-anchor="middle" class="lbl-mono">32칸 FIFO</text>
+      <rect class="box" x="310" y="16" width="140" height="52" rx="9"/><text x="380" y="38" text-anchor="middle" class="lbl-b">MainPipe</text><text x="380" y="57" text-anchor="middle" class="lbl-mono">data 읽기→IFU</text>
+      <line class="ln" x1="140" y1="42" x2="165" y2="42" marker-end="url(#f44a)"/><line class="ln" x1="285" y1="42" x2="310" y2="42" marker-end="url(#f44a)"/>
+      <rect class="box" x="10" y="100" width="62" height="50" rx="7"/><text x="41" y="121" text-anchor="middle" class="lbl">meta 짝</text><text x="41" y="140" text-anchor="middle" class="lbl-mono">128×4</text>
+      <rect class="box" x="78" y="100" width="62" height="50" rx="7"/><text x="109" y="121" text-anchor="middle" class="lbl">meta 홀</text><text x="109" y="140" text-anchor="middle" class="lbl-mono">128×4</text>
+      <line class="ln" x1="75" y1="68" x2="75" y2="100" marker-end="url(#f44a)"/>
+      <g><rect class="box" x="165" y="100" width="30" height="50" rx="5"/><rect class="box" x="200" y="100" width="30" height="50" rx="5"/><rect class="box" x="235" y="100" width="30" height="50" rx="5"/><rect class="box" x="270" y="100" width="30" height="50" rx="5"/><rect class="box" x="305" y="100" width="30" height="50" rx="5"/><rect class="box" x="340" y="100" width="30" height="50" rx="5"/><rect class="box" x="375" y="100" width="30" height="50" rx="5"/><rect class="box" x="410" y="100" width="30" height="50" rx="5"/></g>
+      <text x="180" y="130" text-anchor="middle" class="lbl-mono">b0</text><text x="215" y="130" text-anchor="middle" class="lbl-mono">b1</text><text x="250" y="130" text-anchor="middle" class="lbl-mono">b2</text><text x="285" y="130" text-anchor="middle" class="lbl-mono">b3</text><text x="320" y="130" text-anchor="middle" class="lbl-mono">b4</text><text x="355" y="130" text-anchor="middle" class="lbl-mono">b5</text><text x="390" y="130" text-anchor="middle" class="lbl-mono">b6</text><text x="425" y="130" text-anchor="middle" class="lbl-mono">b7</text>
+      <text x="302" y="166" text-anchor="middle" class="lbl-dim">data bank 8개 × 8B, 각 bank에 4 way</text>
+      <line class="ln" x1="380" y1="68" x2="380" y2="100" marker-end="url(#f44a)"/>
+      <rect class="box-warn" x="10" y="184" width="250" height="40" rx="9"/><text x="135" y="209" text-anchor="middle" class="lbl">MissUnit: fetch MSHR 4 + prefetch 10</text>
+      <rect class="box-grey" x="330" y="184" width="120" height="40" rx="9"/><text x="390" y="209" text-anchor="middle" class="lbl-b">L2 (TileLink)</text>
+      <line class="ln" x1="260" y1="204" x2="330" y2="204" marker-end="url(#f44a)"/>
+      <line class="ln-dash" x1="41" y1="150" x2="41" y2="184"/>
+    </svg>
+    <figcaption>PrefetchPipe가 태그를 비교해 히트 way를 알아내 WayLookup에 적어 두면, MainPipe는 태그 비교 없이 그 way의 data bank만 읽는다(ICacheImp.scala:102-108@09453ff8).</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">IC-1 · WayLookup write.ready</span><h4>WayLookup 쓰기 허용</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">빈칸 ≥ FetchPorts(2) &amp;&amp; 저장된 예외 엔트리가 없을 때만 PrefetchPipe가 쓸 수 있다</dd>
+      <dt>이유</dt><dd class="why">한 번에 블록 두 개를 쓸 수 있으므로 "한 칸만 비었음" 상태를 아예 없애 PrefetchPipe를 단순하게 한다. 예외가 생기면 어차피 redirect로 flush되므로 그때까지 쉬어 전력을 아낀다.</dd>
+      <dt>없으면</dt><dd>MainPipe가 꺼낼 way 정보가 넘쳐 덮어써지고, 인출이 엉뚱한 way의 데이터를 읽는다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/icache/ICacheWayLookup.scala:158-162@09453ff8</dd>
+    </dl>
+  </div>
+  <p>미스가 나면 MissUnit이 MSHR을 하나 잡아 L2에 64B Get을 보낸다. 버스 폭이 256비트라 두 beat에 나눠 받는다(<code>l1BusDataWidth = 256</code>, src/main/scala/xiangshan/Parameters.scala:890@09453ff8). fetch MSHR이 prefetch MSHR보다 먼저 버스를 잡고, prefetch끼리는 먼저 들어온 순서다(ICacheMissUnit.scala:59-81@09453ff8). 지금 당장 필요한 요청이 "혹시 필요할" 요청에 밀리면 안 되기 때문이다.</p>
+
+  <div class="sim" id="sim-addr">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>주소를 set·bank·태그로 나누기</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view dom">
+        <div class="rowlbl">vaddr 비트 분할 (현재 값)</div><div class="bits" id="addr-bits"></div>
+        <div class="rowlbl">읽는 data bank: 첫 라인 / 다음 라인</div><div class="cells" id="addr-l0"></div><div class="cells" id="addr-l1" style="margin-top:3px"></div>
+        <p class="mini" id="addr-txt">-</p>
+      </div>
+      <div class="sim-controls">
+        <div class="ctl"><label>블록 시작 페이지 오프셋 <output data-for="off" data-fmt="int"></output></label>
+          <input type="range" data-k="off" min="0" max="4094" step="2" value="872"></div>
+        <div class="ctl"><label>vaddr[13:12] (alias 비트) <output data-for="al" data-fmt="int"></output></label>
+          <input type="range" data-k="al" min="0" max="3" step="1" value="1"></div>
+        <div class="ctl"><label>endPosition (반워드) <output data-for="end" data-fmt="int"></output></label>
+          <input type="range" data-k="end" min="0" max="31" step="1" value="20"></div>
+        <div class="verdict grey" id="addr-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>set 번호 [13:6]</span><b id="addr-set" class="acc">0</b></div>
+      <div class="ro"><span>meta bank</span><b id="addr-mb">0</b></div>
+      <div class="ro"><span>블록 크기(반워드)</span><b id="addr-size">0</b></div>
+      <div class="ro"><span>태그 paddr[47:12]</span><b id="addr-tag">0</b></div>
+    </div>
+    <div class="sim-note">① 오프셋을 0x20(32) 아래로 내리면 endPosition을 31까지 올려도 교차 라인이 되지 않는다. 왜 그런지는 4절의 정렬 규칙에서. ② alias 비트를 0→3으로 바꿔 보세요. 물리 태그는 그대로인데 set 번호만 64씩 바뀐다. ③ 교차 라인일 때 두 set의 meta bank가 언제나 다른지 확인하세요. 물리 페이지 번호는 합성 값 0x800123이다.</div>
+  </div>
+</section>
+
+<section id="sec-twofetch">
+  <h2>2-fetch: 짧은 블록 두 개를 한 사이클에</h2>
+  <p>fetch block은 taken 분기에서 끝난다. 분기가 촘촘한 코드에서는 블록이 8B, 12B처럼 짧아지고, 64B를 한 번에 처리할 수 있는 IFU가 대부분 놀게 된다. 그래서 KMHv3는 FTQ의 연속한 두 블록을 한 번에 ICache·IFU로 보낼 수 있다. 이것이 <strong>2-fetch</strong>다(<code>FetchPorts = 2</code>, FrontendParameters.scala:29@09453ff8).</p>
+  <p>먼저 블록 하나가 캐시 라인 몇 개를 건드리는지 알아야 한다. BPU는 블록 시작 주소를 32B로 내림한 점을 기준으로 끝 위치 <code>endPosition</code>(5비트, 반워드 단위)을 적는다. 따라서 블록은 언제나 "기준점부터 64B" 창 안에 있고, 블록 크기는 <code>endPosition + 1 − startVAddr(4,1)</code> 반워드다(ftq/Bundles.scala:147@09453ff8). 기준점이 라인의 뒤쪽 32B이고 끝이 기준점에서 32B 이상 떨어지면 다음 라인까지 걸친다. 코드는 이를 두 비트로 판정한다: <code>startPc(5) &amp;&amp; endPosition(4)</code>(icache/Helpers.scala:269-273@09453ff8). 블록 하나가 건드리는 라인은 많아야 2개다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 200" role="img" aria-label="32B 정렬 기준점과 교차 라인 블록, 그리고 두 짧은 블록을 합치는 2-fetch">
+      <text x="30" y="18" class="lbl-dim">라인 n (64B)</text><text x="230" y="18" class="lbl-dim">라인 n+1 (64B)</text>
+      <rect class="box" x="30" y="26" width="200" height="26" rx="4"/><rect class="box" x="230" y="26" width="200" height="26" rx="4"/>
+      <line class="ln-dash" x1="130" y1="26" x2="130" y2="52"/><line class="ln-dash" x1="330" y1="26" x2="330" y2="52"/>
+      <rect class="box-acc" x="155" y="64" width="103" height="24" rx="5"/><text x="206" y="81" text-anchor="middle" class="lbl-acc">블록 A</text>
+      <line class="ln-acc" x1="130" y1="98" x2="330" y2="98"/><line class="ln-acc" x1="130" y1="92" x2="130" y2="104"/><line class="ln-acc" x1="330" y1="92" x2="330" y2="104"/>
+      <text x="230" y="118" text-anchor="middle" class="lbl">기준점(32B 내림)부터 64B 창 → 라인 2개</text>
+      <rect class="box" x="30" y="136" width="200" height="26" rx="4"/><rect class="box" x="230" y="136" width="200" height="26" rx="4"/>
+      <rect class="box-2" x="30" y="139" width="50" height="20" rx="4"/><text x="55" y="153" text-anchor="middle" class="lbl-mono">A′ 8</text>
+      <rect class="box-2" x="230" y="139" width="63" height="20" rx="4"/><text x="261" y="153" text-anchor="middle" class="lbl-mono">B′ 10</text>
+      <text x="230" y="186" text-anchor="middle" class="lbl-acc2">8 + 10 = 18 ≤ 32 반워드 → 한 번에 인출</text>
+    </svg>
+    <figcaption>위: 시작이 라인 뒤쪽 절반이면 블록이 다음 라인에 걸칠 수 있다. 아래: taken 분기로 짧아진 두 블록의 크기 합이 32 반워드 이하면 2-fetch 후보가 된다.</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">FTQ-4 · rawTwoFetchValid</span><h4>FTQ의 2-fetch 후보 판정</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">passedPnr(fetchPtr+1) &amp;&amp; size0 + size1 ≤ 32 반워드 &amp;&amp; 두 블록의 가상 페이지 번호가 같다 &amp;&amp; 두 블록에 백엔드 예외·satp flush 표시가 없다</dd>
+      <dt>이유</dt><dd class="why">두 번째 블록이 나중에 override되지 않아야 하고(FTQ-2), 합쳐도 IFU 한 번의 폭(슬롯 32개)을 넘지 않아야 하며, ITLB 포트가 하나뿐이라 같은 페이지여야 한다(<code>itlbPortNum = 1</code>, Parameters.scala:224@09453ff8).</dd>
+      <dt>없으면</dt><dd>IFU 경계 계산 폭과 IBuffer 입력 폭(36)을 넘거나, 두 번째 페이지의 변환을 받을 포트가 없다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ftq/Ftq.scala:327-333@09453ff8</dd>
+    </dl>
+  </div>
+  <p>FTQ는 후보만 낸다. 최종 판정은 ICache MainPipe s0가 한다. 두 블록이 읽을 라인 쌍 4개 중 하나라도 "data bank가 겹치고, way가 같고, set이 다르면" 같은 SRAM 하나에서 서로 다른 행 두 개를 동시에 읽어야 하므로 불가능하다. 또 MMIO이거나 ITLB 예외가 있으면 하나만 보낸다. FTQ는 이 결과(<code>realTwoFetchValid</code>)를 보고 <code>fetchPtr</code>를 2 또는 1 민다(Ftq.scala:254-256@09453ff8).</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">IC-2 · realTwoFetchValid</span><h4>data SRAM 충돌 검사</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">req1 유효 &amp;&amp; WayLookup에 두 번째 엔트리 있음 &amp;&amp; !(bank 겹침 &amp;&amp; 같은 way &amp;&amp; 다른 set) &amp;&amp; !MMIO &amp;&amp; !ITLB 예외</dd>
+      <dt>이유</dt><dd class="why">bank·way마다 SRAM이 하나이고(ICacheDataArray.scala:33-90@09453ff8) 한 사이클에 한 행만 읽는다.</dd>
+      <dt>없으면</dt><dd>한 SRAM에 두 주소를 동시에 요구하게 되어 둘 중 하나의 데이터가 틀린다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/icache/ICacheMainPipe.scala:134-157@09453ff8</dd>
+    </dl>
+  </div>
+  <p>프리페치에도 같은 생각이 쓰인다. 두 블록을 함께 프리페치하려면 pnr과 같은 페이지 조건(Ftq.scala:286-297@09453ff8)에 더해, meta 읽기 포트 2개로 처리할 수 있는 모양이어야 한다. 코드는 이를 다섯 경우의 one-hot으로 분류한다(src/main/scala/xiangshan/frontend/TwoFetch.scala:118-160@09453ff8).</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>경우</th><th>조건</th><th>읽는 라인</th></tr>
+    <tr><td>SameLine</td><td>두 블록의 첫 set이 같다</td><td>1개 (교차 라인이 있으면 2개)</td></tr>
+    <tr><td>Overlap1</td><td>A만 교차 라인이고 A의 둘째 라인 = B의 첫 라인</td><td>2개</td></tr>
+    <tr><td>Overlap2</td><td>Overlap1의 반대</td><td>2개</td></tr>
+    <tr><td>Interleave</td><td>둘 다 비교차이고 set 홀짝이 다르다</td><td>2개 (짝·홀 bank 하나씩)</td></tr>
+    <tr><td>Conflict</td><td>그 밖</td><td>하나씩 따로 프리페치</td></tr>
+  </table></div>
+  <div class="callout decision"><strong>2026-05-06 2-prefetch (#5775), 2026-07-06 2-fetch (#5996), 2026-08-19 PNR 판정 (#6378)</strong><p>2-prefetch(cfe100e29)가 먼저 들어오고 두 달 뒤 2-fetch(d97789de1)가 구현되었다. 이후 0a1cc79f2가 "두 번째 블록은 pnr을 지나야 한다"는 규칙으로 두 경로의 판정을 바꿨다.</p></div>
+
+  <div class="sim" id="sim-two">
+    <div class="sim-head"><span class="sim-tag predict">Predict</span><h3>이 두 블록은 한 번에 인출될까</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="two-sc"><button class="on">①</button><button>②</button><button>③</button><button>④</button><button>⑤</button><button>⑥</button></div>
+      <div id="two-desc" class="mini" style="margin:0">-</div>
+      <div class="seg" id="two-pick"><button class="on">2개 함께</button><button>1개만</button></div>
+      <div class="btn-row"><button class="btn primary" id="two-run">규칙 돌려 확인</button></div>
+      <div class="verdict grey" id="two-out">먼저 답을 고르세요</div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>크기 합 (≤32)</span><b id="two-sum">-</b></div>
+      <div class="ro"><span>같은 페이지 · pnr 통과</span><b id="two-pg">-</b></div>
+      <div class="ro"><span>SRAM 충돌</span><b id="two-cf">-</b></div>
+      <div class="ro"><span>2-prefetch 경우</span><b id="two-case" class="acc">-</b></div>
+    </div>
+    <div class="sim-note">① 시나리오마다 먼저 답을 고르고 확인하세요. ② ①과 ⑤는 way 하나만 다르다. 결과가 갈리는 이유를 IC-2에서 찾아보세요. ③ ①은 2-fetch가 되지만 2-prefetch 경우는 Interleave다. ⑥과 비교해 보세요. 주소·way는 합성 값이고, 판정은 Ftq.scala:327-333과 ICacheMainPipe.scala:134-157, TwoFetch.scala:118-124의 식 그대로다.</div>
+  </div>
+</section>
+
+<section id="sec-ifu">
+  <h2>IFU: 바이트 더미에서 명령어 잘라 내기</h2>
+  <p>ICache가 건네는 것은 명령어 목록이 아니라 최대 64B의 바이트다. RISC-V C 확장 때문에 그 안에는 16비트 <span class="term" data-def="RISC-V C 확장의 16비트 압축 명령어. 하위 2비트가 11이 아니면 16비트, 11이면 32비트 명령어다.">RVC</span> 명령어와 32비트 명령어가 섞여 있다. 하위 2비트가 11이면 32비트, 아니면 16비트다. 그런데 32비트 명령어의 뒷반쪽 2B도 우연히 어떤 하위 비트를 가지므로, 앞에서부터 차례로 읽어야만 어디가 명령어의 시작인지 알 수 있다. IFU는 이 일을 네 구간 s0 → s1 → s2 → WB로 나눠 한다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 206" role="img" aria-label="IFU 단계 s0, s1, s2, WB와 flush 경로">
+      <defs><marker id="f46a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker>
+      <marker id="f46b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--bad)"/></marker></defs>
+      <rect class="box-acc" x="8" y="20" width="104" height="100" rx="9"/><text x="60" y="44" text-anchor="middle" class="lbl-b">s0</text><text x="60" y="66" text-anchor="middle" class="lbl-dim">ICache 응답</text><text x="60" y="86" text-anchor="middle" class="lbl-dim">경계 계산</text><text x="60" y="106" text-anchor="middle" class="lbl-dim">개수 세기</text>
+      <rect class="box-acc" x="120" y="20" width="104" height="100" rx="9"/><text x="172" y="44" text-anchor="middle" class="lbl-b">s1</text><text x="172" y="66" text-anchor="middle" class="lbl-dim">앞으로 모으기</text><text x="172" y="86" text-anchor="middle" class="lbl-dim">반쪽 잇기</text><text x="172" y="106" text-anchor="middle" class="lbl-dim">4칸 정렬</text>
+      <rect class="box-acc" x="232" y="20" width="104" height="100" rx="9"/><text x="284" y="44" text-anchor="middle" class="lbl-b">s2</text><text x="284" y="66" text-anchor="middle" class="lbl-dim">RVC 확장</text><text x="284" y="86" text-anchor="middle" class="lbl-dim">1차 검사</text><text x="284" y="106" text-anchor="middle" class="lbl-dim">IBuffer 쓰기</text>
+      <rect class="box-2" x="344" y="20" width="108" height="100" rx="9"/><text x="398" y="44" text-anchor="middle" class="lbl-b">WB</text><text x="398" y="66" text-anchor="middle" class="lbl-dim">2차 검사</text><text x="398" y="86" text-anchor="middle" class="lbl-dim">FTQ redirect</text><text x="398" y="106" text-anchor="middle" class="lbl-dim">학습 전달</text>
+      <line class="ln" x1="112" y1="70" x2="120" y2="70" marker-end="url(#f46a)"/><line class="ln" x1="224" y1="70" x2="232" y2="70" marker-end="url(#f46a)"/><line class="ln" x1="336" y1="70" x2="344" y2="70" marker-end="url(#f46a)"/>
+      <path class="ln-bad" d="M398,120 V146 H60 V122" marker-end="url(#f46b)"/><path class="ln-bad" d="M172,146 V122" marker-end="url(#f46b)"/>
+      <text x="230" y="168" text-anchor="middle" class="lbl">WB redirect → s0·s1 flush</text>
+      <text x="230" y="192" text-anchor="middle" class="lbl-dim">s2는 WB와 같은 블록이면 살린다 (s2_wbNotFlush)</text>
+    </svg>
+    <figcaption>IFU의 네 구간. predecode는 s1(src/main/scala/xiangshan/frontend/ifu/Ifu.scala:374@09453ff8), PredChecker 입력은 s2(511-515줄), flush 조건은 110-113, 733줄이다.</figcaption>
+  </figure>
+
+  <p>경계 규칙 자체는 한 줄이다. 슬롯 i가 새 명령어의 시작이려면 앞 슬롯이 시작이 아니었거나(앞 슬롯이 32비트의 뒷반쪽이었다), 앞 슬롯이 16비트 명령어의 시작이어야 한다. 문제는 이 사슬이 32단 직렬이라는 점이다. 한 사이클에 32번 차례로 계산하면 타이밍을 못 맞춘다. 그래서 코드는 덧셈기의 carry-select와 같은 꾀를 쓴다. 앞 16슬롯은 직렬로 계산하고, 뒤 16슬롯은 "슬롯 15가 32비트 시작이다"와 "아니다" 두 가설로 동시에 계산해 두었다가 앞 결과로 고른다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">IFU-1 · InstrBoundary</span><h4>명령어 경계</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">b(0) = !prevEndIsHalfRvi; b(i) = !b(i−1) || maybeRvc(i−1). 뒤 16칸은 두 가설 중 b(15) &amp;&amp; !maybeRvc(15)로 선택. 블록 끝 halfRvi = b(end) &amp;&amp; !maybeRvc(end)</dd>
+      <dt>이유</dt><dd class="why">ICache가 미리 계산한 maybeRvcMap만으로 시작 위치를 구한다. 32단 사슬을 16단 + Mux로 줄여 타이밍을 맞춘다.</dd>
+      <dt>없으면</dt><dd>32비트 명령어의 중간부터 해독하여 엉뚱한 명령어가 실행된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ifu/InstrBoundary.scala:54-78, 131-135@09453ff8</dd>
+    </dl>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 184" role="img" aria-label="앞 16칸 직렬 계산과 뒤 16칸 두 가설 병렬 계산 후 선택">
+      <defs><marker id="f47a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-acc" x="10" y="64" width="190" height="56" rx="9"/><text x="105" y="88" text-anchor="middle" class="lbl-b">앞 16칸 직렬</text><text x="105" y="108" text-anchor="middle" class="lbl-mono">b0 → b1 → … → b15</text>
+      <rect class="box-2" x="232" y="14" width="150" height="50" rx="9"/><text x="307" y="36" text-anchor="middle" class="lbl-b">가설 A</text><text x="307" y="55" text-anchor="middle" class="lbl-mono">b16 = 0 에서 출발</text>
+      <rect class="box-2" x="232" y="120" width="150" height="50" rx="9"/><text x="307" y="142" text-anchor="middle" class="lbl-b">가설 B</text><text x="307" y="161" text-anchor="middle" class="lbl-mono">b16 = 1 에서 출발</text>
+      <path class="box" d="M402,30 L440,50 L440,134 L402,154 Z"/><text x="421" y="96" text-anchor="middle" class="lbl-b">Mux</text>
+      <line class="ln" x1="382" y1="39" x2="402" y2="39" marker-end="url(#f47a)"/><line class="ln" x1="382" y1="145" x2="402" y2="145" marker-end="url(#f47a)"/>
+      <path class="ln-acc" d="M200,92 H390 V92" /><line class="ln-acc" x1="390" y1="92" x2="402" y2="92"/>
+      <text x="300" y="86" text-anchor="middle" class="lbl-acc">b15 &amp;&amp; !rvc15</text>
+    </svg>
+    <figcaption>뒤 16칸은 두 경우를 미리 계산해 두고 앞 16칸의 결과로 고른다. 디버그용 32단 직렬 계산과 다르면 XSError를 낸다(InstrBoundary.scala:137-141@09453ff8).</figcaption>
+  </figure>
+
+  <p>블록 끝 슬롯이 32비트 명령어의 앞반쪽이면 그 명령어는 이번 블록에서 끝나지 못한다. 이것이 <span class="term" data-def="32비트 명령어의 앞 16비트만 이번 블록 끝에 있고 나머지 16비트는 다음 블록 첫 슬롯에 있는 경우.">half RVI</span>다. IFU는 그 2B를 들고 있다가 다음 블록 첫 2B와 이어 붙이고, 다음 블록의 경계 계산은 <code>b(0) = false</code>로 시작한다. s0는 경계로부터 이번 블록의 명령어 수 <code>PopCount(endMask &amp; totalRange)</code>를 미리 세어 둔다(Ifu.scala:172@09453ff8). 이 수가 7절의 IBuffer 역압에 쓰인다.</p>
+  <p>s1은 유효 명령어를 앞으로 모은다(<code>compact</code>). 출력 칸 idx는 입력 idx..2idx+1 중 "앞에 유효한 것이 idx개인" 하나만 고르면 되므로 32→1 Mux가 필요 없다(ifu/Helpers.scala:166-195@09453ff8). 그다음 IBuffer의 쓰기 bank에 맞추려고 <code>prevIBufEnqPtr</code>의 하위 2비트만큼 0~3칸 밀어 둔다(<code>align</code>, 197-209줄). 거품은 0~3칸이라 실제로 필요한 폭은 32 + 3 = 35인데, 상수는 <code>IBufferEnqueueWidth = 32 + NumWriteBank(4) = 36</code>이다(FrontendParameters.scala:91@09453ff8). 바로 위에 "FIXME: maybe ...-1?" 주석이 있고, 3칸 미는 경우에도 마지막 레인은 언제나 0으로 채워진다(Helpers.scala:207). s2는 36개의 <code>RvcExpander</code>로 16비트 명령어를 32비트로 펼친다(Ifu.scala:89@09453ff8).</p>
+
+  <div class="sim" id="sim-bnd">
+    <div class="sim-head"><span class="sim-tag lab">Lab</span><h3>16·32비트가 섞인 32슬롯에서 경계 찾기</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view dom">
+        <div class="rowlbl">슬롯 0~31 하위 2비트 (눌러서 11 ↔ 01)</div><div class="cells c16" id="bnd-slots"></div>
+        <div class="rowlbl">뒤 16칸 가설 A (b16=0) / 가설 B (b16=1), S = 시작</div><div class="cells c16" id="bnd-ha"></div><div class="cells c16" id="bnd-hb" style="margin-top:3px"></div>
+        <div class="rowlbl">모으기 + 정렬 후 IBuffer 입력 36레인 (s = 시작 슬롯, 파랑 16비트·주황 32비트, 노랑 거품)</div><div class="cells c12" id="bnd-lanes"></div>
+      </div>
+      <div class="sim-controls">
+        <div class="ctl"><label><input type="checkbox" data-k="half"> 이전 블록 끝이 half RVI</label></div>
+        <div class="ctl"><label>블록 끝 슬롯 endPos <output data-for="end" data-fmt="int"></output></label>
+          <input type="range" data-k="end" min="0" max="31" step="1" value="31"></div>
+        <div class="ctl"><label>prevIBufEnqPtr mod 4 <output data-for="sh" data-fmt="int"></output></label>
+          <input type="range" data-k="sh" min="0" max="3" step="1" value="0"></div>
+        <div class="btn-row"><button class="btn primary" id="bnd-rand">무작위</button><button class="btn" id="bnd-rvc">모두 16비트</button><button class="btn" id="bnd-rvi">모두 32비트</button></div>
+        <div class="verdict grey" id="bnd-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>명령어 수</span><b id="bnd-n" class="acc">0</b></div>
+      <div class="ro"><span>16비트 / 32비트</span><b id="bnd-mix">0</b></div>
+      <div class="ro"><span>선택된 가설</span><b id="bnd-hyp">-</b></div>
+      <div class="ro"><span>끝 half RVI</span><b id="bnd-half">-</b></div>
+    </div>
+    <div class="sim-note">① 32비트 명령어의 뒷반쪽 슬롯(옅은 칸)을 눌러 보세요. 경계가 바뀌지 않는다. 규칙이 시작 슬롯의 비트만 보기 때문이다. ② 슬롯 15를 32비트 시작으로 만들면 선택된 가설이 A로 바뀐다. ③ "모두 16비트"에서 endPos=31, 정렬 3이면 레인 0~34가 차고 레인 35는 빈다. 폭 36이 하나 남는다는 FIXME의 뜻이다. 비트 패턴은 합성 데이터이고 규칙은 InstrBoundary.scala와 Helpers.scala:166-209 그대로다.</div>
+  </div>
+</section>
+
+<section id="sec-predcheck">
+  <h2>PredChecker와 IFU redirect</h2>
+  <p>BPU는 명령어를 보지 않고 주소만 보고 예측한다. 그래서 가끔 명백한 실수를 한다. BTB의 별칭 때문에 그냥 <code>add</code>인 자리에 "여기서 taken"이라고 하거나, 블록 안의 무조건 점프 <code>jal</code>을 못 보고 지나친다. 이런 실수는 명령어 바이트만 보면 확신할 수 있으므로 백엔드까지 갈 필요가 없다. IFU의 <code>PredChecker</code>가 predecode 결과와 예측을 대조해 일찍 고친다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">IFU-2 · PredChecker</span><h4>예측 오류 다섯 가지</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">jalFault = Direct(jal) &amp;&amp; 유효 &amp;&amp; !predTaken · jalrFault = Indirect &amp;&amp; !pop &amp;&amp; 유효 &amp;&amp; !predTaken · retFault = pop &amp;&amp; 유효 &amp;&amp; !predTaken · notCfiTaken = 분기 아님 &amp;&amp; predTaken · invalidTaken = 예측 끝이 32비트의 앞반쪽</dd>
+      <dt>이유</dt><dd class="why">명령어만 보고 틀렸다고 확신할 수 있는 예측을 실행 전에 고쳐 redirect 손실을 줄인다. 조건 분기 방향과 간접 점프 목표는 실행해야 알 수 있으므로 여기서 잡지 않는다.</dd>
+      <dt>없으면</dt><dd>가짜 taken이나 놓친 jal이 백엔드 실행 단계에서야 발견되어 그 사이 인출한 명령어를 모두 버린다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ifu/PredChecker.scala:80-126@09453ff8</dd>
+    </dl>
+  </div>
+  <p>오류가 여러 개면 첫 번째만 처리한다. <code>prefixOr</code>로 첫 오류 위치까지(그 위치 포함)만 유효로 남기고, 우선순위 인코더로 그 위치를 고른다(PredChecker.scala:100-126@09453ff8). 새 목표는 jal·조건 분기면 <code>pc + offset</code>, 아니면 <code>pc + (RVC 또는 invalidTaken ? 2 : 4)</code>다(128-134, 168-172줄). return이면 FTQ 수신기가 이 값을 RAS top(<code>specTopAddr</code>)으로 바꾼다(ftq/IfuRedirectReceiver.scala:42@09453ff8). 비-return 간접 점프(jalrFault)는 순차 주소로 redirect되며, 실제 목표는 백엔드가 나중에 고친다(추론).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 168" role="img" aria-label="PredChecker 오류가 FTQ redirect로 반영되기까지의 사이클">
+      <defs><marker id="f48a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="60" y="20" text-anchor="middle" class="lbl-mono">t</text><text x="173" y="20" text-anchor="middle" class="lbl-mono">t+1</text><text x="286" y="20" text-anchor="middle" class="lbl-mono">t+2</text><text x="399" y="20" text-anchor="middle" class="lbl-mono">t+3</text>
+      <rect class="box-acc" x="10" y="30" width="100" height="60" rx="9"/><text x="60" y="54" text-anchor="middle" class="lbl-b">IFU s2</text><text x="60" y="75" text-anchor="middle" class="lbl-dim">오류 위치</text>
+      <rect class="box-bad" x="123" y="30" width="100" height="60" rx="9"/><text x="173" y="54" text-anchor="middle" class="lbl-b">IFU WB</text><text x="173" y="75" text-anchor="middle" class="lbl-dim">redirect 발행</text>
+      <rect class="box-2" x="236" y="30" width="100" height="60" rx="9"/><text x="286" y="54" text-anchor="middle" class="lbl-b">FTQ</text><text x="286" y="75" text-anchor="middle" class="lbl-dim">포인터 되감기</text>
+      <rect class="box" x="349" y="30" width="100" height="60" rx="9"/><text x="399" y="54" text-anchor="middle" class="lbl-b">BPU</text><text x="399" y="75" text-anchor="middle" class="lbl-dim">새 경로</text>
+      <line class="ln" x1="110" y1="60" x2="123" y2="60" marker-end="url(#f48a)"/><line class="ln" x1="223" y1="60" x2="236" y2="60" marker-end="url(#f48a)"/><line class="ln" x1="336" y1="60" x2="349" y2="60" marker-end="url(#f48a)"/>
+      <text x="230" y="122" text-anchor="middle" class="lbl">WB 결과는 1사이클 레지스터, FTQ 수신기에서 다시 1사이클</text>
+      <text x="230" y="148" text-anchor="middle" class="lbl-dim">첫 오류 뒤 명령어는 IBuffer에 들어가지 않는다</text>
+    </svg>
+    <figcaption>PredChecker 결과는 RegEnable을 거쳐 WB에서 나가고(PredChecker.scala:146-176@09453ff8), FTQ의 IFU 수신기에서 RegNext로 한 번 더 늦춰진다(IfuRedirectReceiver.scala:61@09453ff8).</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">IFU-3 · s2_flush</span><h4>WB redirect의 flush 범위</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s2_flush = backendRedirect || (wbRedirect &amp;&amp; !s2_wbNotFlush). s2_wbNotFlush = WB 블록과 s2 블록의 ftqIdx가 같다. s1·s0는 WB redirect에 언제나 flush</dd>
+      <dt>이유</dt><dd class="why">같은 FTQ 칸을 가리키는 s2 블록은 WB가 고친 블록의 일부이므로 버리면 안 된다(추론: 코드 조건으로부터).</dd>
+      <dt>없으면</dt><dd>고친 블록의 유효한 앞부분까지 사라지거나, 반대로 틀린 경로의 블록이 IBuffer에 들어간다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ifu/Ifu.scala:110-113, 733@09453ff8</dd>
+    </dl>
+  </div>
+  <p>WB는 redirect와 함께 학습 정보도 FTQ에 보낸다. <code>canTrain = isDirect || isReturn || invalidTaken || notCfiTaken</code>일 때만 BPU 학습으로 이어진다(Ifu.scala:742-743@09453ff8).</p>
+  <div class="callout decision"><strong>2026-07-02 IFU 학습 경로 (#6112), 2026-08-21 notCfiTaken 추가 (#6398)</strong><p>IFU에서 BPU로 가는 학습 경로와 <code>canTrain</code>의 <code>isDirect || isReturn</code>은 커밋 24ed326a5에서 들어왔고, 59086b8a5가 <code>notCfiTaken</code>을 더했다. 이와 별개로 2026-09-14 커밋 b900bf578(#6484)은 FTQ가 백엔드 resolve를 거르는 조건을 바꿨다. 예전에는 direct jump를 모두 학습에서 뺐지만, 이제는 <em>오예측된</em> direct jump는 통과시킨다(<code>isDirect &amp;&amp; !mispredict</code>만 거름, ftq/ResolveQueue.scala:89@09453ff8). 자기 수정 코드 때문에 jal 목표가 바뀌는 경우를 BPU가 배우게 하려는 변경이며, 같은 커밋에서 <code>fixedTaken</code> 필드가 제거되었다.</p></div>
+
+  <div class="sim" id="sim-pc">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>PredChecker가 고르는 첫 오류</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view dom"><div class="cells" id="pc-lanes"></div><p class="mini" id="pc-txt">-</p></div>
+      <div class="sim-controls">
+        <div class="seg" id="pc-prog"><button class="on">jal</button><button>add</button><button>ret</button></div>
+        <div class="ctl"><label>BPU가 taken이라 한 레인 <output data-for="tk" data-fmt="int"></output></label>
+          <input type="range" data-k="tk" min="-1" max="7" step="1" value="-1"></div>
+        <div class="verdict grey" id="pc-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>첫 오류</span><b id="pc-kind" class="acc">-</b></div>
+      <div class="ro"><span>IBuffer에 남는 수</span><b id="pc-keep">0</b></div>
+      <div class="ro"><span>redirect 목표</span><b id="pc-tgt">-</b></div>
+      <div class="ro"><span>BPU 학습</span><b id="pc-train">-</b></div>
+    </div>
+    <div class="sim-note">① 프로그램 "jal"에서 taken을 −1(없음)에서 2로 옮기면 오류가 사라진다. ② 프로그램 "add"(분기 없음)에서 taken 위치를 바꿔 IBuffer에 남는 수가 taken 위치+1과 같은지 보세요. ③ 프로그램 "ret"(jalr와 ret 포함)에서 taken을 4로 두면 ret는 맞았지만 앞의 jalr가 오류가 된다. −1은 taken 없음(블록 끝까지 순차)이다. 명령어 배치는 합성 데이터이고 판정·목표 식은 PredChecker.scala:82-134와 Ifu.scala:742-743 그대로다.</div>
+  </div>
+  <div class="callout deep"><strong>MMIO 인출은 한 개씩</strong><p>캐시를 거치면 안 되는 주소(장치 ROM 등)는 <code>IfuUncacheUnit</code>이 Idle → (WaitLastCommit) → SendReq → WaitResp 순서로 명령어 하나씩 가져온다. 앞선 명령어가 모두 커밋될 때까지 기다리는 것은 MMIO 또는 Pbmt.IO 영역뿐이다. 그런 영역은 읽기에 부작용이 있어 투기적으로 읽으면 안 되기 때문이다. 멱등 영역인 Pbmt.NC는 기다리지 않고 바로 SendReq로 간다(<code>shouldWait = isMmio || Pbmt.isIO(pbmt)</code>, IfuUncacheUnit.scala:86-89@09453ff8). 8B Get 하나에서 32비트 명령어가 8B 경계를 넘으면 다음 8B를 한 번 더 요청하고, 4KB 페이지 끝을 넘으면 재요청 대신 redirect로 ITLB·PMP를 다시 거친다(IfuUncacheUnit.scala:56-143, instruncache/InstrUncacheEntry.scala:71-74, 106, 145@09453ff8). 동시에 처리하는 엔트리는 1개다(<code>nMmioEntry = 1</code>).</p></div>
+</section>
+
+<section id="sec-ibuffer">
+  <h2>IBuffer: 인출과 디코드 사이의 완충</h2>
+  <p>배식대가 없으면 요리사는 손님이 접시를 집어 갈 때까지 다음 요리를 못 낸다. IFU는 한 번에 많게는 36레인을 쏟아 내고, 디코더는 사이클당 최대 8개를 가져간다(<code>DecodeWidth = 8</code>, src/main/scala/xiangshan/Parameters.scala:81@09453ff8). 이 속도 차이를 흡수하는 FIFO가 <span class="term" data-def="인출된 명령어를 디코더가 가져갈 때까지 담아 두는 48칸 FIFO. 쓰기 4 bank, 읽기 8 bank로 나뉜다.">IBuffer</span>다. 크기는 48칸이며, 쓰기는 4 bank, 읽기는 8 bank로 나뉜다(ibuffer/Parameters.scala:23-25@09453ff8).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 214" role="img" aria-label="IBuffer 48칸, 쓰기 bank 4개와 읽기 2단 Mux, 출력 8칸">
+      <defs><marker id="f49a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-acc" x="8" y="28" width="96" height="70" rx="9"/><text x="56" y="52" text-anchor="middle" class="lbl-b">IFU 36레인</text><text x="56" y="72" text-anchor="middle" class="lbl-dim">앞 0~3칸</text><text x="56" y="89" text-anchor="middle" class="lbl-dim">거품</text>
+      <line class="ln" x1="104" y1="62" x2="118" y2="62" marker-end="url(#f49a)"/>
+      <g id="f49-grid"></g>
+      <rect class="box-grey" x="120" y="28" width="210" height="70" rx="6" fill-opacity="0.4"/>
+      <line class="ln-dash" x1="120" y1="45.5" x2="330" y2="45.5"/><line class="ln-dash" x1="120" y1="63" x2="330" y2="63"/><line class="ln-dash" x1="120" y1="80.5" x2="330" y2="80.5"/>
+      <text x="336" y="41" class="lbl-mono">w0</text><text x="336" y="58" class="lbl-mono">w1</text><text x="336" y="76" class="lbl-mono">w2</text><text x="336" y="93" class="lbl-mono">w3</text>
+      <text x="225" y="118" text-anchor="middle" class="lbl-dim">엔트리 e → 쓰기 bank e mod 4</text>
+      <text x="225" y="136" text-anchor="middle" class="lbl-dim">엔트리마다 9 → 1 Mux (36 / 4)</text>
+      <rect class="box" x="364" y="20" width="88" height="36" rx="7"/><text x="408" y="43" text-anchor="middle" class="lbl">1단 6→1</text>
+      <rect class="box" x="364" y="66" width="88" height="36" rx="7"/><text x="408" y="89" text-anchor="middle" class="lbl">2단 8→1</text>
+      <rect class="box-2" x="364" y="112" width="88" height="36" rx="7"/><text x="408" y="135" text-anchor="middle" class="lbl">출력 8칸</text>
+      <rect class="box-grey" x="364" y="166" width="88" height="36" rx="7"/><text x="408" y="189" text-anchor="middle" class="lbl-b">디코드</text>
+      <line class="ln" x1="408" y1="56" x2="408" y2="66" marker-end="url(#f49a)"/><line class="ln" x1="408" y1="102" x2="408" y2="112" marker-end="url(#f49a)"/><line class="ln" x1="408" y1="148" x2="408" y2="166" marker-end="url(#f49a)"/>
+      <text x="8" y="170" class="lbl">allowEnq: 다음 블록 수 &lt; 다음 빈칸</text>
+      <text x="8" y="194" class="lbl-dim">비어 있으면 출력 칸으로 바로 (bypass)</text>
+    </svg>
+    <figcaption>IFU가 bank 경계에 맞춰 미리 밀어 둔 덕분에 엔트리 하나의 쓰기 Mux는 9입력이면 된다. 읽기는 bank 안 6→1, bank 사이 8→1의 두 단이다(IBuffer.scala:381-397, 436-447@09453ff8).</figcaption>
+  </figure>
+
+  <p>IBuffer가 꽉 차면 IFU를 멈춰야 한다. 그런데 "지금 빈칸이 몇 개인가"를 디코드 수락 → IBuffer → IFU로 한 사이클 안에 전달하면 조합 경로가 너무 길다. 그래서 IBuffer는 한 사이클 앞서 계산한다. IFU s1이 미리 알려 준 다음 블록의 명령어 수 <code>prevInstrCount</code>와, 이번 사이클이 끝난 뒤의 빈칸 수를 비교해 레지스터에 담는다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">IB-1 · allowEnq</span><h4>IBuffer 입수 허용</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">allowEnq(다음 사이클) := prevInstrCount &lt; 48 − (numValid + numEnq − numDeq). io.in.ready = allowEnq</dd>
+      <dt>이유</dt><dd class="why">ready를 레지스터 출력으로 만들어 IFU s2의 ready 경로를 짧게 한다. 비교가 &lt;라서 블록 크기가 빈칸과 똑같을 때도 한 사이클 쉰다.</dd>
+      <dt>없으면</dt><dd>ready가 디코드 → IBuffer → IFU를 잇는 긴 조합 경로가 되거나, 넘치는 명령어를 덮어쓴다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ibuffer/IBuffer.scala:162-175, 378@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">IB-2 · useBypass</span><h4>빈 버퍼 건너뛰기</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">enqPtr == deqPtr (비었음) &amp;&amp; 디코드가 받을 수 있음 &amp;&amp; !resumingVType &amp;&amp; 입력에 vset 계열 없음</dd>
+      <dt>이유</dt><dd class="why">비어 있으면 한 번 썼다가 다시 읽는 1사이클을 아끼려고 입력을 출력 칸으로 바로 보낸다. vset 명령어는 vtype 추정 경로를 거쳐야 하므로 제외한다.</dd>
+      <dt>없으면</dt><dd>redirect 직후처럼 버퍼가 빈 순간마다 디코드가 한 사이클 더 기다린다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ibuffer/IBuffer.scala:143-154, 201-227@09453ff8</dd>
+    </dl>
+  </div>
+  <p>예외는 처음 만난 하나만 저장한다(<code>firstException</code>, IBuffer.scala:462-470@09453ff8). 예외는 어차피 redirect를 부르므로 두 번째부터는 의미가 없다(2025-10-23, #5095). 백엔드 redirect가 오면 Frontend가 한 사이클 늦춘 <code>needFlush</code>로 포인터를 모두 0, 출력을 무효, <code>allowEnq</code>를 1로 만든다(IBuffer.scala:500-510@09453ff8). IBuffer에서 나간 명령어가 어떻게 해독되고 이름이 바뀌는지는 <a href="ch05-decode-rename.html">5장</a>에서 이어진다.</p>
+
+  <div class="sim" id="sim-ib">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>IBuffer 점유와 allowEnq</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="ib-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>IFU 블록당 평균 명령어 수 <output data-for="fn" data-fmt="int"></output></label>
+          <input type="range" data-k="fn" min="1" max="32" step="1" value="20"></div>
+        <div class="ctl"><label>디코드가 받는 수/사이클 <output data-for="dec" data-fmt="int"></output></label>
+          <input type="range" data-k="dec" min="0" max="8" step="1" value="6"></div>
+        <div class="btn-row"><button class="btn primary" id="ib-play">재생</button><button class="btn" id="ib-step">한 사이클</button><button class="btn" id="ib-reset">처음으로</button></div>
+        <div class="verdict grey" id="ib-verdict">대기</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>사이클</span><b id="ib-t">0</b></div>
+      <div class="ro"><span>점유 /48</span><b id="ib-n" class="acc">0</b></div>
+      <div class="ro"><span>IFU 정지 사이클</span><b id="ib-stall">0</b></div>
+      <div class="ro"><span>평균 디코드/사이클</span><b id="ib-thr">0</b></div>
+    </div>
+    <div class="sim-note">① 디코드를 0으로 두고 한 사이클씩 눌러 점유가 몇에서 멈추는지 보세요. 다음 블록 수가 남은 빈칸보다 작아야 들어간다. ② 블록당 20, 디코드 6이면 평균 디코드가 6에 붙는다. 병목은 디코드다. ③ 블록당 4로 낮추면 IFU가 병목이 되어 버퍼가 비고 정지가 사라진다. 블록 크기는 합성 난수, bypass와 출력 8칸은 생략했다. 규칙은 IBuffer.scala:162-175 그대로다.</div>
+  </div>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ul>
+    <li>FTQ(64칸)는 BPU와 인출을 떼어 놓는다. BPU는 bpu−commit &lt; 64, bpu−fetch &lt; 32, 학습 정지 &lt; 8일 때만 새 블록을 쓴다.</li>
+    <li>pnrPtr 앞의 칸은 더는 override되지 않는다. 2-prefetch·2-fetch의 두 번째 블록은 반드시 그 경계를 지나야 한다.</li>
+    <li>ICache는 256 set × 4 way × 64B = 64 KiB, set은 vaddr[13:6], 태그는 paddr[47:12] 36비트인 VIPT다. 라인을 채울 때 2B마다 maybeRvc 비트를 함께 저장한다.</li>
+    <li>2-fetch는 크기 합 ≤ 32 반워드, 같은 페이지, pnr 통과를 FTQ가 보고, data SRAM 충돌·MMIO·예외를 ICache가 최종 판정한다.</li>
+    <li>IFU는 b(i) = !b(i−1) || rvc(i−1)을 16단 + Mux로 계산하고, PredChecker가 jal 놓침·가짜 taken 같은 명백한 오류를 WB에서 redirect한다.</li>
+    <li>IBuffer(48칸)는 다음 블록 수 &lt; 다음 빈칸일 때만 IFU를 받는다. 이 비교를 한 사이클 앞서 레지스터로 만든다.</li>
+  </ul>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="2">
+    <div class="q">ICache 미스로 fetchPtr가 40사이클 멈췄다. 커밋은 충분히 빠르고 학습도 막히지 않았다. BPU는 어떻게 되는가?</div>
+    <div class="opts"><button>미스와 동시에 바로 멈춘다</button><button>FTQ 64칸이 다 찰 때까지 계속 예측한다</button><button>bpu − fetch가 32가 될 때까지 예측하고 멈춘다</button><button>미스와 무관하게 끝없이 예측한다</button></div>
+    <div class="explain">FTQ-1의 둘째 조건 dist(bpu, fetch) &lt; PrefetchDepth(32) 때문이다. 바로 멈춘다면 분리형 프런트엔드를 둔 의미가 없다. 64칸 조건은 bpu와 commit 사이 거리이므로 fetch가 멈춘 상황에서는 32 제한이 먼저 걸린다. 끝없이 예측하면 커밋 전 칸을 덮어쓴다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">블록 시작 vaddr의 라인 안 오프셋이 0x08(8)이다. endPosition을 최대 31까지 바꿀 때 이 블록이 다음 라인에 걸칠 수 있는가?</div>
+    <div class="opts"><button>endPosition이 16 이상이면 걸친다</button><button>걸치지 않는다</button><button>endPosition이 28 이상이면 걸친다</button></div>
+    <div class="explain">교차 라인 판정은 startPc(5) &amp;&amp; endPosition(4)다. 오프셋 8은 비트 5가 0이므로 기준점이 라인 시작이고, 64B 창이 라인과 정확히 겹친다. endPosition ≥ 16이라는 조건만 보면 비트 5를 잊은 것이고, 28은 근거가 없는 값이다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">FTQ가 rawTwoFetchValid를 냈는데도 fetchPtr가 1만 늘었다. 가능한 이유는?</div>
+    <div class="opts"><button>두 블록이 같은 way의 다른 set에서 같은 data bank를 읽어야 했다</button><button>두 블록의 크기 합이 32 반워드를 넘었다</button><button>두 번째 블록이 아직 pnr 이전이었다</button></div>
+    <div class="explain">IC-2의 SRAM 충돌은 ICache MainPipe가 판정하므로 FTQ 후보와 결과가 갈릴 수 있다. 크기 합과 pnr은 FTQ가 rawTwoFetchValid를 낼 때 이미 확인한 조건이라 그 경우에는 후보 자체가 나오지 않는다.</div>
+  </div>
+  <div class="quiz" data-answer="3">
+    <div class="q">BPU가 블록 중간의 <code>add</code>(32비트) 자리에 taken을 예측했다. PredChecker의 redirect 목표는?</div>
+    <div class="opts"><button>예측된 taken 목표 그대로</button><button>그 add의 pc + 2</button><button>RAS top</button><button>그 add의 pc + 4</button></div>
+    <div class="explain">notCfiTaken이며 분기가 아니므로 fixedIsJump가 거짓이고, 순차 목표 pc + (RVC 또는 invalidTaken ? 2 : 4)를 쓴다. 32비트 명령어라 +4다. 예측 목표 그대로라면 오류를 고친 것이 아니고, +2는 RVC일 때, RAS top은 return일 때만 쓴다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08.</p>
+
+</main>
+</div>
+<script src="assets/ch04-a.js"></script>
+<script src="assets/ch04-b.js"></script>
+</body>
+</html>

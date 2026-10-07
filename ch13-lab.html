@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13장 통합 실험실: 한 명령어의 일생 · KMHv3Book</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+.seg.wrap { flex-wrap: wrap; }
+.table-wrap table.data { min-width: 720px; }
+#sim-lab .sim-body { grid-template-columns: minmax(0, 1fr); }
+.prog { width: 100%; min-height: 168px; box-sizing: border-box; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--canvas-bg); color: var(--text); resize: vertical; }
+.lab-ctl { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px 18px; font-size: 14px; }
+.gantt-wrap { overflow-x: auto; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--canvas-bg); }
+.gantt { border-collapse: collapse; font-family: var(--mono); font-size: 10px; }
+.gantt th, .gantt td { min-width: 24px; height: 22px; padding: 0 1px; text-align: center; border: 1px solid var(--grid); white-space: nowrap; }
+.gantt th { color: var(--text-faint); font-weight: 500; }
+.gantt .lab { position: sticky; left: 0; z-index: 1; background: var(--bg-elev); text-align: left; padding: 0 8px; min-width: 150px; font-size: 11px; color: var(--text); cursor: pointer; }
+.gantt tr.sel .lab { color: var(--accent); font-weight: 700; }
+.gantt .st-F, .gantt .st-D, .gantt .st-R, .gantt .st-DS { background: var(--surface-2); color: var(--text-dim); }
+.gantt .st-W, .gantt .st-RW { color: var(--text-faint); }
+.gantt .st-IS { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+.gantt .st-OG { background: var(--accent-2-soft); color: var(--accent-2); }
+.gantt .st-EX { background: var(--accent); color: var(--on-accent); font-weight: 700; }
+.gantt .st-M { background: var(--warn-soft); color: var(--warn); }
+.gantt .st-WB { background: var(--ok-soft); color: var(--ok); }
+.gantt .st-C { background: var(--ok); color: var(--on-accent); font-weight: 700; }
+.gantt .st-X { background: var(--bad-soft); color: var(--bad); }
+.gantt td.mp { outline: 2px solid var(--bad); outline-offset: -2px; }
+.gantt .fut { opacity: .22; }
+.gantt th.now { color: var(--accent); font-weight: 700; }
+.gantt td.now { box-shadow: inset 0 -3px 0 var(--accent); }
+.lab-detail { margin: 0; font-size: 13.5px; color: var(--text-dim); font-family: var(--mono); line-height: 1.6; }
+</style>
+</head>
+<body data-chapter="ch13">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 13</div>
+  <h1>통합 실험실: 한 명령어의 일생</h1>
+  <p class="lead">앞의 장들은 파이프라인을 한 구간씩 확대해 보았다. 이 장은 그 구간들을 다시 이어 붙인다. 명령어 하나가 분기 예측기에서 출발해 커밋으로 확정될 때까지 몇 사이클이 걸리는지 세고, 여러 명령이 같은 길을 동시에 지날 때 어디서 줄이 서는지 시뮬레이터로 재현한다.
+    이 장에서는 정상 경로의 사이클 수, wakeup 지연, 커밋 규칙, 그리고 분기 오예측과 ROB 가득 참이라는 두 가지 대표적 손실만 다룬다.</p>
+  <ul class="objectives">
+    <li>명령 하나가 BPU s0에서 커밋까지 거치는 단계와 사이클 오프셋을 말할 수 있다.</li>
+    <li>의존하는 명령의 select 시점을 생산자 종류(ALU 1, MUL 3, load hit 4)로 예측할 수 있다.</li>
+    <li>커밋이 정렬된 8칸 line 안에서만 진행되는 규칙을 Gantt 차트에서 찾아낼 수 있다.</li>
+    <li>분기 오예측 한 번의 비용이 어떤 구간으로 이루어지는지 분해할 수 있다.</li>
+    <li>load miss가 ROB를 채우는 과정과 Dispatch 문턱이 336인 이유를 설명할 수 있다.</li>
+  </ul>
+</div>
+
+<section id="life">
+  <h2>한 명령어의 일생: 지도와 시간표</h2>
+  <p>식당 주방을 떠올려 보자. 주문을 미리 짐작하고(분기 예측), 재료를 창고에서 꺼내고(인출), 주문서를 읽어 요리사에게 나눠 주고(디코드·리네임·디스패치), 재료가 다 준비된 요리부터 불에 올리고(이슈·실행), 마지막으로 손님에게는 주문 순서대로 내보낸다(커밋). 요리는 순서 없이 해도 서빙은 순서대로 한다. 이것이 <span class="term" data-def="명령을 프로그램 순서와 다른 순서로 실행하되, 결과는 프로그램 순서대로 확정하는 CPU 구조.">비순차 실행<span class="en">out-of-order execution</span></span>의 전체 모양이다.</p>
+  <p>KMHv3에서는 이 흐름이 크게 두 덩어리로 나뉜다. 명령을 가져오는 <b>앞단</b>(frontend: BPU, FTQ, ICache, IFU, IBuffer)과 명령을 실행하고 확정하는 <b>뒷단</b>(backend: Decode부터 ROB까지)이다. 아래 지도의 상자를 누르면 그 단계를 자세히 다룬 장으로 간다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 258" role="img" aria-label="KMHv3 파이프라인 지도와 각 단계를 다루는 장">
+      <defs><marker id="m13-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker>
+        <marker id="m13-1r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--bad)"/></marker></defs>
+      <text x="16" y="24" class="lbl-dim">앞단 (frontend): 명령을 가져온다</text>
+      <a href="ch02-bpu.html"><rect class="box-2" x="16" y="36" width="76" height="62" rx="9"/><text x="54" y="62" text-anchor="middle" class="lbl-b">분기 예측</text><text x="54" y="84" text-anchor="middle" class="lbl-acc2">2·3장</text></a>
+      <a href="ch04-fetch.html"><rect class="box-2" x="104" y="36" width="76" height="62" rx="9"/><text x="142" y="62" text-anchor="middle" class="lbl-b">FTQ</text><text x="142" y="84" text-anchor="middle" class="lbl-acc2">4장</text></a>
+      <a href="ch04-fetch.html"><rect class="box-2" x="192" y="36" width="76" height="62" rx="9"/><text x="230" y="62" text-anchor="middle" class="lbl-b">I캐시</text><text x="230" y="84" text-anchor="middle" class="lbl-acc2">4·10장</text></a>
+      <a href="ch04-fetch.html"><rect class="box-2" x="280" y="36" width="76" height="62" rx="9"/><text x="318" y="62" text-anchor="middle" class="lbl-b">IFU</text><text x="318" y="84" text-anchor="middle" class="lbl-acc2">4장</text></a>
+      <a href="ch04-fetch.html"><rect class="box-2" x="368" y="36" width="76" height="62" rx="9"/><text x="406" y="62" text-anchor="middle" class="lbl-b">IBuffer</text><text x="406" y="84" text-anchor="middle" class="lbl-acc2">4장</text></a>
+      <line class="ln" x1="92" y1="67" x2="103" y2="67" marker-end="url(#m13-1)"/>
+      <line class="ln" x1="180" y1="67" x2="191" y2="67" marker-end="url(#m13-1)"/>
+      <line class="ln" x1="268" y1="67" x2="279" y2="67" marker-end="url(#m13-1)"/>
+      <line class="ln" x1="356" y1="67" x2="367" y2="67" marker-end="url(#m13-1)"/>
+      <path class="ln" d="M406,98 V114 H54 V140" marker-end="url(#m13-1)"/>
+      <text x="444" y="132" text-anchor="end" class="lbl-dim">뒷단 (backend): 실행하고 확정한다</text>
+      <a href="ch05-decode-rename.html"><rect class="box-acc" x="16" y="142" width="76" height="62" rx="9"/><text x="54" y="168" text-anchor="middle" class="lbl-b">디코드</text><text x="54" y="190" text-anchor="middle" class="lbl-acc">5장</text></a>
+      <a href="ch05-decode-rename.html"><rect class="box-acc" x="104" y="142" width="76" height="62" rx="9"/><text x="142" y="168" text-anchor="middle" class="lbl-b">리네임</text><text x="142" y="190" text-anchor="middle" class="lbl-acc">5장</text></a>
+      <a href="ch06-dispatch-issue.html"><rect class="box-acc" x="192" y="142" width="76" height="62" rx="9"/><text x="230" y="168" text-anchor="middle" class="lbl-b">이슈 큐</text><text x="230" y="190" text-anchor="middle" class="lbl-acc">6장</text></a>
+      <a href="ch07-execute.html"><rect class="box-acc" x="280" y="142" width="76" height="62" rx="9"/><text x="318" y="168" text-anchor="middle" class="lbl-b">실행</text><text x="318" y="190" text-anchor="middle" class="lbl-acc">7·9장</text></a>
+      <a href="ch08-rob-redirect.html"><rect class="box-ok" x="368" y="142" width="76" height="62" rx="9"/><text x="406" y="168" text-anchor="middle" class="lbl-b">ROB</text><text x="406" y="190" text-anchor="middle" class="lbl-acc">8장</text></a>
+      <line class="ln" x1="92" y1="173" x2="103" y2="173" marker-end="url(#m13-1)"/>
+      <line class="ln" x1="180" y1="173" x2="191" y2="173" marker-end="url(#m13-1)"/>
+      <line class="ln" x1="268" y1="173" x2="279" y2="173" marker-end="url(#m13-1)"/>
+      <line class="ln" x1="356" y1="173" x2="367" y2="173" marker-end="url(#m13-1)"/>
+      <path class="ln-bad" d="M318,204 V228 H6 V67 H14" stroke-dasharray="5 4" marker-end="url(#m13-1r)"/>
+      <text x="162" y="248" text-anchor="middle" class="lbl-bad">분기 오예측 redirect (8장)</text>
+    </svg>
+    <figcaption>KMHv3 파이프라인 지도. 실행 상자에는 load·store 파이프(9장)가, I캐시 상자에는 TLB와 프리페처(10장)가 들어 있다. 빨간 점선은 오예측이 앞단을 되돌리는 길이다.</figcaption>
+  </figure>
+
+  <p>이제 시간축을 붙인다. 기준점은 BPU가 새 PC를 고르는 사이클 <b>R</b>이다. 모든 큐가 비어 있고, ITLB와 ICache가 한 번에 맞으며, 명령이 아무것도 기다리지 않는다고 하자. 그러면 각 단계 사이에 놓인 레지스터(Chisel의 <code>Reg</code>, <code>RegNext</code>) 개수가 곧 사이클 수다. 이렇게 센 값이 그림 13-2다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 436" role="img" aria-label="한 명령어의 일생: R+0 BPU s0부터 R+16 커밋까지 단계별 사이클">
+      <text x="6" y="28" class="lbl-dim">단계 · 장</text>
+      <g class="lbl-mono" text-anchor="middle">
+        <text x="176.5" y="28">0</text><text x="193.5" y="28">1</text><text x="210.5" y="28">2</text><text x="227.5" y="28">3</text><text x="244.5" y="28">4</text><text x="261.5" y="28">5</text><text x="278.5" y="28">6</text><text x="295.5" y="28">7</text><text x="312.5" y="28">8</text><text x="329.5" y="28">9</text><text x="346.5" y="28">10</text><text x="363.5" y="28">11</text><text x="380.5" y="28">12</text><text x="397.5" y="28">13</text><text x="414.5" y="28">14</text><text x="431.5" y="28">15</text><text x="448.5" y="28">16</text>
+      </g>
+      <g stroke="var(--grid)" stroke-width="1">
+        <line x1="168" y1="36" x2="168" y2="414"/><line x1="202" y1="36" x2="202" y2="414"/><line x1="236" y1="36" x2="236" y2="414"/><line x1="270" y1="36" x2="270" y2="414"/><line x1="304" y1="36" x2="304" y2="414"/><line x1="338" y1="36" x2="338" y2="414"/><line x1="372" y1="36" x2="372" y2="414"/><line x1="406" y1="36" x2="406" y2="414"/><line x1="440" y1="36" x2="440" y2="414"/>
+        <line x1="6" y1="216" x2="457" y2="216"/>
+      </g>
+      <g class="lbl-dim">
+        <text x="6" y="55">BPU s0: PC 선택</text><text x="6" y="77">BPU s1 → FTQ</text><text x="6" y="99">Prefetch s0: ITLB</text><text x="6" y="121">Prefetch s1 → WL</text><text x="6" y="143">MainPipe s0: SRAM</text><text x="6" y="165">IFU s0 (= MP s1)</text><text x="6" y="187">IFU s1</text><text x="6" y="209">IFU s2 → IBuffer</text>
+        <text x="6" y="231">Decode</text><text x="6" y="253">Rename</text><text x="6" y="275">Dispatch · IQ enq</text><text x="6" y="297">Select (IS)</text><text x="6" y="319">OG0: RF 읽기 요청</text><text x="6" y="341">OG1: 데이터 도착</text><text x="6" y="363">EX (ALU 1 cycle)</text><text x="6" y="385">ROB writeback</text><text x="6" y="407">Commit</text>
+      </g>
+      <g class="lbl-mono">
+        <text x="138" y="55">2장</text><text x="138" y="77">2장</text><text x="138" y="99">4장</text><text x="138" y="121">4장</text><text x="138" y="143">4장</text><text x="138" y="165">4장</text><text x="138" y="187">4장</text><text x="138" y="209">4장</text>
+        <text x="138" y="231">5장</text><text x="138" y="253">5장</text><text x="138" y="275">6장</text><text x="138" y="297">6장</text><text x="138" y="319">7장</text><text x="138" y="341">7장</text><text x="138" y="363">7장</text><text x="138" y="385">8장</text><text x="138" y="407">8장</text>
+      </g>
+      <g class="box-2">
+        <rect x="169" y="43" width="15" height="16" rx="3"/><rect x="186" y="65" width="15" height="16" rx="3"/><rect x="203" y="87" width="15" height="16" rx="3"/><rect x="220" y="109" width="15" height="16" rx="3"/><rect x="237" y="131" width="15" height="16" rx="3"/><rect x="254" y="153" width="15" height="16" rx="3"/><rect x="271" y="175" width="15" height="16" rx="3"/><rect x="288" y="197" width="15" height="16" rx="3"/>
+      </g>
+      <g class="box-acc">
+        <rect x="305" y="219" width="15" height="16" rx="3"/><rect x="322" y="241" width="15" height="16" rx="3"/><rect x="339" y="263" width="15" height="16" rx="3"/><rect x="356" y="285" width="15" height="16" rx="3"/><rect x="373" y="307" width="15" height="16" rx="3"/><rect x="390" y="329" width="15" height="16" rx="3"/><rect x="407" y="351" width="15" height="16" rx="3"/>
+      </g>
+      <g class="box-ok"><rect x="424" y="373" width="15" height="16" rx="3"/><rect x="441" y="395" width="15" height="16" rx="3"/></g>
+      <text x="6" y="430" class="t-faint">(추론) Reg 경계를 센 최소값 · ITLB/ICache hit, 빈 큐 가정 · 가로축 R+n</text>
+    </svg>
+    <figcaption>한 명령어의 일생. 앞단 8 cycle(R~R+7), 디코드에서 select까지 3 cycle, select에서 EX까지 3 cycle, EX에서 커밋까지 2 cycle로 R+16에 커밋된다(추론). 실제 회로 파형으로 확인한 값이 아니라 레지스터 경계를 센 최소값이다.</figcaption>
+    <div class="legend"><span><i style="--c:var(--accent-2)"></i>앞단</span><span><i style="--c:var(--accent)"></i>뒷단 실행 경로</span><span><i style="--c:var(--ok)"></i>ROB·커밋</span></div>
+  </figure>
+
+  <p>표로 다시 적으면 다음과 같다. 사이클 열은 모두 레지스터 경계를 세어 얻은 <b>(추론)</b> 값이고, 근거 열은 그 경계를 만드는 코드 위치다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>단계</th><th class="num">사이클</th><th>무엇을 하나</th><th>장</th><th>근거 (src/main/scala/xiangshan/)</th></tr>
+    <tr><td>BPU s0 → s1</td><td class="num">R, R+1</td><td>PC 선택, s1의 빠른 예측이 FTQ로</td><td><a href="ch02-bpu.html">2장</a>·<a href="ch03-predictors.html">3장</a></td><td><code>frontend/bpu/Bpu.scala:510,533</code></td></tr>
+    <tr><td>ICache Prefetch s0/s1</td><td class="num">R+2, R+3</td><td>ITLB·tag 확인, WayLookup에 기록</td><td><a href="ch04-fetch.html">4장</a>·<a href="ch10-cache-mmu.html">10장</a></td><td><code>frontend/ftq/Ftq.scala:301</code></td></tr>
+    <tr><td>MainPipe s0</td><td class="num">R+4</td><td>WayLookup(Reg)을 읽고 data SRAM 읽기</td><td><a href="ch04-fetch.html">4장</a></td><td><code>frontend/icache/ICacheWayLookup.scala:60,147</code></td></tr>
+    <tr><td>IFU s0/s1/s2</td><td class="num">R+5~R+7</td><td>명령 경계 찾기, predecode, IBuffer에 넣기</td><td><a href="ch04-fetch.html">4장</a></td><td><code>frontend/ifu/Ifu.scala:122,186,418</code></td></tr>
+    <tr><td>Decode</td><td class="num">R+8</td><td>IBuffer 출력 레지스터에서 8개를 꺼내 해석</td><td><a href="ch05-decode-rename.html">5장</a></td><td><code>frontend/ibuffer/IBuffer.scala:102,274</code></td></tr>
+    <tr><td>Rename / Dispatch</td><td class="num">R+9, R+10</td><td>물리 레지스터 배정, IQ에 넣기</td><td><a href="ch05-decode-rename.html">5장</a>·<a href="ch06-dispatch-issue.html">6장</a></td><td><code>backend/CtrlBlock.scala:683,784</code></td></tr>
+    <tr><td>Select → OG0 → OG1</td><td class="num">R+11~R+13</td><td>IQ에서 뽑혀 레지스터 파일 읽기</td><td><a href="ch06-dispatch-issue.html">6장</a>·<a href="ch07-execute.html">7장</a></td><td><code>backend/issue/IssueQueue.scala:889</code>, <code>backend/datapath/DataPath.scala:515</code></td></tr>
+    <tr><td>EX</td><td class="num">R+14</td><td>ALU 1 cycle (load는 S0~S3, <a href="ch09-loadstore.html">9장</a>)</td><td><a href="ch07-execute.html">7장</a></td><td><code>backend/Region.scala:512</code></td></tr>
+    <tr><td>ROB writeback → Commit</td><td class="num">R+15, R+16</td><td>완료 표시, 순서대로 확정</td><td><a href="ch08-rob-redirect.html">8장</a></td><td><code>backend/CtrlBlock.scala:154-160</code>, <code>backend/rob/Rob.scala:262</code></td></tr>
+  </table></div>
+
+  <div class="callout warn"><strong>이 숫자들이 말하지 않는 것</strong><p>그림 13-2는 한 명령이 아무것도 기다리지 않을 때의 최소값이다. 실제 명령은 대부분 피연산자를 기다리고, 실행 포트를 두고 경쟁하고, 앞 명령의 커밋을 기다린다. 2절과 3절이 그 기다림을 다룬다. ITLB나 ICache가 빗나가면 앞단이 그만큼 멈춘다(<code>frontend/icache/ICacheMainPipe.scala:447</code>의 <code>s1_fetchFinish</code>).</p></div>
+
+  <div class="callout decision"><strong>2026-07-13 (#6044) WayLookup bypass 제거</strong><p>커밋 b137cb9ef "timing(ICache): drop support for wayLookup bypass"로 Prefetch 결과가 WayLookup 레지스터를 반드시 거치게 되었다. 타이밍을 얻는 대신 앞단 경로에 1 cycle(R+3 → R+4)이 고정으로 들어갔다.</p></div>
+</section>
+
+<section id="rules">
+  <h2>뒷단의 세 가지 규칙: 폭, wakeup, 커밋 line</h2>
+  <p>명령이 혼자 지나갈 때는 그림 13-2가 전부다. 문제는 수백 개가 동시에 지나갈 때다. 그때 성능을 정하는 것은 세 가지 규칙이다. 한 사이클에 몇 개가 지나갈 수 있는가(<b>폭</b>), 앞 명령의 결과를 언제 쓸 수 있는가(<b>wakeup</b>), 그리고 끝난 명령을 언제 확정할 수 있는가(<b>커밋 line</b>)다.</p>
+
+  <h3>폭: 8개씩, 그러나 실행 포트는 종류별로 다르다</h3>
+  <p>디코드, 리네임, 커밋은 모두 한 사이클에 8개다(<code>DecodeWidth</code>, <code>RenameWidth</code>, <code>CommitWidth</code> = 8, <code>src/main/scala/xiangshan/Parameters.scala:81-83</code>). 실행 쪽은 종류마다 포트 수가 다르다. 정수 스케줄러의 실행 유닛을 세면 다음과 같다(<code>Parameters.scala:345-444</code>, 전수).</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>종류</th><th class="num">포트</th><th>유닛 이름</th><th class="num">EX cycle</th><th>근거 (FuConfig.scala)</th></tr>
+    <tr><td>ALU</td><td class="num">6</td><td>ALU0~ALU5</td><td class="num">1</td><td><code>CertainLatency(0)</code> 기본값, :68, :343</td></tr>
+    <tr><td>MUL</td><td class="num">2</td><td>ALU4, ALU5에 함께 붙음</td><td class="num">3</td><td><code>CertainLatency(2)</code>, :364</td></tr>
+    <tr><td>분기(BJU)</td><td class="num">3</td><td>BJU0~BJU2</td><td class="num">1</td><td>기본값, :256</td></tr>
+    <tr><td>LOAD</td><td class="num">3</td><td>LDU0~LDU2</td><td class="num">4 (S0~S3)</td><td><code>UncertainLatency(3)</code>, :477</td></tr>
+    <tr><td>STORE 주소</td><td class="num">2</td><td>STA0, STA1 (데이터는 STD0·1)</td><td class="num">-</td><td>-</td></tr>
+  </table></div>
+  <p>그래서 독립적인 ALU 명령 16개가 들어오면 디코드는 2 cycle이면 끝나지만, select는 한 사이클에 6개까지만 된다. MUL은 ALU4·ALU5 두 포트에서만 실행되므로 ALU와 자리를 나눠 쓴다.</p>
+  <div class="callout decision"><strong>2025-04-15 뒷단 폭을 8로</strong><p>커밋 a5dadc651 "feat(backend): support 8 IBufNBank, 8 decodeWidth, 8 renameWidth, 8 rabCommitWidth"가 IBuffer 읽기 bank, 디코드, 리네임, RAB 커밋 폭을 모두 8로 맞췄다. 이 장의 모든 실험에서 쓰는 "8"이 여기서 왔다.</p></div>
+
+  <h3>wakeup: 결과가 나오기 전에 소비자를 깨운다</h3>
+  <p>소비자 명령이 생산자의 결과를 레지스터 파일에서 다시 읽으려면 몇 사이클이 더 든다. 그래서 KMHv3는 생산자가 IQ에서 뽑히는 순간 "몇 사이클 뒤 결과가 나온다"는 <span class="term" data-def="생산자 명령이 곧 결과를 낸다는 신호. 이 신호를 받은 소비자 명령은 준비 완료로 표시되어 select 후보가 된다.">wakeup<span class="en">wakeup</span></span> 신호를 미리 예약해 둔다. 고정 지연 유닛은 지연만큼 늦춘 뒤 레지스터 한 단(<code>lastConnect</code>)을 거쳐 내보내고, 소비자는 그 신호가 보이는 사이클에 바로 select될 수 있다. 결과 데이터는 레지스터 파일 대신 <span class="term" data-def="방금 실행 유닛에서 나온 결과를 레지스터 파일을 거치지 않고 다음 명령의 입력으로 바로 연결하는 배선.">bypass<span class="en">bypass network</span></span>로 받는다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="생산자 종류별로 의존 명령이 select되는 시점: ALU +1, MUL +3, load hit +4">
+      <defs><marker id="m13-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ok)"/></marker></defs>
+      <text x="6" y="22" class="lbl-dim">생산자 select = 0</text>
+      <g class="lbl-mono" text-anchor="middle"><text x="146" y="22">0</text><text x="182" y="22">1</text><text x="218" y="22">2</text><text x="254" y="22">3</text><text x="290" y="22">4</text><text x="326" y="22">5</text><text x="362" y="22">6</text><text x="398" y="22">7</text><text x="434" y="22">8</text></g>
+      <g class="lbl-dim"><text x="6" y="49">ALU 생산자</text><text x="6" y="121">MUL 생산자</text><text x="6" y="193">LOAD hit 생산자</text></g>
+      <text x="6" y="71" class="lbl-dim">소비자 <tspan class="lbl-acc">+1</tspan></text>
+      <text x="6" y="143" class="lbl-dim">소비자 <tspan class="lbl-acc">+3</tspan></text>
+      <text x="6" y="215" class="lbl-dim">소비자 <tspan class="lbl-acc">+4</tspan></text>
+      <g class="box-acc"><rect x="130" y="36" width="32" height="18" rx="3"/><rect x="166" y="58" width="32" height="18" rx="3"/><rect x="130" y="108" width="32" height="18" rx="3"/><rect x="238" y="130" width="32" height="18" rx="3"/><rect x="130" y="180" width="32" height="18" rx="3"/><rect x="274" y="202" width="32" height="18" rx="3"/></g>
+      <g class="box"><rect x="166" y="36" width="32" height="18" rx="3"/><rect x="202" y="36" width="32" height="18" rx="3"/><rect x="202" y="58" width="32" height="18" rx="3"/><rect x="238" y="58" width="32" height="18" rx="3"/>
+        <rect x="166" y="108" width="32" height="18" rx="3"/><rect x="202" y="108" width="32" height="18" rx="3"/><rect x="274" y="130" width="32" height="18" rx="3"/><rect x="310" y="130" width="32" height="18" rx="3"/>
+        <rect x="166" y="180" width="32" height="18" rx="3"/><rect x="202" y="180" width="32" height="18" rx="3"/><rect x="310" y="202" width="32" height="18" rx="3"/><rect x="346" y="202" width="32" height="18" rx="3"/></g>
+      <g class="box-ok"><rect x="238" y="36" width="32" height="18" rx="3"/><rect x="274" y="58" width="32" height="18" rx="3"/>
+        <rect x="238" y="108" width="104" height="18" rx="3"/><rect x="346" y="130" width="32" height="18" rx="3"/>
+        <rect x="238" y="180" width="32" height="18" rx="3"/><rect x="274" y="180" width="32" height="18" rx="3"/><rect x="310" y="180" width="32" height="18" rx="3"/><rect x="346" y="180" width="32" height="18" rx="3"/><rect x="382" y="202" width="32" height="18" rx="3"/></g>
+      <g class="lbl-mono" text-anchor="middle">
+        <text x="146" y="49">IS</text><text x="182" y="49">OG0</text><text x="218" y="49">OG1</text><text x="254" y="49">EX</text>
+        <text x="182" y="71">IS</text><text x="218" y="71">OG0</text><text x="254" y="71">OG1</text><text x="290" y="71">EX</text>
+        <text x="146" y="121">IS</text><text x="182" y="121">OG0</text><text x="218" y="121">OG1</text><text x="290" y="121">EX × 3</text>
+        <text x="254" y="143">IS</text><text x="290" y="143">OG0</text><text x="326" y="143">OG1</text><text x="362" y="143">EX</text>
+        <text x="146" y="193">IS</text><text x="182" y="193">OG0</text><text x="218" y="193">OG1</text><text x="254" y="193">S0</text><text x="290" y="193">S1</text><text x="326" y="193">S2</text><text x="362" y="193">S3</text>
+        <text x="290" y="215">IS</text><text x="326" y="215">OG0</text><text x="362" y="215">OG1</text><text x="398" y="215">EX</text>
+      </g>
+      <line x1="266" y1="54" x2="278" y2="60" stroke="var(--ok)" stroke-width="1.6" marker-end="url(#m13-3)"/>
+      <line x1="338" y1="126" x2="350" y2="132" stroke="var(--ok)" stroke-width="1.6" marker-end="url(#m13-3)"/>
+      <line x1="374" y1="198" x2="386" y2="204" stroke="var(--ok)" stroke-width="1.6" marker-end="url(#m13-3)"/>
+      <text x="6" y="244" class="lbl-dim">소비자 select = 생산자 select + 1 + FU latency (추론)</text>
+    </svg>
+    <figcaption>생산자 종류별 back-to-back 타이밍. 초록 화살표는 bypass다. 소비자의 EX가 생산자의 마지막 EX(또는 S3) 바로 다음 사이클에 붙는다. load는 S0에서 wakeup을 보내고 IQ가 이를 한 번 더 레지스터에 담으므로 +4다(<code>backend/issue/IssueQueue.scala:974</code>).</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">W1 · canIssueBypass</span><h4>wakeup을 받은 그 사이클에 select</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">각 피연산자가 이미 준비됨(srcState) 또는 이번 사이클 IQ wakeup 도착 → 엔트리가 select 후보</dd>
+      <dt>이유</dt><dd class="why">생산자 결과가 bypass로 나오는 바로 그 사이클에 소비자가 EX에 들어가게 해서, 의존 ALU 체인을 명령당 1 cycle로 돌린다.</dd>
+      <dt>없으면</dt><dd>wakeup을 레지스터에 담은 다음 사이클에야 뽑을 수 있어 ALU 체인 간격이 2 cycle로 늘고, 의존이 많은 코드의 IPC가 거의 절반이 된다(추론).</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/issue/EntryBundles.scala:310@09453ff8 · issue/MultiWakeupQueue.scala:47,76 · issue/IssueQueue.scala:781</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-chain">
+    <div class="sim-head"><span class="sim-tag predict">PREDICT</span><h3>의존 체인 8개: MUL은 얼마나 느린가</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="chain-cv"></canvas></div>
+      <div class="sim-controls">
+        <p style="margin:0"><code>mul x1, x1, x2</code>를 8번 이어 쓴다. 첫 MUL의 EX 시작에서 마지막 MUL의 EX 시작까지 몇 cycle일까? 먼저 고른 뒤 실행하자.</p>
+        <div class="seg" id="chain-choice"><button class="on">7</button><button>14</button><button>21</button><button>28</button></div>
+        <div class="btn-row"><button class="btn primary" id="chain-run">실행</button><button class="btn" id="chain-reset">다시</button></div>
+        <div class="verdict grey" id="chain-out">아직 실행하지 않음</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>ALU 체인 (cycle)</span><b id="chain-ro-alu">?</b></div>
+      <div class="ro"><span>MUL 체인 (cycle)</span><b id="chain-ro-mul" class="acc">?</b></div>
+      <div class="ro"><span>LOAD hit 체인 (cycle)</span><b id="chain-ro-ld">?</b></div>
+    </div>
+    <div class="sim-note">① 답을 고르고 실행해 세 선의 기울기(1, 3, 4)를 비교하자. ② 같은 체인을 3절 시뮬레이터의 "MUL 체인" 프리셋에서 한 사이클씩 넘겨 보자. ③ <code>ld x1, 0(x1)</code> 같은 포인터 따라가기는 왜 LOAD 선 위에 놓이는지 생각해 보자. 규칙은 그림 13-3과 W1에 있다. 이 그래프는 13장 엔진(<code>assets/ch13-engine.js</code>)을 돌린 결과이며 합성 프로그램이다. 간격 1/3/4는 FU latency 상수와 Reg 경계를 세어 얻은 값이다(추론).</div>
+  </div>
+
+  <h3>커밋 line: 8칸씩 정렬된 줄 안에서만</h3>
+  <p>ROB는 352칸을 8개 <span class="term" data-def="ROB 엔트리를 인덱스 하위 3비트로 나눠 담는 8개의 기억 구역. 같은 행(line)의 8칸을 한 번에 읽는다.">bank<span class="en">bank</span></span>로 나눠 담는다(<code>bankNum = 8</code>, <code>backend/rob/Rob.scala:173</code>). 커밋할 후보는 현재 line의 8칸을 레지스터 <code>robDeqGroup</code>에 한꺼번에 읽어 와서 고른다. 그래서 한 사이클에 커밋되는 명령은 언제나 같은 line 안에 있고, line의 마지막 칸(bank 7)을 커밋해야 다음 사이클에 다음 line을 읽는다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 190" role="img" aria-label="ROB line k에서 10~12가 커밋되고 13이 막아 나머지가 기다리는 모습">
+      <defs><marker id="m13-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+      <text x="6" y="44" class="lbl-dim">bank</text>
+      <g class="lbl-mono" text-anchor="middle"><text x="102" y="44">0</text><text x="148" y="44">1</text><text x="194" y="44">2</text><text x="240" y="44">3</text><text x="286" y="44">4</text><text x="332" y="44">5</text><text x="378" y="44">6</text><text x="424" y="44">7</text></g>
+      <text x="6" y="82" class="lbl-b">line k</text>
+      <text x="6" y="162" class="lbl-b">line k+1</text>
+      <g class="box-grey"><rect x="80" y="56" width="44" height="40" rx="5"/><rect x="126" y="56" width="44" height="40" rx="5"/></g>
+      <g class="box-ok"><rect x="172" y="56" width="44" height="40" rx="5"/><rect x="218" y="56" width="44" height="40" rx="5"/><rect x="264" y="56" width="44" height="40" rx="5"/></g>
+      <rect class="box-warn" x="310" y="56" width="44" height="40" rx="5"/>
+      <g class="box"><rect x="356" y="56" width="44" height="40" rx="5"/><rect x="402" y="56" width="44" height="40" rx="5"/></g>
+      <g class="box"><rect x="80" y="136" width="44" height="40" rx="5"/><rect x="126" y="136" width="44" height="40" rx="5"/><rect x="172" y="136" width="44" height="40" rx="5"/><rect x="218" y="136" width="44" height="40" rx="5"/><rect x="310" y="136" width="44" height="40" rx="5"/><rect x="356" y="136" width="44" height="40" rx="5"/><rect x="402" y="136" width="44" height="40" rx="5"/></g>
+      <rect class="box-warn" x="264" y="136" width="44" height="40" rx="5"/>
+      <g class="lbl-mono" text-anchor="middle">
+        <text x="102" y="72">8</text><text x="148" y="72">9</text><text x="194" y="72">10</text><text x="240" y="72">11</text><text x="286" y="72">12</text><text x="332" y="72">13</text><text x="378" y="72">14</text><text x="424" y="72">15</text>
+        <text x="102" y="152">16</text><text x="148" y="152">17</text><text x="194" y="152">18</text><text x="240" y="152">19</text><text x="286" y="152">20</text><text x="332" y="152">21</text><text x="378" y="152">22</text><text x="424" y="152">23</text>
+      </g>
+      <g class="lbl-dim" text-anchor="middle" font-size="12">
+        <text x="102" y="89">커밋됨</text><text x="148" y="89">커밋됨</text><text x="332" y="89">미완료</text><text x="378" y="89">완료</text><text x="424" y="89">완료</text>
+        <text x="102" y="169">완료</text><text x="148" y="169">완료</text><text x="194" y="169">완료</text><text x="240" y="169">완료</text><text x="286" y="169">미완료</text><text x="332" y="169">완료</text><text x="378" y="169">완료</text><text x="424" y="169">완료</text>
+      </g>
+      <g class="lbl-acc" text-anchor="middle" font-size="12"><text x="194" y="89">커밋</text><text x="240" y="89">커밋</text><text x="286" y="89">커밋</text></g>
+      <line x1="194" y1="118" x2="194" y2="100" stroke="var(--accent)" stroke-width="1.6" marker-end="url(#m13-4)"/>
+      <text x="204" y="124" class="lbl-acc" font-size="12">deqPtr</text>
+    </svg>
+    <figcaption>커밋 line. 이번 사이클에는 10~12의 3개만 커밋된다. 13이 끝나지 않았으므로 이미 끝난 14·15도 기다리고, line k+1은 line k의 15가 커밋된 다음 사이클에야 읽힌다.</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">C1 · commitValidThisLine</span><h4>같은 line, 앞에서부터 연속으로</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">commit_v &amp;&amp; commit_w &amp;&amp; !isBlocked &amp;&amp; !isBlockedByOlder &amp;&amp; !hasCommitted(i); line 끝(bank 7)을 커밋하면 다음 사이클에 다음 line 로드(allCommitted)</dd>
+      <dt>이유</dt><dd class="why">한 사이클에 8칸을 같은 행 주소로 읽게 해서 ROB 읽기를 단순하게 하고, 프로그램 순서대로만 확정한다(추론: 동기는 코드 구조에서 읽은 해석).</dd>
+      <dt>없으면</dt><dd>line 제약이 없으면 두 행에 걸친 8칸을 한 번에 읽어야 한다. 순서 조건(isBlockedByOlder)이 없으면 앞 명령이 예외를 내도 뒤 명령이 이미 확정되어 정확한 예외를 낼 수 없다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:842@09453ff8 · Rob.scala:250,262 · rob/RobDeqPtrWrapper.scala:71 (realCommitLast)</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="lab">
+  <h2>통합 파이프라인 시뮬레이터</h2>
+  <p>이제 규칙을 한꺼번에 돌려 본다. 아래 시뮬레이터는 짧은 프로그램(최대 16개)을 받아, 명령마다 어느 사이클에 어느 단계에 있었는지 Gantt 차트로 그린다. 모델이 쓰는 규칙은 다섯 줄이다.</p>
+  <ol class="steps">
+    <li><b>디코드·리네임·디스패치</b> 프로그램 순서대로 한 사이클에 8개. D, R=D+1, DS=D+2. <span class="io">DecodeWidth/RenameWidth = 8 · CtrlBlock.scala:683,784</span></li>
+    <li><b>select (IS)</b> DS+1 이후, 모든 생산자의 select + (ALU 1, MUL 3, load hit 4, miss면 + 지연) 이후, 그리고 포트가 남은 첫 사이클. 오래된 명령이 먼저 포트를 잡는다. <span class="io">ALU 6 · MUL 2(ALU4·5) · BJU 3 · LDU 3 · STA 2</span></li>
+    <li><b>OG0 → OG1 → EX</b> IS+1, IS+2, IS+3부터 EX cycle 수만큼. load miss는 S3 뒤에 M(miss 대기)이 붙는다. <span class="io">IssueQueue.scala:889 · DataPath.scala:515 · Region.scala:512</span></li>
+    <li><b>WB → C</b> 마지막 EX 다음 사이클 WB, 그 다음 사이클부터 커밋 가능. 커밋은 순서대로, 8칸 정렬 line을 넘지 않는다. <span class="io">CtrlBlock.scala:154-160 · Rob.scala:262,842 (추론)</span></li>
+    <li><b>오예측 분기 (!mp)</b> 분기 EX를 E라 하면 뒤 명령은 E+10에야 디코드된다. 그 사이 오경로 명령은 E+2에 flush된다. <span class="io">4절 · 그림 13-5 (추론)</span></li>
+  </ol>
+
+  <div class="sim" id="sim-lab">
+    <div class="sim-head"><span class="sim-tag anim">ANIMATION · LAB</span><h3>KMHv3 파이프라인 Gantt 시뮬레이터</h3></div>
+    <div class="sim-body">
+      <div class="seg wrap" id="lab-preset"><button class="on">의존 ALU 체인</button><button>독립 16개</button><button>MUL 체인</button><button>load hit/miss</button><button>분기 오예측</button></div>
+      <textarea id="lab-prog" class="prog" spellcheck="false" aria-label="시뮬레이션할 명령 프로그램"></textarea>
+      <div class="lab-ctl">
+        <div class="ctl"><label>load miss 지연 (cycle) <output data-for="miss" data-fmt="int"></output></label><input type="range" data-k="miss" min="4" max="60" step="1" value="20"></div>
+        <div class="ctl"><label>첫 명령의 ROB bank <output data-for="off" data-fmt="int"></output></label><input type="range" data-k="off" min="0" max="7" step="1" value="0"></div>
+        <div class="ctl"><label>현재 cycle (드래그로 되감기) <output data-for="t" data-fmt="int"></output></label><input type="range" data-k="t" min="0" max="20" step="1" value="20"></div>
+      </div>
+      <div class="btn-row"><button class="btn" id="lab-step">한 cycle 앞으로</button><button class="btn primary" id="lab-play">재생 / 정지</button><button class="btn" id="lab-reset">처음으로</button><button class="btn" id="lab-all">끝까지</button></div>
+      <div class="verdict grey" id="lab-verdict">-</div>
+      <div class="gantt-wrap"><table class="gantt" id="lab-gantt"></table></div>
+      <p class="lab-detail" id="lab-detail"></p>
+      <div class="legend" style="margin:0"><span><i style="--c:var(--surface-2)"></i>F·D·R·DS</span><span><i style="--c:var(--accent)"></i>IS·EX</span><span><i style="--c:var(--accent-2)"></i>OG0·OG1</span><span><i style="--c:var(--warn)"></i>M miss 대기</span><span><i style="--c:var(--ok)"></i>WB·C</span><span><i style="--c:var(--bad)"></i>오경로·오예측 EX</span><span>· = IQ/ROB에서 대기</span></div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>현재 cycle</span><b id="lab-ro-t">0</b></div>
+      <div class="ro"><span>decode / select / commit</span><b id="lab-ro-dsc">0</b></div>
+      <div class="ro"><span>ROB 점유</span><b id="lab-ro-rob">0</b></div>
+      <div class="ro"><span>커밋 누계</span><b id="lab-ro-done" class="acc">0</b></div>
+      <div class="ro"><span>마지막 커밋 cycle</span><b id="lab-ro-last">0</b></div>
+      <div class="ro"><span>IPC (첫 D ~ 마지막 C)</span><b id="lab-ro-ipc">0</b></div>
+    </div>
+    <div class="sim-note">① "독립 16개"에서 cycle 4의 select가 6개에서 멈추는 것(ALU 포트 6)과, #8~#11이 cycle 9에 WB를 마쳐 cycle 10에 커밋할 수 있는데도 cycle 11에 커밋되는 것(line 제약: line 0의 #7이 cycle 10에 커밋된 다음 cycle에야 line 1을 읽음)을 찾자. ② "첫 명령의 ROB bank"를 4로 옮기면 line 경계가 #3/#4 사이로 옮겨 가 커밋 사이클이 달라진다. ③ "load hit/miss"에서 miss 지연을 4에서 60까지 끌며 독립 명령 #4~#7의 커밋이 miss 뒤로 함께 밀리는 것을 보자. 행을 누르면 그 명령의 사이클 내역과 이유가 나온다. 이 시뮬레이터는 단순화한 모델이다. 폭 8, 포트 수, line 8은 코드에서 온 실제 상수이고, wakeup 1/3/4와 오예측 E+10은 Reg 경계를 세어 얻은 값이다(추론). 그러나 IQ·물리 레지스터·LSQ 용량, 앞단 공급 변동, RF 포트 충돌, 명령 융합(fusion)은 넣지 않았다(6절).</div>
+  </div>
+
+  <div class="callout tip"><strong>프로그램 문법</strong><p><code>add/sub/and/or/xor/addi/li/mv/nop</code>(ALU), <code>mul</code>, <code>ld/lw/lb…</code>(LOAD), <code>sd/sw…</code>(STORE), <code>beq/bne/blt/bge/j</code>(분기)를 읽는다. load 뒤에 <code>!miss</code>를 붙이면 miss, 분기 뒤에 <code>!mp</code>를 붙이면 오예측이다. <code>#</code> 뒤는 주석이다. <code>x0</code>은 의존을 만들지 않는다.</p></div>
+</section>
+
+<section id="mispredict">
+  <h2>분기 오예측: 16 cycle의 내역</h2>
+  <p>분기 예측이 틀렸다는 사실은 분기 명령이 실행 유닛에 도착해서야 드러난다. 그때 앞단은 이미 엉뚱한 길의 명령을 수십 개 가져와 뒷단에 밀어 넣은 뒤다. 이들을 지우고 올바른 주소에서 다시 가져와야 하는데, 다시 가져온 첫 명령이 실행되기까지는 그림 13-2의 앞단과 뒷단 앞부분을 처음부터 다시 지나야 한다. 이 손해가 <span class="term" data-def="분기 오예측이 드러난 뒤 올바른 경로의 첫 명령이 실행될 때까지 잃는 사이클.">오예측 벌점<span class="en">misprediction penalty</span></span>이다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 262" role="img" aria-label="분기 EX(E)에서 정답 경로 첫 EX(E+16)까지의 구간">
+      <text x="6" y="26" class="lbl-dim">구간 · E+n</text>
+      <g class="lbl-mono" text-anchor="middle">
+        <text x="176.5" y="26">0</text><text x="210.5" y="26">2</text><text x="244.5" y="26">4</text><text x="278.5" y="26">6</text><text x="312.5" y="26">8</text><text x="346.5" y="26">10</text><text x="380.5" y="26">12</text><text x="414.5" y="26">14</text><text x="448.5" y="26">16</text>
+      </g>
+      <g stroke="var(--grid)" stroke-width="1"><line x1="168" y1="34" x2="168" y2="232"/><line x1="202" y1="34" x2="202" y2="232"/><line x1="236" y1="34" x2="236" y2="232"/><line x1="270" y1="34" x2="270" y2="232"/><line x1="304" y1="34" x2="304" y2="232"/><line x1="338" y1="34" x2="338" y2="232"/><line x1="372" y1="34" x2="372" y2="232"/><line x1="406" y1="34" x2="406" y2="232"/><line x1="440" y1="34" x2="440" y2="232"/></g>
+      <g class="lbl-dim"><text x="6" y="58">분기 EX: 오예측 판명</text><text x="6" y="90">redirect 전달 (Reg 2단)</text><text x="6" y="122">앞단 재충전</text><text x="6" y="154">디코드~디스패치</text><text x="6" y="186">select·OG0·OG1</text><text x="6" y="218">정답 경로 첫 EX</text></g>
+      <rect class="box-bad" x="169" y="40" width="15" height="26" rx="3"/>
+      <rect class="box-bad" x="186" y="72" width="32" height="26" rx="3"/>
+      <rect class="box-2" x="203" y="104" width="134" height="26" rx="3"/>
+      <text x="270" y="122" text-anchor="middle" class="lbl-acc2">BPU s0 ~ IFU s2 · 8</text>
+      <rect class="box-acc" x="339" y="136" width="49" height="26" rx="3"/>
+      <rect class="box-acc" x="390" y="168" width="49" height="26" rx="3"/>
+      <rect class="box-ok" x="441" y="200" width="15" height="26" rx="3"/>
+      <path class="ln" d="M176,240 V246 H448 V240"/>
+      <text x="312" y="260" text-anchor="middle" class="lbl-acc">분기 EX → 정답 경로 첫 EX ≈ 16 cycle (추론)</text>
+    </svg>
+    <figcaption>오예측 벌점의 구성. E+1에 Region이 가장 오래된 redirect를 레지스터에 담고, E+2에 RedirectGenerator가 FTQ로 보낸다. 같은 E+2에 뒷단도 flush된다. 그 뒤는 그림 13-2의 R=E+2인 경우와 같다(추론).</figcaption>
+  </figure>
+
+  <p>E+2에 FTQ가 redirect를 바로 처리할 수 있는 것은 한 사이클 먼저 받아 둔 FTQ 인덱스 덕분이다. 뒷단은 E+1에 "곧 이 FTQ 엔트리로 redirect가 간다"는 <code>ftqIdxAhead</code>를 보내고, FTQ는 그 엔트리를 미리 읽어 둔다.</p>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">R1 · aheadIdxMatch</span><h4>미리 받은 FTQ 인덱스가 맞으면 같은 사이클에 처리</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">RegNext(ftqIdxAhead).valid &amp;&amp; redirect.ftqIdx === RegNext(ftqIdxAhead).bits → redirect 즉시 처리, 아니면 RegNext로 1 cycle 늦춤</dd>
+      <dt>이유</dt><dd class="why">redirect 인덱스로 FTQ 큐를 읽는 한 사이클을 미리 해 두어 오예측 벌점을 1 cycle 줄인다.</dd>
+      <dt>없으면</dt><dd>모든 뒷단 redirect가 한 사이클 늦게 BPU에 닿아 벌점이 17 cycle이 된다(추론). 아래 시뮬레이터의 첫 체크박스가 이 경우다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/frontend/ftq/BackendRedirectReceiver.scala:36-53@09453ff8 · backend/CtrlBlock.scala:434-435 · backend/Region.scala:800-801 · backend/ctrlblock/RedirectGenerator.scala:37-60</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-05-19 redirect FTQ 인덱스를 한 사이클 앞서 읽기</strong><p>커밋 3a49b46e0 "feat(ftq): read the queue with redirect FTQ index one cycle ahead of real redirect"가 위 R1을 넣었다. 코드에는 "Magic! Do not touch!!!" 주석이 붙어 있다(<code>BackendRedirectReceiver.scala:34</code> 부근).</p></div>
+
+  <div class="sim" id="sim-mp">
+    <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>오예측 벌점과 실효 IPC</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="mp-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label><input type="checkbox" data-k="ahead"> ftqIdxAhead 불일치 (+1)</label></div>
+        <div class="ctl"><label>정답 경로 ICache miss <output data-for="ic" data-fmt="int"></output></label><input type="range" data-k="ic" min="0" max="40" step="1" value="0"></div>
+        <div class="ctl"><label><input type="checkbox" data-k="walk"> snapshot 없음: ROB walk (추론)</label></div>
+        <div class="ctl"><label>walk할 뒤 엔트리 수 <output data-for="young" data-fmt="int"></output></label><input type="range" data-k="young" min="0" max="344" step="8" value="128"></div>
+        <div class="ctl"><label>오예측 / 1000 명령 <output data-for="mpki" data-fmt="f1"></output></label><input type="range" data-k="mpki" min="0" max="20" step="0.5" value="5"></div>
+        <div class="ctl"><label>오예측 없을 때 IPC <output data-for="ipc" data-fmt="f2"></output></label><input type="range" data-k="ipc" min="1" max="6" step="0.25" value="3"></div>
+        <div class="verdict grey" id="mp-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>벌점 (E → 첫 EX)</span><b id="mp-ro-p" class="acc">16</b></div>
+      <div class="ro"><span>구성</span><b id="mp-ro-parts">2+8+3+3</b></div>
+      <div class="ro"><span>잃은 decode·dispatch 슬롯 (×8)</span><b id="mp-ro-slot">128</b></div>
+      <div class="ro"><span>실효 IPC</span><b id="mp-ro-ipc">0</b></div>
+      <div class="ro"><span>IPC 손실</span><b id="mp-ro-loss" class="warn">0</b></div>
+    </div>
+    <div class="sim-note">① 기본 상태에서 오예측 비율을 0에서 20까지 끌어 보자. IPC 3인 코어는 1000명령당 5번 오예측만으로 IPC의 약 19%를 잃는다. ② "ftqIdxAhead 불일치"를 켜면 벌점이 17이 된다. 한 사이클이 슬롯 8개라는 점을 확인하자. ③ snapshot 없이 walk할 엔트리를 64개 이하로 두면 벌점이 그대로이고, 그보다 많으면 늘어난다. walk는 사이클당 8개, 앞단 재충전 8 cycle과 겹친다고 가정했다(추론). 벌점 구간은 그림 13-5, 실효 IPC는 CPI = 1/IPC + MPKI/1000 × 벌점이라는 교과서 근사식이다. 상수는 코드에서 왔고 프로그램은 가상이다.</div>
+  </div>
+</section>
+
+<section id="robfull">
+  <h2>ROB가 가득 찰 때: load miss가 드러나는 순간</h2>
+  <p>비순차 코어가 load miss를 견디는 방법은 단순하다. miss가 메모리에서 돌아오는 동안 뒤의 명령을 계속 받아 실행한다. 하지만 커밋은 순서대로이므로 ROB 맨 앞의 load가 끝나지 않으면 아무것도 나가지 못한다. 들어오기만 하고 나가지 않으니 ROB는 결국 찬다. 그때부터 dispatch가 멈추고 miss 지연이 그대로 실행 시간이 된다.</p>
+  <p>여기서 이상한 숫자가 하나 나온다. ROB는 352칸인데 Dispatch는 점유가 336을 넘으면 멈춘다. 16칸은 왜 비워 두는가?</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 200" role="img" aria-label="ROB 352칸 중 336까지는 dispatch 허용, 나머지 16칸은 아직 세지 않은 두 묶음의 자리">
+      <text x="20" y="34" class="lbl-mono">allowEnqueueForDispatch: 점유 + 도착분 ≤ 352 − 2×8</text>
+      <rect class="box-acc" x="20" y="56" width="280" height="44" rx="6"/>
+      <rect class="box-2" x="300" y="56" width="70" height="44"/>
+      <rect class="box-warn" x="370" y="56" width="70" height="44" rx="6"/>
+      <line x1="150" y1="50" x2="144" y2="106" stroke="var(--bg-elev)" stroke-width="5"/>
+      <line class="ln" x1="146" y1="50" x2="140" y2="106"/><line class="ln" x1="154" y1="50" x2="148" y2="106"/>
+      <text x="226" y="83" text-anchor="middle" class="lbl">≤ 336이면 허용</text>
+      <text x="76" y="83" text-anchor="middle" class="lbl">점유</text>
+      <text x="335" y="83" text-anchor="middle" class="lbl-b">① +8</text>
+      <text x="405" y="83" text-anchor="middle" class="lbl-b">② +8</text>
+      <g class="lbl-mono" text-anchor="middle"><text x="20" y="118">0</text><text x="300" y="118">336</text><text x="370" y="118">344</text><text x="436" y="118">352</text></g>
+      <text x="20" y="148" class="lbl-dim">① 지난 사이클에 보낸 8개: RegNext로 ROB에 도착하는 중</text>
+      <text x="20" y="172" class="lbl-dim">② 이번 사이클에 보내는 8개: 허가 신호(Reg)는 이미 났다</text>
+      <text x="20" y="194" class="t-faint">가로축은 336 앞부분을 줄여 그렸다</text>
+    </svg>
+    <figcaption>Dispatch 문턱 336의 내역. 허가 신호 <code>allowEnqueueForDispatch</code>는 레지스터라 한 사이클 늦게 반영되고, dispatch 요청도 한 사이클 늦게 ROB에 닿는다. 그래서 허가를 내는 순간 아직 세지 않은 묶음이 둘(①②) 있다.</figcaption>
+  </figure>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">D1 · allowEnqueueForDispatch</span><h4>ROB 352칸, Dispatch 문턱 336</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">다음 사이클 dispatch 허용 = (numValidEntries + dispatchNum ≤ RobSize − 2×RenameWidth = 336), Reg</dd>
+      <dt>이유</dt><dd class="why">허가가 한 사이클 늦고(Reg) 요청이 한 사이클 늦게 도착하므로(RegNext), 그 사이 떠 있는 두 묶음 16칸을 남겨 ROB가 넘치지 않게 한다. ROB 자신의 수락 조건 <code>allowEnqueue</code>는 한 묶음만 남긴 344다.</dd>
+      <dt>없으면</dt><dd>Dispatch가 344를 쓰면 이미 보낸 묶음이 도착했을 때 ROB의 <code>allowEnqueue</code>가 거짓이 되어 받아 주지 않는다. 보낸 쪽은 보냈다고 여기므로 명령을 잃는다(추론, 아래 시뮬레이터의 "344라면").</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:971-972@09453ff8 · Rob.scala:184-185,200-201,502 · backend/CtrlBlock.scala:796-800 · backend/dispatch/Dispatch.scala:899,905</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-rob">
+    <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>load miss 하나로 ROB 채우기</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="rob-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>ROB 맨 앞 load의 miss 지연 <output data-for="miss" data-fmt="int"></output></label><input type="range" data-k="miss" min="10" max="400" step="10" value="100"></div>
+        <div class="seg" id="rob-limit"><button class="on">실제: 336</button><button>344라면</button></div>
+        <div class="verdict grey" id="rob-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>첫 dispatch 정지 cycle</span><b id="rob-ro-first">-</b></div>
+      <div class="ro"><span>stall_cycle_rob</span><b id="rob-ro-stall" class="warn">0</b></div>
+      <div class="ro"><span>잃은 dispatch 슬롯</span><b id="rob-ro-lost">0</b></div>
+      <div class="ro"><span>최대 점유</span><b id="rob-ro-peak" class="acc">0</b></div>
+      <div class="ro"><span>ROB가 거절한 요청</span><b id="rob-ro-drop" class="bad">0</b></div>
+    </div>
+    <div class="sim-note">① 지연을 10에서 올려 가며 dispatch가 처음 멈추는 지연을 찾자. 40 근처에서 바뀐다. 336칸을 사이클당 8개로 채우는 데 걸리는 약 42 cycle이 ROB가 숨길 수 있는 지연이다. ② 지연 100에서 최대 점유가 정확히 352가 되는 것을 보자. 문턱 336은 낭비가 아니라 떠 있는 두 묶음의 자리다. ③ "344라면"을 누르고 같은 지연에서 거절된 요청 8개가 생기는 것을 확인하자. 이유는 D1 게이트와 그림 13-6에 있다. 이 모델은 ROB만 센다. 뒤따르는 명령은 서로 독립이고 IQ·물리 레지스터·LSQ는 무한하다고 가정했으므로, 실제로는 다른 자원(정수 물리 레지스터 224개, LQ 120칸 등)이 먼저 바닥날 수 있다. 커밋은 line 규칙대로 사이클당 8개다.</div>
+  </div>
+
+  <div class="callout decision"><strong>2025-10-20 ROB와 RAB를 352칸으로</strong><p>커밋 6f12fb244 "perf(backend): increase fpPreg to 256, robSize and rabSize to 352"가 지금의 <code>RobSize = 352</code>(<code>Parameters.scala:114</code>)를 정했다. 위 시뮬레이터에서 숨길 수 있는 지연(약 42 cycle)은 이 크기를 폭 8로 나눈 값에서 나온다.</p></div>
+</section>
+
+<section id="limits">
+  <h2>모델이 버린 것들과 다음 실험</h2>
+  <p>이 장의 시뮬레이터는 실제 상수를 쓰지만 실제 회로는 아니다. 무엇을 버렸는지 알아야 결과를 바르게 읽는다. 아래 표의 각 줄은 해당 장에서 실제 동작을 다룬다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>항목</th><th>이 장의 모델</th><th>실제 KMHv3</th><th>장</th></tr>
+    <tr><td>앞단 공급</td><td>매 사이클 8개를 빠짐없이 공급</td><td>64B fetch block, 2-fetch, taken 분기에서 블록이 끊김, IBuffer 48칸</td><td><a href="ch04-fetch.html">4장</a></td></tr>
+    <tr><td>예측 override</td><td>없음</td><td>s2 override 1 bubble, s3 override 2 bubble (추론)</td><td><a href="ch02-bpu.html">2장</a>·<a href="ch03-predictors.html">3장</a></td></tr>
+    <tr><td>IQ 배정</td><td>select 시점에 빈 포트 아무거나</td><td>Dispatch가 IQ를 정하고 IQ마다 크기 16~20, enq 2</td><td><a href="ch06-dispatch-issue.html">6장</a></td></tr>
+    <tr><td>자원 용량</td><td>ROB만 셈 (5절)</td><td>정수 물리 레지스터 224, LQ 120, SQ 128(64×2)</td><td><a href="ch05-decode-rename.html">5장</a>·<a href="ch09-loadstore.html">9장</a></td></tr>
+    <tr><td>RF 읽기</td><td>OG0·OG1 항상 성공</td><td>포트 충돌 시 og0/og1 응답으로 재발행</td><td><a href="ch07-execute.html">7장</a></td></tr>
+    <tr><td>load miss</td><td>S3 뒤 고정 지연, 소비자를 정확히 깨움</td><td>S3에서 cancel, 투기적으로 깨운 소비자 취소, LoadQueueReplay에서 재발행</td><td><a href="ch09-loadstore.html">9장</a>·<a href="ch10-cache-mmu.html">10장</a></td></tr>
+    <tr><td>ROB 엔트리</td><td>명령 1개 = 엔트리 1개</td><td>기본 설정과 같다. ROB 압축(<code>robCompressEn</code>)은 꺼져 있고, 융합(fusion)된 두 명령만 한 엔트리를 나눠 쓴다</td><td><a href="ch08-rob-redirect.html">8장</a></td></tr>
+  </table></div>
+  <p>표의 근거: IBuffer 48(<code>frontend/ibuffer/Parameters.scala:23</code>), 정수 물리 레지스터 224(<code>Parameters.scala:122</code>), LQ 120(<code>Parameters.scala:101</code>), SQ 64×2(<code>Parameters.scala:109-110</code>), OG 응답(<code>backend/Region.scala:160-165</code>), load cancel(<code>mem/pipeline/NewLoadUnit.scala:1510</code>), ROB 압축 꺼짐(<code>backend/BackendParams.scala:48</code> <code>robCompressEn = false</code>, 융합 쌍만 예외: <code>backend/rename/Rename.scala:315</code>).</p>
+  <ol class="steps">
+    <li><b>폭과 포트</b> "독립 16개"를 MUL 16개로 바꿔 보자. select가 사이클당 2개로 줄어든다. <span class="io">MUL 포트 = ALU4, ALU5</span></li>
+    <li><b>의존 깊이</b> "의존 ALU 체인"의 한 줄 걸러 하나를 <code>add x9, x20, x21</code>로 바꾸면 IPC가 어떻게 바뀌는지 보자.</li>
+    <li><b>miss와 커밋</b> "load hit/miss"에서 miss load를 맨 끝으로 옮기면 독립 명령의 커밋이 더는 밀리지 않는다.</li>
+    <li><b>오예측의 실제 비용</b> "분기 오예측"에서 분기가 load에 의존하므로 E가 늦어진다. 분기를 맨 앞으로 옮기고 정답 경로 첫 EX가 몇 사이클 당겨지는지 보자. 벌점 16은 그대로지만 분기가 늦게 풀릴수록 총손실이 커진다.</li>
+  </ol>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ol>
+    <li>아무것도 기다리지 않으면 BPU s0에서 커밋까지 약 16 cycle이다(추론). 앞단 8, 디코드에서 select까지 3, select에서 EX까지 3, EX에서 커밋까지 2.</li>
+    <li>디코드·리네임·커밋 폭은 모두 8이다. 실행 포트는 ALU 6(그중 MUL 2), 분기 3, LOAD 3, STORE 주소 2다.</li>
+    <li>의존 명령의 select 간격은 1 + FU latency다. ALU 1, MUL 3, load hit 4 cycle이다(<code>canIssueBypass</code>).</li>
+    <li>커밋은 정렬된 8칸 line 안에서 앞에서부터 연속으로 끝난 것만 나간다. 한 사이클에 line을 넘지 않는다.</li>
+    <li>분기 오예측 한 번은 EX에서 정답 경로 첫 EX까지 약 16 cycle, 곧 폭 8 기준 decode·dispatch 슬롯 128개다(추론). ftqIdxAhead가 여기서 1 cycle을 덜어 낸다.</li>
+    <li>ROB 352칸 중 Dispatch 문턱은 336이다. 남은 16칸은 Reg와 RegNext 때문에 아직 세지 않은 두 묶음의 자리이며, 약 42 cycle보다 긴 miss는 dispatch를 멈춘다.</li>
+  </ol>
+</div>
+
+<section class="no-num" id="quiz">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="2">
+    <div class="q">hit하는 load가 cycle 10에 select되었다. 그 결과를 쓰는 add는 가장 빨리 몇 cycle에 select될 수 있는가?</div>
+    <div class="opts"><button>11</button><button>13</button><button>14</button><button>17</button></div>
+    <div class="explain">정답은 14다. load는 S0에서 wakeup을 보내고(select + 3), IQ가 이를 RegNext로 한 번 더 담아 select + 4에 소비자를 뽑는다. 11은 생산자가 ALU일 때, 13은 MUL일 때(+3)의 값이다. 17은 소비자의 EX 사이클(14 + 3)이다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">ROB 맨 앞 line의 bank 0, 1은 완료, bank 2는 미완료, bank 3~7은 완료다. 이번 사이클에 커밋되는 명령은 몇 개인가?</div>
+    <div class="opts"><button>0개</button><button>2개</button><button>7개</button><button>8개</button></div>
+    <div class="explain">정답은 2개다. 커밋은 앞에서부터 연속으로 끝난 것만 나가므로(<code>isBlockedByOlder</code>) bank 0, 1만 커밋된다. 0개는 완료된 앞 명령까지 막는다는 뜻이라 틀리다. 7개는 bank 2를 건너뛰어야 하고, 8개는 미완료인 bank 2까지 커밋해야 하므로 둘 다 순서 규칙에 어긋난다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">Dispatch가 ROB 수락 문턱으로 344가 아니라 336(= 352 − 2×8)을 쓰는 이유로 가장 알맞은 것은?</div>
+    <div class="opts"><button>예외 처리용으로 16칸을 예약해 두기 위해</button><button>허가 신호가 Reg이고 요청이 RegNext로 도착해 아직 세지 않은 묶음이 둘 있기 때문에</button><button>커밋이 8칸 line 두 개를 동시에 읽기 때문에</button><button>ROB 압축으로 엔트리가 두 배가 될 수 있기 때문에</button></div>
+    <div class="explain">정답은 두 번째다. Rob.scala:972의 허가는 레지스터라 한 사이클 늦고, CtrlBlock.scala:796-799의 요청은 RegNext로 한 사이클 늦게 ROB에 닿는다. 예외용 예약 칸은 코드에 없다. 커밋은 한 사이클에 line 하나만 읽는다. ROB 압축은 기본 설정에서 꺼져 있고(<code>BackendParams.scala:48</code>, 융합 쌍만 한 엔트리를 나눔), 켜져도 엔트리를 아끼는 쪽이며 문턱 식에 들어 있지 않다.</div>
+  </div>
+  <div class="quiz" data-answer="2">
+    <div class="q">ftqIdxAhead가 실제 redirect의 FTQ 인덱스와 다르면, 분기 EX(E)에서 정답 경로 첫 EX까지 몇 cycle인가? (이 장의 추론값 기준)</div>
+    <div class="opts"><button>15</button><button>16</button><button>17</button><button>24</button></div>
+    <div class="explain">정답은 17이다. 인덱스가 다르면 BackendRedirectReceiver가 redirect를 RegNext로 한 사이클 늦추므로 기본 16에 1이 더해진다. 15는 어떤 단계도 빠지지 않으므로 나올 수 없다. 16은 인덱스가 맞을 때다. 24는 한 사이클 손해를 디코드 폭(8)과 혼동한 값이다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08. 사이클 오프셋은 코드의 Reg/RegNext 경계를 세어 얻은 추론값이며 RTL 파형으로 확인하지 않았다. 시뮬레이터는 단순화 모델이다.</p>
+
+</main>
+</div>
+<script src="assets/ch13-engine.js"></script>
+<script src="assets/ch13-lab.js"></script>
+<script src="assets/ch13-exp.js"></script>
+</body>
+</html>

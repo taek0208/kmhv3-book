@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 12장: 빌드·시뮬레이션·검증</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+pre.cmd { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin: 14px 0; font-family: var(--mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere; }
+pre.cmd .c { color: var(--text-faint); }
+.dt-table td, .dt-table th { font-size: 13px; padding: 5px 7px; }
+.dt-table tr.cur td { background: var(--accent-soft); }
+.slots { display: grid; grid-template-columns: 72px repeat(8, minmax(0, 1fr)); gap: 3px; font-family: var(--mono); font-size: 10.5px; }
+.slots > b { font-weight: 600; color: var(--text-dim); font-size: 11px; align-self: center; white-space: nowrap; overflow: hidden; }
+.slots > i { font-style: normal; padding: 5px 2px; border-radius: 5px; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--surface); color: var(--text-faint); }
+.slots > b.cur { color: var(--accent); }
+.k-base { background: var(--ok-soft) !important; color: var(--ok) !important; }
+.k-fe { background: var(--code-soft) !important; color: var(--code) !important; }
+.k-bs { background: var(--bad-soft) !important; color: var(--bad) !important; }
+.k-core { background: var(--accent-soft) !important; color: var(--accent) !important; }
+.k-ld { background: var(--warn-soft) !important; color: var(--warn) !important; }
+.k-st { background: var(--accent-2-soft) !important; color: var(--accent-2) !important; }
+.k-oth { background: var(--grey-soft) !important; color: var(--grey) !important; }
+.stackbar { display: flex; height: 26px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+.stackbar > span { display: block; height: 100%; }
+.detail { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; font-size: 14px; background: var(--bg-elev); }
+.detail p { margin: 4px 0; }
+.flags { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 14px; }
+#ld-pick { flex-wrap: wrap; } #ld-pick button { white-space: nowrap; padding: 5px 9px; }
+.wk { border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; background: var(--bg-elev); }
+</style>
+</head>
+<body data-chapter="ch12">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 12</div>
+  <h1>빌드·시뮬레이션·검증</h1>
+  <p class="lead">앞 장들에서 본 Chisel 코드는 그대로는 아무것도 실행하지 않는다. 이 장은 그 코드를 Verilog로 바꾸고, 시뮬레이터로 돌리고, 정답 모델과 한 명령어씩 대조하고, 느린 원인을 슬롯 단위로 나누어 세는 과정을 따라간다. 새로 온 엔지니어가 첫 주에 실제로 치게 될 명령을 Makefile에서 확인한 그대로 보여 준다. 이 장에서는 XiangShan 본체 저장소의 빌드 규칙과 계측 코드만 다루며, 서브모듈(difftest, utility, ready-to-run)의 내부는 이 작업 사본에 체크아웃되어 있지 않아 (추론)으로 표시한다.</p>
+  <ul class="objectives">
+    <li><code>make verilog</code>, <code>make sim-verilog</code>, <code>make emu</code>가 각각 무엇을 만들고 왜 다른지 설명할 수 있다.</li>
+    <li>Chisel → CHIRRTL → SystemVerilog 변환 단계와 각 단계의 입력·출력을 짚을 수 있다.</li>
+    <li>DiffTest가 커밋 슬롯마다 무엇을 비교하고, 무엇을 일부러 건너뛰는지 설명할 수 있다.</li>
+    <li>TRAP 명령어(opcode 0x6b)로 시뮬레이션이 끝나는 방식을 설명할 수 있다.</li>
+    <li>TopDown 카운터가 매 사이클 8개 슬롯에 사유를 하나씩 붙이는 규칙으로 CPI 스택을 계산할 수 있다.</li>
+  </ul>
+</div>
+
+<section id="sec-flow">
+  <h2>소스에서 Verilog까지: 세 번의 변신</h2>
+  <p>요리책의 레시피는 그 자체로 음식이 아니다. 재료를 손질하고, 조리하고, 접시에 담아야 먹을 수 있다. Chisel 코드도 같다. <code>Rob.scala</code>는 "ROB를 만드는 Scala 프로그램"이지 ROB 회로가 아니다. 이 프로그램을 실행해야 비로소 회로가 생기고, 그 회로를 도구가 읽을 수 있는 언어로 옮겨야 시뮬레이터와 합성기가 쓸 수 있다.</p>
+  <p>첫 단계는 <span class="term" data-def="Scala 프로그램을 실행해 Config 값이 모두 정해진 구체적인 회로 그래프를 만드는 단계. RobSize=352 같은 값이 이때 고정된다.">정교화<span class="en">elaboration</span></span>다. <code>mill</code>이 JVM에서 <code>top.TopMain</code>을 실행하면 <code>ArgParser</code>가 명령행 인자를 Config로 바꾸고, <code>LazyModule(new XSTop)</code>이 회로를 조립한다(<code>src/main/scala/top/Top.scala:650-677@09453ff8</code>). 두 번째 단계는 회로를 <span class="term" data-def="Chisel이 내보내는 중간 표현(IR). 컴파일러의 IR처럼 고수준 형태에서 점점 낮춰 간다. 파일 확장자는 .fir.">CHIRRTL<span class="en">FIRRTL IR</span></span>이라는 중간 표현으로 직렬화하는 것이다. 세 번째 단계에서 <span class="term" data-def="LLVM 계열의 하드웨어 컴파일러 CIRCT의 실행 파일. FIRRTL을 최적화해 SystemVerilog를 낸다. Chisel 7은 이것을 내부에서 호출한다.">firtool<span class="en">CIRCT</span></span>이 IR을 최적화해 SystemVerilog(<code>.sv</code>)로 내보낸다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="Chisel 소스에서 정교화, CHIRRTL, firtool, SystemVerilog, Verilator 실행 파일까지의 흐름">
+      <defs><marker id="m12-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="18" class="lbl-dim">mill xiangshan.runMain (JVM)</text>
+      <rect class="box" x="10" y="30" width="130" height="62" rx="10"/>
+      <text x="75" y="56" text-anchor="middle" class="lbl-b">Chisel 소스</text>
+      <text x="75" y="78" text-anchor="middle" class="lbl-mono">src/main/scala</text>
+      <line class="ln" x1="140" y1="61" x2="163" y2="61" marker-end="url(#m12-1)"/>
+      <rect class="box-acc" x="165" y="30" width="130" height="62" rx="10"/>
+      <text x="230" y="56" text-anchor="middle" class="lbl-b">정교화</text>
+      <text x="230" y="78" text-anchor="middle" class="lbl-mono">LazyModule</text>
+      <line class="ln" x1="295" y1="61" x2="318" y2="61" marker-end="url(#m12-1)"/>
+      <rect class="box-2" x="320" y="30" width="130" height="62" rx="10"/>
+      <text x="385" y="56" text-anchor="middle" class="lbl-b">CHIRRTL</text>
+      <text x="385" y="78" text-anchor="middle" class="lbl-mono">SimTop.fir</text>
+      <path class="ln" d="M385,92 L385,120 L75,120 L75,148" fill="none" marker-end="url(#m12-1)"/>
+      <text x="230" y="113" text-anchor="middle" class="lbl-dim">Chisel 7이 CIRCT phase로 firtool 호출</text>
+      <rect class="box-acc" x="10" y="150" width="130" height="62" rx="10"/>
+      <text x="75" y="176" text-anchor="middle" class="lbl-b">firtool</text>
+      <text x="75" y="198" text-anchor="middle" class="lbl-mono">-O=release</text>
+      <line class="ln" x1="140" y1="181" x2="163" y2="181" marker-end="url(#m12-1)"/>
+      <rect class="box-ok" x="165" y="150" width="130" height="62" rx="10"/>
+      <text x="230" y="176" text-anchor="middle" class="lbl-b">SystemVerilog</text>
+      <text x="230" y="198" text-anchor="middle" class="lbl-mono">build/rtl/*.sv</text>
+      <line class="ln ln-dash" x1="295" y1="181" x2="318" y2="181" marker-end="url(#m12-1)"/>
+      <rect class="box" x="320" y="150" width="130" height="62" rx="10"/>
+      <text x="385" y="176" text-anchor="middle" class="lbl-b">Verilator</text>
+      <text x="385" y="198" text-anchor="middle" class="lbl-mono">build/emu</text>
+      <text x="230" y="240" text-anchor="middle" class="lbl-dim">점선: make emu일 때만 (difftest 서브모듈이 수행)</text>
+    </svg>
+    <figcaption>Chisel 코드는 세 번 모양을 바꾼다. 실행해서 회로를 만들고(정교화), IR로 적고(CHIRRTL), firtool이 SystemVerilog로 낮춘다. 단계 목록은 <code>src/main/scala/top/XiangShanStage.scala:38-47</code>의 PhaseManager targets다.</figcaption>
+  </figure>
+
+  <p><code>XiangShanStage</code>는 Chisel의 표준 단계 사이에 XiangShan 전용 단계 하나를 끼워 넣는다. <code>PrintModuleName</code>은 로그와 assert 메시지에 들어간 Scala 객체 이름을 실제 인스턴스 경로(예: <code>SimTop.cpu...bpu.abtb.banks_3.writeBuffer</code>)로 바꾼다. 시뮬레이션 중 assert가 터졌을 때 "어느 모듈의 몇 번째 뱅크"인지 바로 읽을 수 있게 하려는 것이다.</p>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">B1 · PrintModuleName</span><h4>모듈 이름 치환은 CHIRRTL 직렬화보다 먼저</h4><span class="actor code">BUILD</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>optionalPrerequisiteOf = Seq(Dependency[AddSerializationAnnotations])</code>: 직렬화 단계가 회로 스냅샷을 찍기 전에 이 단계가 돈다</dd>
+      <dt>이유</dt><dd class="why">직렬화 단계가 먼저 돌면 <code>.fir</code>에 치환 전 이름이 남는다. 주석: "Without this ordering, the emitted FIRRTL keeps the raw module object names"</dd>
+      <dt>없으면</dt><dd>CHIRRTL을 직접 읽는 GSIM 흐름에서 assert 메시지가 <code>WriteBuffer@1c5c6fee</code>처럼 나와 위치를 찾을 수 없다. Verilog 흐름은 치환된 회로를 바로 쓰므로 영향이 없었다(커밋 18a20db32 본문).</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/transforms/PrintModuleName.scala:33-36@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="callout decision"><strong>2026-08-17 직렬화 전에 모듈 이름을 푼다 (#6361)</strong><p>두 단계 사이에 순서 제약이 없어서 PhaseManager가 어느 쪽을 먼저 고르느냐에 따라 CHIRRTL 내용이 달라졌다. 순서를 명시해 이 우연을 없앴다.</p></div>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">B2 · ArgParser --config</span><h4><code>--config</code>는 설정 전체를 갈아 끼운다</h4><span class="actor code">BUILD</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>case "--config" :: confString :: tail =&gt; nextOption(getConfigByName(confString), tail)</code>: 앞서 쌓인 변경을 버리고 새 Config에서 다시 시작한다</dd>
+      <dt>이유</dt><dd class="why">Config 클래스 이름 하나로 코어 전체 구성을 고르게 하려는 것이다. 나머지 옵션(<code>--num-cores</code>, <code>--l2-cache-size</code> 등)은 그 위에 <code>alter</code>로 덧칠한다.</dd>
+      <dt>없으면</dt><dd>순서 규칙을 모르면 <code>--num-cores 2 --config MinimalConfig</code>처럼 써서 코어 수 설정이 조용히 사라진다. Makefile은 그래서 항상 <code>--config</code>를 맨 앞에 둔다(Makefile:324, 338).</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/top/ArgParser.scala:85-86@09453ff8</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="sec-make">
+  <h2>make 목표 고르기: verilog, sim-verilog, emu</h2>
+  <p>같은 부엌에서 손님상과 시식용 접시를 따로 차리듯, XiangShan도 같은 소스에서 두 종류의 톱을 만든다. <strong>납품용</strong>은 칩이나 FPGA에 올릴 <code>XSTop</code>이고, <strong>검증용</strong>은 가상 메모리·UART·DiffTest 관측 포트를 붙인 <code>SimTop</code>이다. 어느 쪽을 만들지는 <code>make</code> 목표가 정한다. 처음 할 일은 서브모듈을 받는 것이다. 이 저장소의 9개 서브모듈(difftest, utility, ready-to-run, rocket-chip, XSCache 등)이 없으면 아무 목표도 끝까지 가지 않는다.</p>
+<pre class="cmd"><span class="c"># Makefile:368-371. 서브모듈 + rocket-chip의 cde/hardfloat + XSCache의 OpenNCB/ZhuJiang</span>
+make init</pre>
+  <p>목표 없이 <code>make</code>만 치면 <code>.DEFAULT_GOAL = verilog</code>(Makefile:298)가 돈다. 아래는 이 작업 사본에서 <code>NO_XSDEV_IMAGE=1 make -n verilog</code>가 출력한 명령 중 mill 줄만 줄인 것이다. 실제 출력에는 앞에 <code>mkdir -p build/rtl</code>과 <code>time -avp -o ./build/time.log</code> 접두어가, 뒤에 git 헤더를 붙이는 두 줄(Makefile:327-328)이 더 있다. 아래 탐색기는 이 줄들까지 보여 준다.</p>
+<pre class="cmd"><span class="c"># make verilog  →  build/rtl/XSTop.sv</span>
+mill -i -Djvm-xmx=40G -Djvm-xss=256m xiangshan.runMain top.TopMain \
+  --target-dir build/rtl --config DefaultConfig --issue E.b \
+  --num-cores 1 --target systemverilog --firtool-opt "-O=release --disable-annotation-unknown --lowering-options=explicitBitcast,disallowLocalVariables,disallowPortDeclSharing,locationInfoStyle=none" --split-verilog --dump-fir --llc OpenLLC --fpga-platform --reset-gen --firtool-opt --ignore-read-enable-mem --firtool-opt "--default-layer-specialization=disable"</pre>
+<pre class="cmd"><span class="c"># make sim-verilog  →  build/rtl/SimTop.sv (main 클래스와 끝부분만 다르다)</span>
+mill -i -Djvm-xmx=40G -Djvm-xss=256m xiangshan.test.runMain top.XiangShanSim \
+  --target-dir build/rtl --config DefaultConfig --issue E.b \
+  --num-cores 1 --target systemverilog --firtool-opt "-O=release ..." --split-verilog --dump-fir --llc OpenLLC --enable-difftest --firtool-opt "--default-layer-specialization=enable" --full-stacktrace
+sed -i -e 's/$fatal/xs_assert_v2(`__FILE__, `__LINE__)/g' ./build/rtl/*.sv
+sed -i -e "s/\$error(/\$fwrite(32\'h80000002, /g" ./build/rtl/*.sv</pre>
+<pre class="cmd"><span class="c"># make emu  →  sim-verilog 후 difftest 서브모듈의 Verilator 빌드 (Makefile:398-402)</span>
+make -C ./difftest emu-mk NUM_CORES=1 RTL_SUFFIX=sv RTL_INCLUDE=""
+make -C ./difftest emu NUM_CORES=1 RTL_SUFFIX=sv OBJCACHE=
+<span class="c"># README.md:135-136의 예시</span>
+make emu CONFIG=MinimalConfig EMU_THREADS=2 -j10
+./build/emu -b 0 -e 0 -i ./ready-to-run/coremark-2-iteration.bin --diff ./ready-to-run/riscv64-nemu-interpreter-so</pre>
+  <p>서브모듈 없이 <code>make -n emu</code>를 치면 sim-verilog 명령을 다 출력한 뒤 <code>make[1]: *** No rule to make target 'emu-mk'</code>에서 멈춘다. <code>difftest/</code> 디렉터리가 비어 있기 때문이다. <code>EMU_THREADS</code>는 최상위 Makefile에 정의가 없다. 명령행 변수라 sub-make로 넘어가 difftest의 <code>verilator.mk</code>가 쓰는 것으로 보인다(추론).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 268" role="img" aria-label="세 make 목표가 각각 어떤 main 클래스를 거쳐 어떤 산출물을 내는지">
+      <defs><marker id="m12-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="75" y="16" text-anchor="middle" class="lbl-dim">make 목표</text>
+      <text x="230" y="16" text-anchor="middle" class="lbl-dim">main 클래스</text>
+      <text x="385" y="16" text-anchor="middle" class="lbl-dim">산출물</text>
+      <rect class="box" x="10" y="28" width="130" height="56" rx="10"/><text x="75" y="61" text-anchor="middle" class="lbl-b">verilog</text>
+      <line class="ln" x1="140" y1="56" x2="163" y2="56" marker-end="url(#m12-2)"/>
+      <rect class="box-acc" x="165" y="28" width="130" height="56" rx="10"/><text x="230" y="52" text-anchor="middle" class="lbl-mono">top.TopMain</text><text x="230" y="72" text-anchor="middle" class="lbl-dim">릴리스 옵션</text>
+      <line class="ln" x1="295" y1="56" x2="318" y2="56" marker-end="url(#m12-2)"/>
+      <rect class="box-ok" x="320" y="28" width="130" height="56" rx="10"/><text x="385" y="52" text-anchor="middle" class="lbl-mono">XSTop.sv</text><text x="385" y="72" text-anchor="middle" class="lbl-dim">납품용 톱</text>
+      <rect class="box" x="10" y="110" width="130" height="56" rx="10"/><text x="75" y="143" text-anchor="middle" class="lbl-b">sim-verilog</text>
+      <line class="ln" x1="140" y1="138" x2="163" y2="138" marker-end="url(#m12-2)"/>
+      <rect class="box-acc" x="165" y="110" width="130" height="56" rx="10"/><text x="230" y="134" text-anchor="middle" class="lbl-mono">XiangShanSim</text><text x="230" y="154" text-anchor="middle" class="lbl-dim">+ DiffTest 전체</text>
+      <line class="ln" x1="295" y1="138" x2="318" y2="138" marker-end="url(#m12-2)"/>
+      <rect class="box-ok" x="320" y="110" width="130" height="56" rx="10"/><text x="385" y="134" text-anchor="middle" class="lbl-mono">SimTop.sv</text><text x="385" y="154" text-anchor="middle" class="lbl-dim">검증용 톱</text>
+      <rect class="box" x="10" y="192" width="130" height="56" rx="10"/><text x="75" y="225" text-anchor="middle" class="lbl-b">emu</text>
+      <path class="ln ln-dash" d="M75,192 L75,166" fill="none" marker-end="url(#m12-2)"/>
+      <text x="82" y="183" class="lbl-dim">먼저</text>
+      <line class="ln" x1="140" y1="220" x2="163" y2="220" marker-end="url(#m12-2)"/>
+      <rect class="box-2" x="165" y="192" width="130" height="56" rx="10"/><text x="230" y="216" text-anchor="middle" class="lbl-mono">difftest/</text><text x="230" y="236" text-anchor="middle" class="lbl-dim">Verilator 빌드</text>
+      <line class="ln" x1="295" y1="220" x2="318" y2="220" marker-end="url(#m12-2)"/>
+      <rect class="box-ok" x="320" y="192" width="130" height="56" rx="10"/><text x="385" y="216" text-anchor="middle" class="lbl-mono">build/emu</text><text x="385" y="236" text-anchor="middle" class="lbl-dim">C++ 시뮬레이터</text>
+    </svg>
+    <figcaption><code>emu</code>는 <code>sim-verilog</code>를 먼저 부르고 그 결과를 difftest 서브모듈에 넘긴다. <code>verilog</code>의 결과는 시뮬레이션 경로에 쓰이지 않는다. 근거: Makefile:321-339, 398-402.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <tr><th>목표</th><th>Chisel 타깃</th><th>디버그/릴리스</th><th>후처리</th><th>근거</th></tr>
+    <tr><td><code>verilog</code></td><td>systemverilog</td><td>기본 릴리스 (<code>FPGA=1</code>이면 디버그)</td><td>git 헤더</td><td>Makefile:279-284, 321-331</td></tr>
+    <tr><td><code>sim-verilog</code></td><td>systemverilog</td><td>기본 디버그 (<code>RELEASE=1</code>이면 릴리스)</td><td>git 헤더, <code>$fatal</code>·<code>$error</code> 치환</td><td>Makefile:266-270, 333-356</td></tr>
+    <tr><td><code>sim-chirrtl</code></td><td>chirrtl</td><td>sim-verilog와 같음</td><td>없음 (firtool 안 돎)</td><td>Makefile:83-98, 359</td></tr>
+    <tr><td><code>emu</code></td><td>systemverilog</td><td>sim-verilog와 같음</td><td>+ Verilator 빌드</td><td>Makefile:398-402</td></tr>
+    <tr><td><code>gsim</code></td><td>chirrtl</td><td>sim-verilog와 같음</td><td>GSIM이 <code>.fir</code>을 직접 읽음</td><td>Makefile:404-405</td></tr>
+  </table></div>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">B3 · MAKECMDGOALS</span><h4>목표는 한 번에 하나</h4><span class="actor code">MAKE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>MAKECMDGOALS</code>에 공백이 있으면 <code>$(error At most one target can be specified)</code></dd>
+      <dt>이유</dt><dd class="why">목표 이름이 Chisel 타깃(<code>CHISEL_TARGET</code>)과 IOMMU 사용 여부를 정한다(Makefile:79-89). 목표가 섞이면 이 설정이 하나로 정해지지 않는다(추론).</dd>
+      <dt>없으면</dt><dd><code>make sim-chirrtl emu</code>처럼 서로 다른 RTL 형식을 요구하는 목표가 한 번에 돌아 산출물이 엇갈린다(추론). 실제로 <code>make -n sim-verilog emu</code>는 <code>Makefile:70: *** At most one target can be specified.  Stop.</code>을 낸다.</dd>
+      <dt>근거</dt><dd class="src">Makefile:69-71@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">B4 · TOPMAIN_ARGS</span><h4><code>make verilog</code>는 기본이 릴리스 옵션</h4><span class="actor code">MAKE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>PLDM</code>이나 <code>FPGA</code>가 1이면 <code>DEBUG_ARGS</code>, 아니면 <code>RELEASE_ARGS</code>(<code>--fpga-platform --reset-gen ... --default-layer-specialization=disable</code>)</dd>
+      <dt>이유</dt><dd class="why"><code>XSTop</code>은 납품용이다. 시뮬레이션 전용 장치(DPI-C, 로그)를 빼고 리셋 생성기를 넣은 형태가 기본이어야 한다.</dd>
+      <dt>없으면</dt><dd>납품 RTL에 <code>--enable-difftest</code>의 전체 관측 포트가 섞인다. 반대로 <code>TOPMAIN_ARGS</code>에는 <code>SIM_ARGS</code>가 없어서 <code>make verilog WITH_CHISELDB=1</code>을 쳐도 <code>--with-chiseldb</code>는 전달되지 않는다(<code>make -n</code>으로 확인).</dd>
+      <dt>근거</dt><dd class="src">Makefile:260, 279-284@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">B5 · ISSUE / LLC / IOMMU</span><h4>조합이 맞지 않으면 make가 바로 멈춘다</h4><span class="actor code">MAKE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>ISSUE</code>는 B, C, E.b 중 하나. <code>LLC</code>는 OpenLLC나 ZhuJiang이고 ZhuJiang은 <code>ISSUE=E.b</code>만. <code>WITH_IOMMU=1</code>은 <code>CONFIG=DefaultConfig</code>만</dd>
+      <dt>이유</dt><dd class="why">긴 정교화(수 분)를 시작하기 전에 지원하지 않는 조합을 거른다.</dd>
+      <dt>없으면</dt><dd>Scala 쪽에서 한참 뒤에 실패하거나, 지원하지 않는 CHI 버전으로 RTL이 만들어진다(추론).</dd>
+      <dt>근거</dt><dd class="src">Makefile:52-67, 205-213@09453ff8</dd>
+    </dl>
+  </div>
+  <p>한 가지 더: <code>verilog</code>, <code>sim-verilog</code>, <code>emu</code>는 모두 <code>$(call docker-deps, ...)</code>로 감싸여 있다. 로컬에 <code>ghcr.io/openxiangshan/xsdev:&lt;브랜치&gt;</code> 이미지가 있으면 목표를 그 컨테이너 안에서 돌리고, 없으면 그냥 로컬에서 돈다(scripts/Makefile.docker:21-23, 97).</p>
+  <div class="callout decision"><strong>2026-08-20 GSIM용으로는 CHIRRTL만 만든다 (#6374)</strong><p>이전에는 <code>make gsim</code>이 sim-verilog 전체를 돌렸다. 커밋 본문의 MinimalConfig 측정에 따르면 정교화와 <code>.fir</code> 쓰기가 약 1분 20초, firtool과 분할 Verilog가 약 3분이었고, GSIM은 <code>.fir</code>만 읽으므로 2053개 <code>.sv/.v</code> 파일이 매번 버려졌다. 그래서 <code>sim-chirrtl</code> 목표와 <code>CHISEL_TARGET</code> 분기가 생겼다.</p></div>
+
+  <div class="sim" id="sim-build">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>빌드 흐름 탐색기</h3></div>
+    <div class="sim-body">
+      <div class="btn-row" id="bf-goals"><button class="btn primary" data-g="verilog">verilog</button><button class="btn" data-g="sim-verilog">sim-verilog</button><button class="btn" data-g="sim-chirrtl">sim-chirrtl</button><button class="btn" data-g="emu">emu</button><button class="btn" data-g="gsim">gsim</button></div>
+      <div class="flags">
+        <label><input type="checkbox" data-k="release"> RELEASE=1</label>
+        <label><input type="checkbox" data-k="fpga"> FPGA=1</label>
+        <label><input type="checkbox" data-k="chiseldb"> WITH_CHISELDB=1</label>
+        <label><input type="checkbox" data-k="constantin"> WITH_CONSTANTIN=1</label>
+        <label>CONFIG <select data-k="config"><option>DefaultConfig</option><option>MinimalConfig</option></select></label>
+      </div>
+      <div class="ctl"><label>NUM_CORES <output data-for="cores" data-fmt="int"></output></label><input type="range" data-k="cores" min="1" max="4" step="1" value="1"></div>
+      <pre class="cmd" id="bf-cmd"></pre>
+      <div class="btn-row" id="bf-steps"></div>
+      <div class="detail" id="bf-detail"></div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>톱 모듈</span><b id="bf-top">-</b></div>
+      <div class="ro"><span>최종 산출물</span><b id="bf-out" class="acc">-</b></div>
+      <div class="ro"><span>DiffTest 포트</span><b id="bf-dt">-</b></div>
+      <div class="ro"><span>firtool 실행</span><b id="bf-ft">-</b></div>
+    </div>
+    <div class="verdict grey" id="bf-verdict">목표를 고르면 Makefile 규칙대로 명령을 조립한다</div>
+    <div class="sim-note">① <code>verilog</code>와 <code>sim-verilog</code>를 번갈아 눌러 명령 끝부분(<code>--fpga-platform --reset-gen</code> 대 <code>--enable-difftest</code>)이 어떻게 바뀌는지 보세요. ② <code>verilog</code>에서 WITH_CHISELDB를 켜 보세요. 명령에 아무 변화가 없는 이유는 B4 게이트에 있다. ③ <code>gsim</code>을 고르고 단계 단추 중 어느 것이 "건너뜀"이 되는지 보세요. 명령 조립 규칙은 Makefile:114-120, 197-284를 그대로 옮겼고 <code>make -n</code> 출력과 대조했다.</div>
+  </div>
+</section>
+
+<section id="sec-difftest">
+  <h2>DiffTest: 정답지와 나란히 달리기</h2>
+  <p>시험 답안을 채점하는 가장 확실한 방법은 정답지를 옆에 펴 놓고 한 문제씩 맞춰 보는 것이다. 마지막 점수만 보면 어디서 틀렸는지 모르지만, 한 문제씩 맞춰 보면 첫 오답에서 바로 멈출 수 있다. CPU 검증도 같다. 프로그램이 끝까지 돌았는지만 보면, 수십억 사이클 중 어디서 상태가 틀어졌는지 찾을 길이 없다.</p>
+  <p><span class="term" data-def="검증 대상 설계와 ISA만 정확히 구현한 참조 모델을 동시에 돌리며, 대상이 명령어를 커밋할 때마다 참조 모델도 같은 수만큼 실행해 아키텍처 상태를 비교하는 기법.">DiffTest<span class="en">lockstep co-simulation</span></span>는 이 방식을 쓴다. 검증 대상(<span class="term" data-def="Design Under Test. 여기서는 XiangShan RTL.">DUT</span>)이 명령어를 <a href="ch08-rob-redirect.html">커밋</a>할 때마다, 타이밍 없이 명령어 의미만 구현한 <span class="term" data-def="ISA 동작만 정확히 구현한 소프트웨어 시뮬레이터. XiangShan은 NEMU(기본)와 Spike를 공유 라이브러리(.so)로 연결한다.">참조 모델<span class="en">REF</span></span>도 같은 수만큼 명령어를 실행하고 PC·레지스터·CSR·메모리 쓰기를 비교한다. 비교는 커밋 시점에만 한다. 비순차 코어 안에서는 명령어가 제멋대로 순서로 실행되지만, 아키텍처 상태가 의미를 갖는 것은 프로그램 순서대로 확정되는 커밋 순간뿐이기 때문이다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 262" role="img" aria-label="DUT의 8개 커밋 슬롯 정보와 참조 모델의 실행 결과를 C++ 비교기가 대조하는 구조">
+      <defs><marker id="m12-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-acc" x="10" y="16" width="200" height="104" rx="12"/>
+      <text x="110" y="40" text-anchor="middle" class="lbl-b">XiangShan RTL (DUT)</text>
+      <text x="110" y="60" text-anchor="middle" class="lbl-dim">ROB 커밋 슬롯 ×8</text>
+      <g class="lbl-mono">
+        <rect class="box-ok" x="24" y="74" width="18" height="18" rx="3"/><rect class="box-ok" x="46" y="74" width="18" height="18" rx="3"/><rect class="box-ok" x="68" y="74" width="18" height="18" rx="3"/><rect class="box" x="90" y="74" width="18" height="18" rx="3"/>
+        <rect class="box" x="112" y="74" width="18" height="18" rx="3"/><rect class="box" x="134" y="74" width="18" height="18" rx="3"/><rect class="box" x="156" y="74" width="18" height="18" rx="3"/><rect class="box" x="178" y="74" width="18" height="18" rx="3"/>
+      </g>
+      <text x="110" y="110" text-anchor="middle" class="lbl-mono">DifftestModule(...)</text>
+      <rect class="box-2" x="250" y="16" width="200" height="104" rx="12"/>
+      <text x="350" y="40" text-anchor="middle" class="lbl-b">참조 모델 (NEMU .so)</text>
+      <text x="350" y="62" text-anchor="middle" class="lbl-dim">타이밍 없는 ISA 실행</text>
+      <text x="350" y="86" text-anchor="middle" class="lbl-mono">step(nFused+1)</text>
+      <text x="350" y="106" text-anchor="middle" class="lbl-dim">슬롯마다 (추론)</text>
+      <rect class="box-code" x="100" y="160" width="260" height="56" rx="12"/>
+      <text x="230" y="184" text-anchor="middle" class="lbl-b">C++ 비교기 (difftest/)</text>
+      <text x="230" y="204" text-anchor="middle" class="lbl-dim">PC · 레지스터 · CSR · store</text>
+      <path class="ln" d="M110,120 L110,140 L180,140 L180,158" fill="none" marker-end="url(#m12-3)"/>
+      <text x="16" y="146" class="lbl-dim">커밋 정보 delay 3</text>
+      <path class="ln" d="M350,120 L350,140 L280,140 L280,158" fill="none" marker-end="url(#m12-3)"/>
+      <text x="444" y="146" text-anchor="end" class="lbl-dim">REF 상태</text>
+      <text x="230" y="240" text-anchor="middle" class="lbl-acc2">일치 → 다음 사이클</text>
+      <text x="230" y="258" text-anchor="middle" class="lbl-bad">불일치 → 그 자리에서 중단</text>
+    </svg>
+    <figcaption>하드웨어 쪽은 "관측 포트"(<code>DifftestModule</code>)만 심고, 비교와 참조 모델 구동은 C++ 쪽이 한다. 포트 쪽은 <code>Rob.scala:1743</code>에서 확인했고, C++ 비교기 내부는 difftest 서브모듈이라 (추론)이다.</figcaption>
+  </figure>
+
+  <p>XiangShan 본체에는 <code>DifftestModule(</code> 호출이 41곳 있다(<code>grep -rn "DifftestModule(" src/main/scala</code> 42줄 중 주석 1줄 제외). 신입이 먼저 알아야 할 것은 아래 여섯 종류다. <code>delay</code>는 신호를 몇 사이클 늦춰 내보내는지를 뜻하는 인자다. 정확한 의미는 difftest 쪽 구현이라 (추론)이다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>포트</th><th>위치</th><th class="num">delay</th><th>무엇을 내보내나</th></tr>
+    <tr><td><code>DiffInstrCommit</code> ×8</td><td>backend/rob/Rob.scala:1743</td><td class="num">3</td><td>valid, skip, rfwen, wdest, wpdest, nFused, (full이면) pc, instr</td></tr>
+    <tr><td><code>DiffTrapEvent</code></td><td>Rob.scala:1808</td><td class="num">지정 없음</td><td>hasTrap, cycleCnt, instrCnt, (full이면) code, pc</td></tr>
+    <tr><td><code>DiffArchIntRenameTable</code></td><td>backend/rename/RenameTable.scala:243</td><td class="num">2</td><td>아키텍처 레지스터 → 물리 레지스터 매핑</td></tr>
+    <tr><td><code>DiffPhyIntRegState</code></td><td>backend/datapath/DataPath.scala:365</td><td class="num">2</td><td>정수 물리 레지스터 파일 전체 값</td></tr>
+    <tr><td><code>DiffStoreEvent</code></td><td>mem/sbuffer/Sbuffer.scala:940</td><td class="num">2</td><td>커밋된 store의 주소, 데이터, 마스크</td></tr>
+    <tr><td><code>DiffArchEvent</code></td><td>backend/fu/NewCSR/NewCSR.scala:1678</td><td class="num">3</td><td>인터럽트·예외 번호, exceptionPC</td></tr>
+  </table></div>
+
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">D1 · AlwaysBasicDiff</span><h4>기본 DiffTest 포트는 납품 빌드에도 들어간다</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>if (env.EnableDifftest || env.AlwaysBasicDiff)</code>. <code>AlwaysBasicDiff</code> 기본값은 <code>true</code>. pc, instr 같은 "full" 필드는 <code>EnableDifftest || FullBasicDiff</code>일 때만</dd>
+      <dt>이유</dt><dd class="why">주석은 "used by difftest only and should be optimized after synthesis"라고 쓴다. FPGA나 실리콘에서도 최소한의 커밋 비교를 할 수 있게 하려는 것으로 보인다(추론).</dd>
+      <dt>없으면</dt><dd>FPGA 위에서 돌다 이상해진 칩을 정답 모델과 대조할 수단이 없어진다(추론). 끄려면 <code>--disable-always-basic-diff</code>(ArgParser.scala:141-144).</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:1715-1717@09453ff8, src/main/scala/xiangshan/Parameters.scala:617@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">D2 · DiffInstrCommit.valid</span><h4>진짜 커밋일 때만 비교한다</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>difftest.valid := io.commits.commitValid(i) &amp;&amp; io.commits.isCommit</code></dd>
+      <dt>이유</dt><dd class="why">ROB는 분기 오예측 뒤 복구할 때 같은 커밋 포트로 <a href="ch08-rob-redirect.html">walk</a>를 한다. walk 중인 슬롯은 아키텍처 상태를 바꾸지 않는다.</dd>
+      <dt>없으면</dt><dd>버려지는 잘못된 경로의 명령어까지 참조 모델이 실행해, 정상 동작에서도 불일치가 난다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:1747@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">D3 · skip</span><h4>MMIO·비캐시 IO·성능 카운터 결과는 비교하지 않는다</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>dt_skip = Mux(eliminatedMove, false.B, exuOut.isSkipDiff)</code>, <code>isSkipDiff = isMMIO || isNCIO || isPerfCnt</code></dd>
+      <dt>이유</dt><dd class="why">UART 같은 장치 레지스터 값이나 <code>mcycle</code> 같은 카운터 값은 DUT의 타이밍에 달려 있다. 타이밍이 없는 참조 모델은 그 값을 알 수 없다. 이때 참조 모델이 DUT 값을 받아 자기 레지스터에 덮어쓰는 것으로 보인다(추론, difftest 쪽).</dd>
+      <dt>없으면</dt><dd>장치를 읽는 첫 명령어에서 멀쩡한 코어가 불일치로 멈춘다. 아래 시뮬레이터의 "skip 끄기"가 이 경우다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:1744@09453ff8, src/main/scala/xiangshan/Bundle.scala:306@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">D4 · rfwen / nFused</span><h4>x0 쓰기는 무시하고, 융합 슬롯은 여러 명령어로 센다</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>rfwen := commitValid(i) &amp;&amp; rfWen &amp;&amp; ldest =/= 0</code>. <code>nFused := instrSize - 1</code>, valid면 <code>assert(instrSize &gt;= 1)</code></dd>
+      <dt>이유</dt><dd class="why">x0은 항상 0이라 쓰기가 의미 없다. <a href="ch05-decode-rename.html">명령어 융합</a>으로 두 명령어가 한 uop가 되면 커밋 슬롯 하나가 아키텍처 명령어 여러 개를 뜻하므로, 참조 모델이 nFused+1개를 실행해야 PC가 맞는다(추론).</dd>
+      <dt>없으면</dt><dd>융합된 슬롯 뒤부터 참조 모델이 한 명령어씩 뒤처져 PC와 값이 계속 어긋난다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:1750, 1769-1772@09453ff8</dd>
+    </dl>
+  </div>
+
+  <p>레지스터 값은 어떻게 비교할까? DUT 안에는 "a0 레지스터"라는 칸이 따로 없다. <a href="ch05-decode-rename.html">리네이밍</a> 때문에 a0의 값은 <em>RAT가 가리키는 물리 레지스터</em>에 있다. 그래서 DUT는 아키텍처 RAT와 물리 레지스터 파일 전체를 따로 내보내고, C++ 쪽이 <code>PRF[RAT[a0]]</code>로 다시 맞춘다(추론: 재구성 코드는 difftest). 두 사진이 같은 순간에 찍혀야 이 조합이 맞는다.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 214" role="img" aria-label="RAT와 물리 레지스터 파일을 같은 사이클에 찍어야 PRF[RAT[x]]가 맞는다는 시간축 그림">
+      <defs><marker id="m12-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <line class="ln" x1="120" y1="30" x2="450" y2="30" marker-end="url(#m12-4)"/>
+      <text x="160" y="22" text-anchor="middle" class="lbl-mono">t-3</text><text x="240" y="22" text-anchor="middle" class="lbl-mono">t-2</text><text x="320" y="22" text-anchor="middle" class="lbl-mono">t-1</text><text x="400" y="22" text-anchor="middle" class="lbl-mono">t</text>
+      <text x="10" y="64" class="lbl">RAT 사진</text><text x="10" y="80" class="lbl-mono">delay 2</text>
+      <circle cx="240" cy="68" r="9" class="box-acc"/>
+      <line class="ln ln-dash" x1="249" y1="68" x2="392" y2="68" marker-end="url(#m12-4)"/>
+      <text x="10" y="114" class="lbl">물리 RF 사진</text><text x="10" y="130" class="lbl-mono">delay 2</text>
+      <circle cx="240" cy="118" r="9" class="box-acc"/>
+      <line class="ln ln-dash" x1="249" y1="118" x2="392" y2="118" marker-end="url(#m12-4)"/>
+      <text x="10" y="164" class="lbl-bad">RF가 delay 3이면</text>
+      <circle cx="160" cy="160" r="9" class="box-bad"/>
+      <line class="ln ln-dash" x1="169" y1="160" x2="392" y2="160" marker-end="url(#m12-4)"/>
+      <text x="408" y="96" class="lbl-acc2">일치</text>
+      <text x="408" y="164" class="lbl-bad">어긋남</text>
+      <text x="240" y="200" text-anchor="middle" class="lbl-dim">같은 순간의 매핑과 값이어야 PRF[RAT[x]]가 맞다</text>
+    </svg>
+    <figcaption>두 포트 모두 <code>delay = 2</code>이고 서로를 가리키는 주석이 붙어 있다. "Delay of RenameTable should be same as PhyRegFile"(RenameTable.scala:242), "Delay of PhyRegFile should be same as RenameTable"(DataPath.scala:364). 커밋 정보가 왜 3인지는 코드에 설명이 없다.</figcaption>
+  </figure>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">D5 · RAT·RF delay</span><h4>매핑과 값은 같은 사이클의 사진이어야 한다</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>DiffArchIntRenameTable(..., delay = 2)</code>와 <code>DiffPhyIntRegState(..., delay = 2)</code></dd>
+      <dt>이유</dt><dd class="why">RAT는 t-2의 매핑인데 RF는 t-3의 값이면, 방금 새로 매핑된 물리 레지스터에 아직 값이 안 들어간 사진을 읽게 된다(추론: 코드는 "Delay of RenameTable should be same as PhyRegFile"이라고만 적는다).</dd>
+      <dt>없으면</dt><dd>설계에 버그가 없는데도 레지스터 값 불일치가 보고된다. 아래 시뮬레이터의 "RF delay 3"이 이 경우다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rename/RenameTable.scala:242-243@09453ff8, src/main/scala/xiangshan/backend/datapath/DataPath.scala:364-365@09453ff8</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-diff">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>DiffTest 불일치 찾기</h3></div>
+    <div class="sim-body">
+      <div class="btn-row" id="dt-scn"><button class="btn primary">정상</button><button class="btn">ALU 버그 (add +1)</button><button class="btn">skip 끄기</button><button class="btn">RF delay 3</button><button class="btn">nFused 무시</button><button class="btn">a0=1로 종료</button></div>
+      <div class="btn-row"><button class="btn primary" id="dt-step">한 사이클</button><button class="btn" id="dt-reset">처음으로</button></div>
+      <div class="table-wrap"><table class="data dt-table">
+        <thead><tr><th>사이클</th><th>슬롯</th><th>PC</th><th>명령어</th><th>DUT</th><th>REF</th><th>판정</th></tr></thead>
+        <tbody id="dt-body"></tbody>
+      </table></div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>사이클</span><b id="dt-cyc">0 / 4</b></div>
+      <div class="ro"><span>비교한 슬롯</span><b id="dt-cmp">0</b></div>
+      <div class="ro"><span>skip한 슬롯</span><b id="dt-skip">0</b></div>
+      <div class="ro"><span>REF가 실행한 명령어</span><b id="dt-ref" class="acc">0</b></div>
+    </div>
+    <div class="verdict grey" id="dt-verdict">시나리오를 고르면 끝까지 돌린 결과가 보인다. 처음으로를 누르고 한 사이클씩 다시 볼 수 있다.</div>
+    <div class="sim-note">① "ALU 버그"를 고르고 몇 번째 사이클, 몇 번 슬롯에서 멈추는지 보세요. 나머지 명령어는 아예 비교되지 않는다. ② "skip 끄기"는 UART 읽기(MMIO)에서 멈춘다. 코어는 멀쩡한데도 그렇다. 왜 그런지는 D3 게이트. ③ "RF delay 3"은 설계 버그 없이 첫 슬롯부터 어긋난다(D5). 프로그램, 사이클별 커밋 묶음, 장치 값은 합성 데이터이고, 슬롯 규칙(valid·skip·rfwen·nFused, 8슬롯, TRAP 코드)은 Rob.scala:1743-1820을 따른다. REF 쪽 동작은 (추론)이다.</div>
+  </div>
+</section>
+
+<section id="sec-trap">
+  <h2>시뮬레이션을 끝내는 법: TRAP 0x6b</h2>
+  <p>시뮬레이터는 프로그램이 "끝났다"는 것을 어떻게 알까? 실제 칩에는 끝이 없다. 운영체제가 계속 돈다. 그래서 테스트 프로그램은 마지막에 약속된 특수 명령어 하나를 실행해 "여기서 멈추고 이 값을 결과로 보라"고 알린다. XiangShan은 RISC-V 표준 명령어가 쓰지 않는 opcode <code>0x6b</code>를 이 용도로 쓴다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 176" role="img" aria-label="TRAP 명령어 32비트 필드 배치: imm 0, rs1 자유, funct3 000, rd 00000, opcode 1101011">
+      <rect class="box" x="10" y="40" width="165" height="54" rx="4"/><text x="92" y="64" text-anchor="middle" class="lbl-b">imm = 0</text><text x="92" y="84" text-anchor="middle" class="lbl-mono">000000000000</text>
+      <rect class="box-acc" x="175" y="40" width="69" height="54" rx="4"/><text x="209" y="64" text-anchor="middle" class="lbl-b">rs1</text><text x="209" y="84" text-anchor="middle" class="lbl-mono">?????</text>
+      <rect class="box" x="244" y="40" width="41" height="54" rx="4"/><text x="264" y="64" text-anchor="middle" class="lbl-b">f3</text><text x="264" y="84" text-anchor="middle" class="lbl-mono">000</text>
+      <rect class="box" x="285" y="40" width="69" height="54" rx="4"/><text x="319" y="64" text-anchor="middle" class="lbl-b">rd</text><text x="319" y="84" text-anchor="middle" class="lbl-mono">00000</text>
+      <rect class="box-2" x="354" y="40" width="96" height="54" rx="4"/><text x="402" y="64" text-anchor="middle" class="lbl-b">opcode</text><text x="402" y="84" text-anchor="middle" class="lbl-mono">1101011</text>
+      <text x="10" y="30" class="lbl-mono">31</text><text x="175" y="30" class="lbl-mono">19</text><text x="244" y="30" class="lbl-mono">14</text><text x="285" y="30" class="lbl-mono">11</text><text x="354" y="30" class="lbl-mono">6</text><text x="450" y="30" text-anchor="end" class="lbl-mono">0</text>
+      <text x="209" y="122" text-anchor="middle" class="lbl-acc">결과 코드를 담은 레지스터</text>
+      <text x="402" y="122" text-anchor="middle" class="lbl-acc2">= 0x6b</text>
+      <text x="230" y="160" text-anchor="middle" class="lbl-dim">디코드: ALUOpType.xstrap → isXSTrap</text>
+    </svg>
+    <figcaption><code>TRAP = BitPat("b000000000000?????000000001101011")</code>. rs1 자리만 자유롭다. 근거: <code>src/main/scala/xiangshan/backend/decode/isa/CustomInstructions.scala:10</code>, <code>backend/Bundles.scala:336</code>.</figcaption>
+  </figure>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">D6 · DiffTrapEvent</span><h4>커밋 슬롯 중 하나라도 TRAP이면 종료를 알린다</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>trapVec(i) = isCommit &amp;&amp; commitValid(i) &amp;&amp; isXSTrap</code>, <code>hasTrap = trapVec.reduce(_ || _)</code>. 코드는 그 슬롯의 결과 데이터 <code>wdata</code>, 사이클 수 <code>timer</code>, 명령어 수 <code>instrCnt</code>를 함께 보낸다</dd>
+      <dt>이유</dt><dd class="why">종료 지점과 결과 코드, 그리고 IPC 계산에 필요한 두 숫자를 한 번에 넘긴다. emu는 코드가 0이면 <code>HIT GOOD TRAP</code>, 아니면 BAD TRAP을 출력하는 것으로 보인다(추론: <code>debug/cputest.sh:25</code>가 <code>HIT GOOD TRAP|IPC</code>를 grep한다).</dd>
+      <dt>없으면</dt><dd>시뮬레이터가 프로그램 끝을 몰라 최대 사이클까지 헛돈다. 테스트 성공·실패도 출력 텍스트를 사람이 읽어 판단해야 한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:1803-1820@09453ff8</dd>
+    </dl>
+  </div>
+  <p>관례상 테스트 프로그램은 a0 레지스터에 결과를 담고 <code>rs1 = a0</code>로 TRAP을 실행한다(추론: AM 런타임은 서브모듈 밖). 실제 실행은 대개 <code>scripts/xiangshan.py</code>를 거친다. CI는 전부 이 래퍼를 쓴다(.github/workflows/emu-basics.yml:57-60). 래퍼가 최종적으로 만드는 명령은 다음 형태다.</p>
+<pre class="cmd"><span class="c"># scripts/xiangshan.py:305 (빈 옵션은 생략)</span>
+ulimit -s 32768; $NOOP_HOME/build/emu -i &lt;workload&gt; --diff ./ready-to-run/riscv64-nemu-interpreter-so [--max-instr N] [-r &lt;gcpt_restore_bin&gt;] [--no-diff] [--enable-fork] [--dump-db]</pre>
+  <p>SPEC 같은 긴 프로그램은 처음부터 돌리지 않는다. NEMU가 만든 <span class="term" data-def="긴 프로그램의 특정 시점 아키텍처 상태(메모리+레지스터) 스냅샷. XiangShan은 .gz/.zstd 파일과 gcpt restorer 바이너리(-r)로 복원한다.">체크포인트<span class="en">checkpoint</span></span>(<code>.gz</code>, <code>.zstd</code>, xiangshan.py:43-47)에서 시작해 정해진 명령어 수만 돌리고, 대표 구간의 가중 평균으로 전체 성능을 추정한다. top-down 스크립트는 구간 길이를 2천만 명령어로 둔다(<code>icount = 20 * 10 ** 6</code>, scripts/top-down/draw.py:16).</p>
+</section>
+
+<section id="sec-topdown">
+  <h2>TopDown: 빈 슬롯마다 책임자를 붙인다</h2>
+  <p>여덟 칸짜리 컨베이어 벨트를 생각해 보자. 매 사이클 벨트에는 여덟 개의 자리가 지나간다. 자리에 상자가 실리면 일을 한 것이고, 빈 채로 지나가면 손실이다. 손실을 줄이려면 "왜 비었는가"를 자리마다 적어 두어야 한다. 그래야 "빈자리의 40%는 메모리 대기, 20%는 분기 예측 실패" 같은 결론이 나온다.</p>
+  <p>KMHv3는 dispatch 단계에서 매 사이클 <code>RenameWidth = 8</code>개 슬롯(Parameters.scala:82) 각각에 <span class="term" data-def="xiangshan/package.scala의 TopDownCounters 열거형. NoStall을 포함해 76개 사유와 개수 표지 NumStallReasons로 이루어진다.">정지 사유<span class="en">stall reason</span></span>를 하나씩 붙인다. 사유는 <code>TopDownCounters</code> 열거형의 76가지다(xiangshan/package.scala:817-915, 주석 처리된 1줄을 빼고 <code>Value(</code> 77개 중 마지막 <code>NumStallReasons</code> 제외). 사유 하나를 7비트(<code>log2Ceil(76)</code>)로 실어 나른다(Bundle.scala:821).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 300" role="img" aria-label="슬롯 하나의 사유를 고르는 다섯 단계 우선순위 사다리와 기본값">
+      <defs><marker id="m12-6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="16" class="lbl-dim">위에서부터 처음 참인 줄이 이긴다</text>
+      <rect class="box-ok" x="10" y="26" width="262" height="36" rx="8"/><text x="22" y="49" class="lbl">① 이 슬롯이 dispatch됨 (fire)</text>
+      <line class="ln" x1="272" y1="44" x2="296" y2="44" marker-end="url(#m12-6)"/><text x="302" y="49" class="lbl-mono">NoStall (Base)</text>
+      <rect class="box" x="10" y="72" width="262" height="36" rx="8"/><text x="22" y="95" class="lbl">② 앞 단계가 사유를 들고 멈춤</text>
+      <line class="ln" x1="272" y1="90" x2="296" y2="90" marker-end="url(#m12-6)"/><text x="302" y="95" class="lbl-mono">앞 단계 사유</text>
+      <rect class="box" x="10" y="118" width="262" height="36" rx="8"/><text x="22" y="141" class="lbl">③ dispatch 자신이 멈춤·버블</text>
+      <line class="ln" x1="272" y1="136" x2="296" y2="136" marker-end="url(#m12-6)"/><text x="302" y="141" class="lbl-mono">dispatch 사유</text>
+      <rect class="box" x="10" y="164" width="262" height="36" rx="8"/><text x="22" y="187" class="lbl">④ 앞 단계 버블, 이 슬롯 빔</text>
+      <line class="ln" x1="272" y1="182" x2="296" y2="182" marker-end="url(#m12-6)"/><text x="302" y="187" class="lbl-mono">앞 단계 버블 사유</text>
+      <rect class="box" x="10" y="210" width="262" height="36" rx="8"/><text x="22" y="233" class="lbl">⑤ 이 슬롯에 저장된 버블</text>
+      <line class="ln" x1="272" y1="228" x2="296" y2="228" marker-end="url(#m12-6)"/><text x="302" y="233" class="lbl-mono">저장된 사유</text>
+      <rect class="box-grey" x="10" y="256" width="262" height="36" rx="8"/><text x="22" y="279" class="lbl-dim">그 밖</text>
+      <line class="ln" x1="272" y1="274" x2="296" y2="274" marker-end="url(#m12-6)"/><text x="302" y="279" class="lbl-mono">BackendOther…</text>
+    </svg>
+    <figcaption>슬롯마다 <code>MuxCase</code> 하나가 사유를 고른다. 기본값이 있으므로 모든 슬롯이 매 사이클 정확히 하나의 사유를 받는다. 근거: <code>backend/dispatch/Dispatch.scala:1254-1260</code>.</figcaption>
+  </figure>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">P1 · Dispatch stallReason</span><h4>슬롯 하나에 사유 하나, 우선순위대로</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>update := MuxCase(BackendOtherCoreStall, Seq(fire → NoStall, prePipeStall &amp;&amp; inReason≠NoStall → inReason, currentPipeStall → currentReason, prePipeBubbleRelease → inReason, currentPipeBubbleRelease → savedReason))</code></dd>
+      <dt>이유</dt><dd class="why">한 사이클에 여러 원인이 겹칠 수 있다. 우선순위를 고정해야 같은 빈자리가 두 번 세어지지 않는다. 앞 단계가 이미 이유를 들고 멈췄다면(②) dispatch 자신의 이유(③)보다 그것이 근본 원인이라고 보는 설계로 읽힌다(추론: 코드에 이유를 적은 주석은 없다).</dd>
+      <dt>없으면</dt><dd>원인별 카운터의 합이 전체 슬롯 수와 맞지 않아 CPI를 원인별로 나눌 수 없다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/dispatch/Dispatch.scala:1254-1263@09453ff8</dd>
+    </dl>
+  </div>
+  <p>카운터는 사유마다 <code>XSPerfAccumulate(name, PopCount(stallReason === id), XSPerfLevel.CRITICAL)</code>로 쌓인다(Dispatch.scala:1263). 슬롯마다 사유가 정확히 하나이므로, 모든 카운터의 합은 <em>사이클 수 × 8</em>이 된다(MuxCase 기본값에서 이끈 추론. 스크립트는 이 합을 따로 검사하지 않는다). 76개 사유는 스크립트에서 11개 큰 묶음으로 합쳐진다(<code>xs_coarse_rename_map</code>, scripts/top-down/configs.py:175-273). 이 맵의 정지 사유 키 76개는 RTL 열거형과 정확히 같다(두 목록을 정렬해 <code>diff</code>로 확인). 맵에는 그 밖에 <code>commitInstr</code>, <code>total_cycles</code> 두 키가 더 있다(configs.py:271-272).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 300" role="img" aria-label="76개 정지 사유가 11개 대분류에 몇 개씩 들어가는지 막대 그래프">
+      <g class="lbl-mono">
+        <text x="150" y="30" text-anchor="end" class="lbl-mono">Core</text><rect class="box-acc" x="158" y="18" width="245" height="16" rx="3"/><text x="410" y="30" class="lbl-mono">35</text>
+        <text x="150" y="54" text-anchor="end" class="lbl-mono">BadSpec</text><rect class="box-bad" x="158" y="42" width="77" height="16" rx="3"/><text x="242" y="54" class="lbl-mono">11</text>
+        <text x="150" y="78" text-anchor="end" class="lbl-mono">Load</text><rect class="box-warn" x="158" y="66" width="63" height="16" rx="3"/><text x="228" y="78" class="lbl-mono">9</text>
+        <text x="150" y="102" text-anchor="end" class="lbl-mono">FreelistStall</text><rect class="box-grey" x="158" y="90" width="42" height="16" rx="3"/><text x="207" y="102" class="lbl-mono">6</text>
+        <text x="150" y="126" text-anchor="end" class="lbl-mono">Frontend</text><rect class="box-code" x="158" y="114" width="35" height="16" rx="3"/><text x="200" y="126" class="lbl-mono">5</text>
+        <text x="150" y="150" text-anchor="end" class="lbl-mono">Store</text><rect class="box-2" x="158" y="138" width="21" height="16" rx="3"/><text x="186" y="150" class="lbl-mono">3</text>
+        <text x="150" y="174" text-anchor="end" class="lbl-mono">CoreOther</text><rect class="box-grey" x="158" y="162" width="14" height="16" rx="3"/><text x="179" y="174" class="lbl-mono">2</text>
+        <text x="150" y="198" text-anchor="end" class="lbl-mono">Misc</text><rect class="box-grey" x="158" y="186" width="14" height="16" rx="3"/><text x="179" y="198" class="lbl-mono">2</text>
+        <text x="150" y="222" text-anchor="end" class="lbl-mono">BadSpecInst</text><rect class="box-bad" x="158" y="210" width="7" height="16" rx="2"/><text x="172" y="222" class="lbl-mono">1</text>
+        <text x="150" y="246" text-anchor="end" class="lbl-mono">Privileged</text><rect class="box-grey" x="158" y="234" width="7" height="16" rx="2"/><text x="172" y="246" class="lbl-mono">1</text>
+        <text x="150" y="270" text-anchor="end" class="lbl-mono">Base</text><rect class="box-ok" x="158" y="258" width="7" height="16" rx="2"/><text x="172" y="270" class="lbl-mono">1</text>
+      </g>
+      <text x="450" y="292" text-anchor="end" class="lbl-dim">합 76 (대분류 앞의 Merge 접두어 생략)</text>
+    </svg>
+    <figcaption>사유의 절반 가까이(35개)가 Core 묶음이다. 이슈 큐 가득 참, dispatch 정책, ROB 머리 미발행이 여기에 모인다. 개수는 <code>configs.py</code>의 맵을 그대로 세었다.</figcaption>
+  </figure>
+
+  <div class="sim" id="sim-slots">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>TopDown 슬롯 회계</h3></div>
+    <div class="sim-body">
+      <div class="btn-row"><button class="btn primary" id="sl-play">재생</button><button class="btn" id="sl-step">한 사이클</button><button class="btn" id="sl-reset">처음으로</button></div>
+      <div class="ctl"><label>진행 (드래그로 되감기) <output data-for="t" data-fmt="int"></output></label><input type="range" data-k="t" min="0" max="12" step="1" value="0"></div>
+      <div class="slots" id="sl-grid"></div>
+      <div class="stackbar" id="sl-bar"></div>
+      <div class="legend" id="sl-legend"></div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>사이클</span><b id="sl-cyc">0</b></div>
+      <div class="ro"><span>사유 붙은 슬롯 합</span><b id="sl-sum">0</b></div>
+      <div class="ro"><span>NoStall (진행)</span><b id="sl-base" class="ok">0</b></div>
+      <div class="ro"><span>가장 큰 손실 사유</span><b id="sl-top" class="acc">-</b></div>
+    </div>
+    <div class="verdict grey" id="sl-verdict">재생하면 사이클마다 8칸에 사유가 하나씩 붙는다</div>
+    <div class="sim-note">① 끝까지 재생하고 "사유 붙은 슬롯 합"이 항상 사이클 × 8인지 확인하세요. ② 8번째 사이클은 dispatch도 이슈 큐 때문에 막혔지만 사유는 IntFlStall이다. ②번 줄(앞 단계 정지)이 ③번 줄보다 위에 있기 때문이다(그림 12-6). ③ 9번째 사이클의 빈 두 칸은 아무 조건에도 걸리지 않아 기본값 BackendOtherCoreStall을 받는다. 사이클별 입력 신호는 합성 데이터이고, 슬롯마다 사유를 고르는 MuxCase와 대분류 맵은 Dispatch.scala:1254-1260, configs.py:175-273 그대로다. 설명은 이 절의 P1 게이트.</div>
+  </div>
+
+  <p>backend 쪽 정지 사유 중 상당수는 ROB 맨 앞 명령어를 보고 정한다(Rob.scala:1631-1700). 가장 오래된 명령어가 끝나지 않으면 커밋이 막히고, 막힌 커밋이 ROB·물리 레지스터·이슈 큐의 반환을 늦추기 때문이다. ROB 머리가 load라면 아래 사슬로 이름이 정해진다. 이름이 "기다리는 레벨"을 뜻한다는 점이 함정이다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">P2 · ldReason</span><h4>ROB 머리 load의 이름은 "지금 기다리는 곳"</h4><span class="actor code">RTL</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">l3Miss → <code>LoadMemStall</code>, l2Miss → <code>LoadL3Stall</code>, l1Miss → <code>LoadL2Stall</code>, 미발행 → <code>MemNotReadyStall</code>, TLB miss/replay → <code>LoadTLBStall</code>, MSHR replay → <code>LoadMSHRReplayStall</code>, 위반 replay → <code>LoadVioReplayStall</code>, 그 밖 <code>LoadL1Stall</code></dd>
+      <dt>이유</dt><dd class="why">L2에서 미스한 load는 L3의 응답을 기다린다. 손실의 책임은 미스가 난 곳이 아니라 응답을 줘야 하는 곳에 있다고 보는 명명이다.</dd>
+      <dt>없으면</dt><dd>이름을 "미스가 난 레벨"로 읽으면 L3 지연 문제를 L2 문제로 오진한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:1551-1559@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="sim" id="sim-ld">
+    <div class="sim-head"><span class="sim-tag predict">Predict</span><h3>ROB 머리 load에 붙는 이름</h3></div>
+    <div class="sim-body">
+      <p style="margin:0">ROB 맨 앞 load가 L1에서도, L2에서도 미스했고 L3에서는 히트할 예정이다. 이 load 때문에 빈 슬롯에 붙는 사유는? 먼저 고른 뒤 실행하세요.</p>
+      <div class="seg" id="ld-pick"><button class="on">LoadL2Stall</button><button>LoadL3Stall</button><button>LoadMemStall</button></div>
+      <div class="flags" id="ld-flags">
+        <label><input type="checkbox" data-k="l3"> l3Miss</label><label><input type="checkbox" data-k="l2" checked> l2Miss</label><label><input type="checkbox" data-k="l1" checked> l1Miss</label><label><input type="checkbox" data-k="ni"> 미발행</label><label><input type="checkbox" data-k="tlb"> tlbMiss</label><label><input type="checkbox" data-k="tlbr"> tlbReplay</label><label><input type="checkbox" data-k="mshr"> mshrReplay</label><label><input type="checkbox" data-k="vio"> vioReplay</label>
+      </div>
+      <div class="btn-row"><button class="btn primary" id="ld-run">실행</button></div>
+    </div>
+    <div class="sim-readout"><div class="ro"><span>ldReason</span><b id="ld-out" class="acc">-</b></div><div class="ro"><span>대분류</span><b id="ld-cat">-</b></div></div>
+    <div class="verdict grey" id="ld-verdict">아직 실행하지 않음</div>
+    <div class="sim-note">① 예측을 고르고 실행하세요. ② l3Miss도 켜 보세요. 위쪽 조건이 아래를 덮는다. ③ 모든 미스를 끄고 vioReplay만 켜면 대분류가 Load가 아니라 BadSpec이 된다(configs.py의 맵). 사슬은 Rob.scala:1551-1559를 그대로 옮겼다.</div>
+  </div>
+
+  <h3>CPI 스택 계산</h3>
+  <p>카운터를 CPI로 바꾸는 방법은 간단하다. 사유 c의 슬롯 수를 <em>명령어 수 × 8</em>로 나누면 그 사유가 CPI에 보탠 몫이 된다. 모든 몫을 더하면 (사이클 × 8) / (명령어 × 8) = 사이클 / 명령어 = CPI다. 손실이 하나도 없는 코어의 CPI는 1/8 = 0.125다. 한 가지 보정이 있다. NoStall은 dispatch된 uop를 세므로 나중에 버려질 잘못된 경로의 uop도 들어 있다. 스크립트는 Base를 상수 <code>icount = 20 * 10 ** 6</code>(체크포인트 구간 길이)으로 덮어쓰고 그 초과분을 BadSpecInst로 옮긴다(draw.py:205-209). 구간마다 커밋 명령어가 정확히 2천만 개라고 가정하는 셈이다. 아래 계산기는 같은 보정을 그 구간의 명령어 수 I로 한다.</p>
+  <div class="formula">CPI<sub>c</sub> = slots<sub>c</sub> / (I × W),&nbsp;&nbsp; Σ<sub>c</sub> CPI<sub>c</sub> = C / I
+    <span class="where">C는 사이클 수, I는 커밋된 명령어 수, W = 8(RenameWidth, 스크립트 기본 issue width도 8.0, top_down.py:201-203). 나눗셈 형태는 이 정의에서 이끈 것이며 스크립트는 슬롯 수 자체를 쌓아 그린다.</span></div>
+  <div class="sim" id="sim-cpi">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>CPI 스택 계산기</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="cpi-cv" class="short"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>IPC <output data-for="ipc" data-fmt="f2"></output></label><input type="range" data-k="ipc" min="0.5" max="6" step="0.1" value="2"></div>
+        <div class="ctl"><label>버려지는 uop 비율 <output data-for="wp" data-fmt="pct"></output></label><input type="range" data-k="wp" min="0" max="0.4" step="0.02" value="0.1"></div>
+        <div class="ctl"><label>Frontend 비중 <output data-for="fe" data-fmt="int"></output></label><input type="range" data-k="fe" min="0" max="10" step="1" value="3"></div>
+        <div class="ctl"><label>BadSpec 비중 <output data-for="bs" data-fmt="int"></output></label><input type="range" data-k="bs" min="0" max="10" step="1" value="2"></div>
+        <div class="ctl"><label>Core 비중 <output data-for="co" data-fmt="int"></output></label><input type="range" data-k="co" min="0" max="10" step="1" value="4"></div>
+        <div class="ctl"><label>Load 비중 <output data-for="ld" data-fmt="int"></output></label><input type="range" data-k="ld" min="0" max="10" step="1" value="5"></div>
+        <div class="ctl"><label>Store 비중 <output data-for="st" data-fmt="int"></output></label><input type="range" data-k="st" min="0" max="10" step="1" value="1"></div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="ro"><span>CPI</span><b id="cpi-total">-</b></div>
+      <div class="ro"><span>Base CPI</span><b id="cpi-base" class="ok">-</b></div>
+      <div class="ro"><span>BadSpecInst CPI</span><b id="cpi-bsi">-</b></div>
+      <div class="ro"><span>가장 큰 손실</span><b id="cpi-top" class="acc">-</b></div>
+    </div>
+    <div class="verdict grey" id="cpi-verdict">-</div>
+    <div class="sim-note">① IPC를 바꿔도 Base CPI는 0.125에서 움직이지 않는다. 손실 막대만 늘고 준다. ② 버려지는 uop 비율을 올리면 NoStall의 초과분이 BadSpecInst로 옮겨 간다(draw.py:205-209의 보정을 상수 2천만 대신 I로 적용). ③ IPC 6, 버려지는 비율 0.4를 함께 주면 dispatch된 uop가 슬롯 수(사이클 × 8)를 넘어 불가능한 조합이 된다. 사이클은 100만으로 고정한 합성 값이고, 손실 슬롯을 비중대로 나눈다. 설명은 이 절의 수식.</div>
+  </div>
+  <div class="callout decision"><strong>2026-08-11 ROB 머리 중심의 병목 귀속 추가 (#6173)</strong><p>한 사이클에 정지 사건이 여러 개 겹치므로 사건 길이를 단순히 더하지 않고, ROB 머리 명령어의 수명을 시간 조각으로 나눠 조각마다 지배적인 병목 하나에 귀속시킨다(커밋 본문). Rob, IssueQueue, Dispatch, TopDownGen, 스크립트가 함께 바뀌었다.</p></div>
+</section>
+
+<section id="sec-tools">
+  <h2>디버깅 도구 상자와 첫 주 체크리스트</h2>
+  <p>DiffTest가 "몇 번째 명령어에서 틀렸다"를 알려 주면, 그다음은 "그 순간 파이프라인 안에서 무슨 일이 있었나"를 볼 차례다. 아래 도구들은 대부분 Makefile 변수 하나로 켠다. 켜지 않은 기능은 RTL에 들어가지 않으므로, 필요할 때 다시 빌드해야 한다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>도구</th><th>켜는 법</th><th>무엇을 주나</th><th>근거</th></tr>
+    <tr><td>파형</td><td><code>xiangshan.py --trace</code> / <code>--trace-fst</code> → <code>EMU_TRACE</code></td><td>VCD/FST 파형. 내부 처리는 difftest의 verilator.mk (추론)</td><td>scripts/xiangshan.py:82-83, 148</td></tr>
+    <tr><td>ChiselDB</td><td><code>WITH_CHISELDB=1</code> → <code>--with-chiseldb</code></td><td>구조체를 DB 테이블 행으로 기록 (예: <code>InstTable</code>). 저장 형식은 utility 서브모듈 쪽 (추론)</td><td>Makefile:221-223; Rob.scala:1481</td></tr>
+    <tr><td>Constantin</td><td><code>WITH_CONSTANTIN=1</code></td><td>재빌드 없이 상수 변경 (추론: 구현은 utility 서브모듈). 예: <code>StoreBufferThreshold</code> 초기값 9</td><td>Makefile:246-248; Sbuffer.scala:544</td></tr>
+    <tr><td>perfcct</td><td>ChiselDB의 <code>LifeTimeCommitTrace</code> 테이블. 이 테이블은 <code>PerfCCT.*</code> 호출(예: MemBlock.scala:476)이 utility 서브모듈을 거쳐 채우는 것으로 보인다(추론)</td><td>명령어별 파이프라인 단계 다이어그램</td><td>scripts/perfcct.py:61-68 (인자), :166 (테이블 조회)</td></tr>
+    <tr><td>XSPdb</td><td><code>make pdb</code>, <code>make pdb-run</code></td><td>Python 디버거에서 <code>xload</code>, <code>xwatch_commit_pc</code>, <code>xistep</code>, <code>xpc</code></td><td>scripts/Makefile.pdb:38-65; README.md:149-177</td></tr>
+    <tr><td>TopDown 그림</td><td>체크포인트 <code>[PERF ]</code> 로그</td><td>SimPoint 가중 평균 후 CPI 스택</td><td>scripts/top-down/top_down.py:62-118</td></tr>
+  </table></div>
+  <p><span class="term" data-def="picker로 SimTop.sv를 Python 모듈로 감싸고 pdb 위에서 클록 단위로 RTL을 조작하는 디버거. scripts/xspdb/, docs/XSPdb/.">XSPdb</span>는 <code>sim-verilog</code> 결과를 picker로 Python 모듈로 감싼다. 이때 Verilator 옵션은 <code>--output-split 20000 --no-timing --threads 8 +define+DIFFTEST</code>이고, pydifftest는 <code>WITH_CONSTANTIN=0 WITH_CHISELDB=0</code>으로 빌드한다(scripts/Makefile.pdb:43, 52-60). 기본 이미지는 <code>ready-to-run/copy_and_run.bin</code>이다(:32). README의 예시는 <code>xistep</code>으로 끝까지 돌린 뒤 <code>HIT GOOD LOOP at pc = 0xf0001cb0</code>을 출력한다(README.md:177).</p>
+  <div class="callout warn"><strong>kunminghu-v3는 아직 움직이는 중이다</strong><p>README.md:68은 이 브랜치가 빠르게 바뀌고 있어 기능이 안정적이지 않을 수 있다고 경고한다. 빌드가 깨지면 먼저 <code>make init</code>으로 서브모듈이 커밋에 맞는지 확인하고(CI는 <code>init-force</code>를 쓴다, Makefile:373-376), 그다음 자기 변경을 의심한다.</p></div>
+
+  <figure class="diagram">
+    <div class="wk" id="wk">
+      <div class="btn-row"><button class="btn" id="wk-prev">이전</button><button class="btn primary" id="wk-next">다음</button></div>
+      <p style="margin:12px 0 4px"><b id="wk-title">-</b></p>
+      <pre class="cmd" id="wk-cmd"></pre>
+      <p id="wk-why" style="margin:0;font-size:15px;color:var(--text-dim)"></p>
+    </div>
+    <figcaption>첫 주 체크리스트. 단계마다 칠 명령과 확인할 것을 순서대로 보여 준다. 명령은 Makefile과 README에서 확인한 형태다.</figcaption>
+  </figure>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ul>
+    <li>Chisel 코드는 정교화 → CHIRRTL → firtool의 세 단계를 거쳐 <code>build/rtl/*.sv</code>가 된다. <code>PrintModuleName</code>은 직렬화 전에 돌아야 로그에 인스턴스 경로가 남는다.</li>
+    <li><code>make verilog</code>는 릴리스 옵션의 <code>XSTop.sv</code>, <code>make sim-verilog</code>는 DiffTest를 켠 <code>SimTop.sv</code>, <code>make emu</code>는 sim-verilog 뒤 difftest 서브모듈로 <code>build/emu</code>를 만든다. 먼저 <code>make init</code>.</li>
+    <li>DiffTest는 커밋 슬롯(최대 8개)마다 참조 모델을 같은 수만큼 돌려 비교한다. walk 슬롯, x0 쓰기, MMIO·성능 카운터 결과는 비교에서 빠지고, 융합 슬롯은 nFused+1개로 센다.</li>
+    <li>레지스터 값은 RAT와 물리 RF를 같은 delay(2)로 내보내 <code>PRF[RAT[x]]</code>로 복원한다. 둘의 delay가 다르면 버그 없이도 불일치가 난다.</li>
+    <li>시뮬레이션은 opcode 0x6b TRAP 커밋으로 끝나고, 그 결과 데이터가 종료 코드다.</li>
+    <li>TopDown은 매 사이클 8개 슬롯에 76개 사유 중 하나를 우선순위대로 붙인다. 사유별 슬롯 수 / (명령어 × 8)이 CPI 몫이고, 손실 없는 코어의 CPI는 0.125다.</li>
+  </ul>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="2">
+    <div class="q"><code>make verilog WITH_CHISELDB=1</code>을 실행했다. 생성된 <code>XSTop.sv</code>에 ChiselDB 기록 기능이 들어가는가?</div>
+    <div class="opts"><button>들어간다. WITH_CHISELDB는 모든 목표에 적용된다</button><button>들어간다. 다만 FPGA=1일 때만</button><button>들어가지 않는다. 이 플래그는 SIM_ARGS에만 붙고 verilog는 TOPMAIN_ARGS를 쓴다</button><button>make가 오류를 내고 멈춘다</button></div>
+    <div class="explain">Makefile:221-223은 <code>--with-chiseldb</code>를 <code>SIM_ARGS</code>에만 더한다. <code>verilog</code> 목표의 명령은 <code>TOPMAIN_ARGS</code>(Makefile:279-284)를 쓰고 거기엔 SIM_ARGS가 없다. 첫째 보기는 이 구분을 놓쳤다. FPGA=1은 TOPMAIN_ARGS를 DEBUG_ARGS로 바꿀 뿐 SIM_ARGS를 붙이지 않으므로 둘째도 틀렸다. make의 <code>$(error)</code>는 ISSUE/LLC/IOMMU 조합, 목표 개수, <code>WITH_DRAMSIM3=1</code>인데 <code>DRAMSIM3_HOME</code>이 없는 경우(Makefile:199-201)에만 걸리고 WITH_CHISELDB와는 무관하므로 넷째도 아니다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">정상 코어가 UART 상태 레지스터를 읽는 순간 DiffTest가 불일치를 보고했다. 가장 먼저 의심할 것은?</div>
+    <div class="opts"><button>ALU 덧셈 버그</button><button>그 load가 MMIO로 표시되지 않아 skip이 0이 된 것</button><button>TRAP 명령어의 opcode</button><button>RAT의 delay가 2인 것</button></div>
+    <div class="explain">장치 값은 참조 모델이 알 수 없으므로 <code>isMMIO</code>가 skip을 켜야 한다(Bundle.scala:306, Rob.scala:1744). ALU 버그라면 장치 읽기가 아닌 산술 명령어에서 먼저 멈췄을 것이다. TRAP은 종료 때만 쓰인다. RAT delay 2는 물리 RF와 같아서 정상이며, 어긋났다면 첫 레지스터 쓰기부터 틀렸을 것이다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">한 사이클에 rename이 정수 프리리스트 고갈(IntFlStall)로 멈췄고, 같은 사이클에 dispatch도 ALU 이슈 큐가 가득 차 막혔다. 아직 dispatch되지 않은 슬롯에 붙는 사유는?</div>
+    <div class="opts"><button>IntFlStall</button><button>IntIQFullStallAlu</button><button>두 카운터에 하나씩 나눠 센다</button><button>BackendOtherCoreStall</button></div>
+    <div class="explain">MuxCase에서 "앞 단계가 사유를 들고 멈춤"(②)이 "dispatch 자신의 정지"(③)보다 위에 있다(Dispatch.scala:1254-1260). 그래서 IntIQFullStallAlu는 이 사이클에 세지 않는다. 슬롯 하나에는 사유가 정확히 하나라서 나눠 세는 일은 없다. BackendOtherCoreStall은 아무 조건도 참이 아닐 때의 기본값이다.</div>
+  </div>
+  <div class="quiz" data-answer="3">
+    <div class="q">100만 사이클 동안 50만 명령어를 커밋했다. W = 8일 때 NoStall을 뺀 손실 슬롯이 CPI에 보탠 몫의 합은? (버려진 uop는 없다고 하자)</div>
+    <div class="opts"><button>2.000</button><button>0.125</button><button>7.500</button><button>1.875</button></div>
+    <div class="explain">전체 CPI = C/I = 2.000이고, Base = I/(I×8) = 0.125다. 손실 몫은 2.000 − 0.125 = 1.875. 2.000은 Base까지 포함한 전체다. 0.125는 Base 자체다. 7.500은 손실 슬롯 수(800만 − 50만 = 750만)를 100만 사이클로만 나눈 값이라 명령어 수와 W로 나누는 단계를 빠뜨렸다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08. 서브모듈(difftest, utility, ready-to-run)은 이 작업 사본에 체크아웃되어 있지 않아 그 내부 동작은 (추론)으로 표시했다. 주요 코드: <a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/Makefile#L321" target="_blank">Makefile</a>, <a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/backend/rob/Rob.scala#L1743" target="_blank">Rob.scala DiffTest 포트</a>, <a href="https://github.com/OpenXiangShan/XiangShan/blob/09453ff8f44e9d2b526e6149c60e1dc3f08c7192/src/main/scala/xiangshan/backend/dispatch/Dispatch.scala#L1254" target="_blank">Dispatch.scala TopDown 슬롯</a>.</p>
+
+</main>
+</div>
+<script src="assets/ch12-a.js"></script>
+<script src="assets/ch12-b.js"></script>
+</body>
+</html>

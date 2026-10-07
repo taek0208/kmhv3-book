@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 11장: 벡터 확장(RVV)</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+.cells { display: grid; gap: 3px; font: 12px/1.2 var(--mono); }
+.cells .c { border: 1px solid var(--border); border-radius: 4px; padding: 5px 2px; text-align: center; background: var(--bg-elev); color: var(--text-dim); min-width: 0; overflow: hidden; white-space: nowrap; }
+.cells .c.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.cells .c.on2 { background: var(--accent-2-soft); border-color: var(--accent-2); color: var(--text); }
+.cells .c.warn { background: var(--warn-soft); border-color: var(--warn); color: var(--text); }
+.cells .c.off { background: var(--surface); border-style: dashed; color: var(--text-faint); }
+.cells .c.bad { background: var(--bad-soft); border-color: var(--bad); color: var(--text); }
+.rowlbl { font: 12px var(--mono); color: var(--text-dim); margin: 8px 0 3px; }
+.simpad { padding: 14px 16px; overflow-x: auto; }
+.mini { font-size: 13px; color: var(--text-dim); margin: 6px 0 0; }
+.seg { flex-wrap: wrap; max-width: 100%; }
+</style>
+</head>
+<body data-chapter="ch11">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 11</div>
+  <h1>벡터 확장(RVV)</h1>
+  <p class="lead">덧셈 한 번에 원소 하나를 더하는 대신, 명령 하나로 원소 여러 개를 한꺼번에 더하면 어떨까. RISC-V 벡터 확장(RVV)은 그 "여러 개"가 몇 개인지를 프로그램이 실행 중에 하드웨어에게 묻는다. 이 장은 그 질문(<code>vsetvli</code>)이 KMHv3 안에서 어떻게 답해지고, 큰 벡터 명령이 어떻게 레지스터 크기 조각(uop)으로 쪼개져 흘러가는지를 따라간다. 이 장에서는 VLEN=128인 KMHv3의 디코드·vtype 추측·벡터 실행 영역·연속 벡터 load/store만 다루고, 이 브랜치에서 아직 비어 있는 부분은 7절에서 따로 정리한다.</p>
+  <ul class="objectives">
+    <li>스칼라, SIMD, 벡터 명령의 차이와 VLEN, SEW, LMUL, vl, vtype의 뜻을 설명할 수 있다.</li>
+    <li>주어진 AVL, SEW, LMUL에 대해 <code>vsetvli</code>가 돌려줄 vl과 vill을 계산할 수 있다.</li>
+    <li>SplitTable 규칙으로 벡터 명령이 uop 몇 개로 갈라지는지 예측할 수 있다.</li>
+    <li>vtype을 디코드 전에 추측하는 이유와, 틀렸을 때 VTypeBuffer와 flush로 복구하는 경로를 설명할 수 있다.</li>
+    <li>연속 벡터 load가 일반 load 파이프라인에서 16바이트씩 처리되는 방식과, 이 브랜치에서 아직 구현되지 않은 부분을 구분할 수 있다.</li>
+  </ul>
+</div>
+
+<section>
+  <h2>스칼라, SIMD, 벡터</h2>
+  <p>배열 <code>a</code>와 <code>b</code>를 원소별로 더하는 반복문을 생각해 보자. 스칼라 CPU는 원소 하나마다 load, add, store를 한 번씩 한다. 원소가 1000개면 덧셈 명령도 1000번 실행된다. 같은 일을 하는 명령을 매번 다시 읽고 디코드하는 것은 낭비다. 그래서 명령 하나가 원소 여러 개를 함께 처리하게 만든 것이 SIMD와 벡터다.</p>
+  <p><span class="term" data-def="Single Instruction, Multiple Data. 명령 하나가 고정된 개수의 원소를 함께 처리한다. 폭이 명령 인코딩에 박혀 있다.">SIMD</span><span class="en">(x86 SSE/AVX 같은 방식)</span>는 명령 안에 폭이 박혀 있다. 128비트 명령은 32비트 원소 4개를, 256비트 명령은 8개를 처리한다. 하드웨어가 넓어지면 새 명령과 새 바이너리가 필요하다. RISC-V <span class="term" data-def="RISC-V Vector extension. 레지스터 길이 VLEN을 명령에 박지 않고, 프로그램이 vsetvli로 이번에 처리할 원소 수 vl을 하드웨어에게 묻는다.">벡터 확장</span><span class="en">(RVV)</span>은 폭을 명령에 넣지 않는다. 프로그램이 "남은 원소가 1000개이고 원소는 32비트다"라고 말하면, 하드웨어가 "이번에는 16개"라고 답한다. 같은 바이너리가 VLEN=128 기계와 VLEN=512 기계에서 모두 맞게 돈다. 이 성질을 <span class="term" data-def="Vector-Length Agnostic. 코드가 하드웨어의 벡터 길이를 가정하지 않고 실행 중에 vl을 받아 반복한다.">길이 불가지</span><span class="en">(length-agnostic)</span>라고 한다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="스칼라, SIMD, 벡터 명령이 원소를 처리하는 방식 비교">
+      <defs><marker id="m11-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="48" class="lbl-b">스칼라</text>
+      <rect class="box" x="96" y="26" width="80" height="34" rx="6"/><text x="136" y="48" text-anchor="middle" class="lbl-mono">add a[0]</text>
+      <rect class="box" x="186" y="26" width="80" height="34" rx="6"/><text x="226" y="48" text-anchor="middle" class="lbl-mono">add a[1]</text>
+      <rect class="box" x="276" y="26" width="80" height="34" rx="6"/><text x="316" y="48" text-anchor="middle" class="lbl-mono">add a[2]</text>
+      <rect class="box" x="366" y="26" width="80" height="34" rx="6"/><text x="406" y="48" text-anchor="middle" class="lbl-mono">add a[3]</text>
+      <text x="96" y="80" class="lbl-dim">명령 4번 = 원소 4개</text>
+      <text x="10" y="118" class="lbl-b">SIMD</text>
+      <rect class="box-2" x="96" y="96" width="350" height="34" rx="6"/>
+      <line class="ln" x1="183" y1="96" x2="183" y2="130"/><line class="ln" x1="271" y1="96" x2="271" y2="130"/><line class="ln" x1="358" y1="96" x2="358" y2="130"/>
+      <text x="140" y="118" text-anchor="middle" class="lbl-mono">a[0]</text><text x="227" y="118" text-anchor="middle" class="lbl-mono">a[1]</text>
+      <text x="314" y="118" text-anchor="middle" class="lbl-mono">a[2]</text><text x="402" y="118" text-anchor="middle" class="lbl-mono">a[3]</text>
+      <text x="96" y="150" class="lbl-dim">명령에 폭이 박힘: 128비트 = 32비트 × 4</text>
+      <text x="10" y="196" class="lbl-b">벡터</text>
+      <rect class="box-acc" x="96" y="176" width="104" height="34" rx="6"/><text x="148" y="198" text-anchor="middle" class="lbl-mono">vsetvli→vl</text>
+      <line class="ln" x1="200" y1="193" x2="222" y2="193" marker-end="url(#m11-1)"/>
+      <g class="cellrow">
+        <rect class="box-acc" x="226" y="176" width="220" height="34" rx="6"/>
+        <line class="ln" x1="281" y1="176" x2="281" y2="210"/><line class="ln" x1="336" y1="176" x2="336" y2="210"/><line class="ln" x1="391" y1="176" x2="391" y2="210"/>
+        <text x="336" y="198" text-anchor="middle" class="lbl-mono">v8 v9 v10 v11</text>
+      </g>
+      <text x="96" y="234" class="lbl-dim">vl은 실행 중에 정해진다: e32·m4면 16개</text>
+    </svg>
+    <figcaption>스칼라는 원소마다 명령을 하나씩 쓰고, SIMD는 폭을 명령에 박고, 벡터는 vsetvli로 이번 폭(vl)을 실행 중에 받는다. VLEN=128, e32·m4에서 vl은 최대 16이다(2절 계산기).</figcaption>
+  </figure>
+  <p>RVV의 단어 다섯 개만 알면 이 장을 읽을 수 있다. <span class="term" data-def="벡터 레지스터 하나의 비트 수. KMHv3는 128비트. src/main/scala/xiangshan/Parameters.scala:53">VLEN</span><span class="en">(벡터 레지스터 길이)</span>은 v0~v31 각 레지스터의 비트 수로, KMHv3는 128비트다(<code>Parameters.scala:53</code>). <span class="term" data-def="Selected Element Width. 원소 하나의 폭. e8, e16, e32, e64 중 하나.">SEW</span><span class="en">(원소 폭)</span>는 원소 하나의 비트 수다. ELEN=64라서 e64까지 쓸 수 있다(<code>Parameters.scala:54</code>). <span class="term" data-def="Length MULtiplier. 레지스터 몇 개를 한 그룹으로 묶을지. m1, m2, m4, m8 또는 분수 mf2, mf4, mf8.">LMUL</span><span class="en">(레지스터 묶음 배수)</span>은 레지스터 몇 개를 한 그룹으로 쓸지 정한다. LMUL=4이면 v8~v11 네 개가 레지스터 하나처럼 움직인다. 분수 LMUL(mf2, mf4, mf8)은 레지스터의 일부만 쓴다. 마지막으로 <span class="term" data-def="이번 명령이 실제로 처리할 원소 수. vsetvl 계열이 정해 vl CSR에 쓴다.">vl</span>은 이번에 처리할 원소 수이고, <span class="term" data-def="현재 SEW, LMUL, vta, vma, vill을 담은 CSR. vill=1이면 이후 벡터 명령은 illegal.">vtype</span>은 SEW, LMUL과 두 정책 비트(vta, vma)를 담은 설정 레지스터다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 260" role="img" aria-label="128비트 레지스터 하나를 SEW별로 나눈 모습과 LMUL=4 레지스터 그룹">
+      <text x="10" y="20" class="lbl-dim">v8 하나 = 128비트 = 16바이트</text>
+      <text x="10" y="50" class="lbl-mono">e8 ×16</text><text x="10" y="80" class="lbl-mono">e16 ×8</text>
+      <text x="10" y="110" class="lbl-mono">e32 ×4</text><text x="10" y="140" class="lbl-mono">e64 ×2</text>
+      <rect class="box-acc" x="74" y="34" width="376" height="24" rx="4"/>
+      <path class="ln" d="M97.5,34v24M121,34v24M144.5,34v24M168,34v24M191.5,34v24M215,34v24M238.5,34v24M262,34v24M285.5,34v24M309,34v24M332.5,34v24M356,34v24M379.5,34v24M403,34v24M426.5,34v24"/>
+      <rect class="box-acc" x="74" y="64" width="376" height="24" rx="4"/>
+      <path class="ln" d="M121,64v24M168,64v24M215,64v24M262,64v24M309,64v24M356,64v24M403,64v24"/>
+      <rect class="box-acc" x="74" y="94" width="376" height="24" rx="4"/>
+      <path class="ln" d="M168,94v24M262,94v24M356,94v24"/>
+      <rect class="box-acc" x="74" y="124" width="376" height="24" rx="4"/>
+      <path class="ln" d="M262,124v24"/>
+      <rect class="box-2" x="10" y="176" width="440" height="66" rx="10" style="stroke-dasharray:5 4"/>
+      <text x="22" y="196" class="lbl-acc2">LMUL=4 그룹: 네 개가 레지스터 하나처럼</text>
+      <rect class="box" x="22" y="206" width="98" height="28" rx="5"/><text x="71" y="225" text-anchor="middle" class="lbl-mono">v8</text>
+      <rect class="box" x="128" y="206" width="98" height="28" rx="5"/><text x="177" y="225" text-anchor="middle" class="lbl-mono">v9</text>
+      <rect class="box" x="234" y="206" width="98" height="28" rx="5"/><text x="283" y="225" text-anchor="middle" class="lbl-mono">v10</text>
+      <rect class="box" x="340" y="206" width="98" height="28" rx="5"/><text x="389" y="225" text-anchor="middle" class="lbl-mono">v11</text>
+    </svg>
+    <figcaption>같은 16바이트 레지스터가 SEW에 따라 원소 16·8·4·2개로 나뉜다. LMUL=4이면 네 레지스터를 이어 붙여 원소를 4배 담는다.</figcaption>
+  </figure>
+  <div class="callout warn"><strong>이 장의 코드는 공사 중이다</strong><p>kunminghu-v3 브랜치는 2026-08-06 커밋 <code>29f48d8a6</code>에서 옛 벡터 디코더와 벡터 load/store 유닛(VLSU)을 지우고 새 구조로 옮기는 중이다. 이 장은 지금 코드가 하는 일만 설명하고, 비어 있는 기능은 7절 "현재 상태" 표에 모았다. 일반 RVV 동작을 보여 주는 그림이나 모드에는 <b>일반 모델</b>이라고 따로 표시한다.</p></div>
+</section>
+
+<section>
+  <h2>vtype과 vl: vsetvli가 길이를 정한다</h2>
+  <p>원소가 1000개 남았는데 레지스터 그룹에는 16개만 들어간다면, 프로그램은 16개씩 63번 돌아야 한다. 이렇게 큰 배열을 하드웨어 폭만큼씩 잘라 반복하는 것을 <span class="term" data-def="남은 원소를 하드웨어가 한 번에 처리할 수 있는 만큼(vl)씩 잘라 반복하는 루프 형태.">strip-mining</span>이라고 한다. 반복마다 프로그램은 남은 개수 <span class="term" data-def="Application Vector Length. 프로그램이 vsetvli에 넘기는 '남은 원소 수'.">AVL</span>을 <code>vsetvli</code>에 넘기고, 하드웨어는 이번에 처리할 vl을 돌려준다. 하드웨어가 한 번에 담을 수 있는 최대 원소 수가 VLMAX다.</p>
+  <div class="formula">VLMAX = VLEN × LMUL / SEW = 128 × LMUL / SEW
+    <span class="where">불법 조합(SEW &gt; min(LMUL,1) × ELEN)이면 VLMAX는 0이고 vill=1이 된다. 근거: <code>backend/vector/Decoder/VSetFuncUnit.scala:124-163@09453ff8</code></span></div>
+  <div class="table-wrap"><table class="data">
+    <tr><th>SEW \ LMUL</th><th>mf8</th><th>mf4</th><th>mf2</th><th>m1</th><th>m2</th><th>m4</th><th>m8</th></tr>
+    <tr><td>e8</td><td class="num">2</td><td class="num">4</td><td class="num">8</td><td class="num">16</td><td class="num">32</td><td class="num">64</td><td class="num">128</td></tr>
+    <tr><td>e16</td><td>vill</td><td class="num">2</td><td class="num">4</td><td class="num">8</td><td class="num">16</td><td class="num">32</td><td class="num">64</td></tr>
+    <tr><td>e32</td><td>vill</td><td>vill</td><td class="num">2</td><td class="num">4</td><td class="num">8</td><td class="num">16</td><td class="num">32</td></tr>
+    <tr><td>e64</td><td>vill</td><td>vill</td><td>vill</td><td class="num">2</td><td class="num">4</td><td class="num">8</td><td class="num">16</td></tr>
+  </table></div>
+  <p>vl을 정하는 계산은 <code>VSetFuncUnit</code> 한 모듈에 모여 있다. 같은 모듈을 프런트엔드의 추측 계산(<code>VTypeGen</code>, 4절)과 실제 실행 유닛(<code>VSetUnit</code>, int 영역 ALU3)이 함께 쓴다. 명령 형태는 세 가지다. <code>vsetvli</code>는 vtype이 즉치이고 AVL은 레지스터 rs1에서 온다. <code>vsetivli</code>는 AVL까지 5비트 즉치(0~31)다. <code>vsetvl</code>은 vtype도 레지스터 rs2에서 온다. rs1과 rd가 x0인지에 따라 뜻이 바뀐다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V1 · vl 결정</span><h4>AVL ≥ VLMAX이면 vl = VLMAX</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">vill이면 0. rs1≠x0이면 AVL ≥ VLMAX → VLMAX, 아니면 AVL. rs1=x0·rd≠x0이면 VLMAX. rs1=x0·rd=x0이면 이전 vl 유지. 레지스터에서 온 AVL은 8비트로 포화시킨다(7비트 위가 하나라도 1이면 128 이상 값).</dd>
+      <dt>이유</dt><dd class="why">RVV 규격은 VLMAX &lt; AVL &lt; 2·VLMAX일 때 ceil(AVL/2)~VLMAX 중 아무 값이나 허용한다. KMHv3는 가장 단순한 "항상 VLMAX"를 고른다. 포화는 64비트 AVL을 8비트 비교기 하나로 처리하려는 것이다.</dd>
+      <dt>없으면</dt><dd>strip-mining 루프가 원소를 덜 세거나 더 세어, 배열 끝을 넘어 쓰거나 일부를 빼먹는다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/vector/Decoder/VSetFuncUnit.scala:29-31,44-48,65-75@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V2 · vill</span><h4>불법 vtype은 vill=1, vl=0</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">SEW &gt; min(LMUL,1)×64, 예약 비트가 1, 또는 rd=rs1=x0인데 새 VLMAX가 이전 VLMAX와 다르면 vill=1. vill이면 출력 vtype의 vma·vta·vsew·vlmul을 모두 0으로 만든다.</dd>
+      <dt>이유</dt><dd class="why">rd=rs1=x0 형태는 "vl은 그대로 두고 vtype만 바꾼다"는 뜻이다. VLMAX가 바뀌면 옛 vl이 새 그룹에 맞지 않을 수 있으므로 규격이 이를 금지한다.</dd>
+      <dt>없으면</dt><dd>e64·mf2처럼 레지스터 반쪽에 64비트 원소를 넣는 설정이 통과해, 분할표에 없는 조합을 실행하려 한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/vector/Decoder/VSetFuncUnit.scala:61-63,78-82,124-141@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="sim" id="sim-vset">
+    <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>vsetvli 계산기 (VLEN=128)</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="vs-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="seg" id="vs-kind"><button class="on">vsetvli</button><button>vsetivli</button><button>vsetvl</button></div>
+        <div class="seg" id="vs-mode"><button class="on">rs1≠x0</button><button>rs1=x0</button><button>rd=rs1=x0</button></div>
+        <div class="ctl"><label>AVL <output data-for="avl" data-fmt="int"></output></label>
+          <input type="range" data-k="avl" min="0" max="1000" step="1" value="1000"></div>
+        <div class="ctl"><label>SEW <output id="vs-sew-o">e32</output></label>
+          <input type="range" data-k="sew" min="0" max="3" step="1" value="2"></div>
+        <div class="ctl"><label>LMUL <output id="vs-lmul-o">m4</output></label>
+          <input type="range" data-k="lmul" min="0" max="6" step="1" value="5"></div>
+        <div class="verdict grey" id="vs-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">VLMAX</span><span class="v" id="vs-vlmax">-</span></div>
+      <div class="stat"><span class="k">포화 후 AVL</span><span class="v" id="vs-avl">-</span></div>
+      <div class="stat"><span class="k">vl</span><span class="v acc" id="vs-vl">-</span></div>
+      <div class="stat"><span class="k">vill</span><span class="v" id="vs-vill">-</span></div>
+      <div class="stat"><span class="k">루프 반복</span><span class="v" id="vs-iter">-</span></div>
+    </div>
+    <div class="sim-note">합성 입력에 <code>VSetFuncUnit.scala:29-82</code>의 규칙을 그대로 적용한다. rd=rs1=x0 모드의 "이전 설정"은 e32·m1, vl=3으로 고정했다. ① AVL=1000, e32·m4에서 vl과 반복 횟수(1000/16 올림 = 63)를 확인하세요. ② SEW를 e64로 두고 LMUL을 mf2로 내려 vill이 켜지는지 보세요. ③ rd=rs1=x0 모드에서 LMUL만 바꿔 VLMAX가 4가 아니게 되면 vill이 되는 이유를 V2 카드에서 찾아보세요.</div>
+  </div>
+  <div class="sim" id="sim-pvl">
+    <div class="sim-head"><span class="sim-tag predict">PREDICT</span><h3>vl을 먼저 맞혀 보기</h3></div>
+    <div class="sim-body">
+      <p style="margin:0"><code>vsetvli t0, a0, e32, m4</code>에서 a0=1000이다. t0(vl)에 들어갈 값은?</p>
+      <div class="seg" id="pvl-choice"><button class="on">1000</button><button>500</button><button>32</button><button>16</button></div>
+      <div class="btn-row"><button class="btn primary" id="pvl-run">계산해 보기</button></div>
+      <div class="verdict grey" id="pvl-out">아직 확인하지 않음</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>uop 분할: 레지스터 그룹을 레지스터 하나씩</h2>
+  <p>KMHv3의 벡터 데이터패스는 레지스터 하나, 즉 128비트 폭이다. 그래서 LMUL=4인 <code>vadd</code>는 그대로 실행할 수 없다. 디코더가 이 명령을 레지스터 하나씩 맡는 <span class="term" data-def="micro-operation. 원래 명령(mop)을 하드웨어가 한 번에 실행할 수 있는 크기로 쪼갠 조각.">uop</span> 4개로 쪼갠다. 몇 개로 쪼갤지는 명령 종류, SEW, LMUL의 조합으로 정해지며, 그 표가 <code>SplitTable</code>이다. 디코드 단계가 vtype을 알아야 하는 이유가 여기 있다. vtype을 모르면 uop 개수도 모른다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 300" role="img" aria-label="vadd m4, vwadd m2, vredsum m4가 uop으로 갈라지는 모습">
+      <defs><marker id="m11-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="22" class="lbl-b">vadd.vv · e32·m4 → uop 4개 (dup)</text>
+      <rect class="box-acc" x="10" y="34" width="102" height="40" rx="6"/><text x="61" y="59" text-anchor="middle" class="lbl-mono">uop0 v8</text>
+      <rect class="box-acc" x="122" y="34" width="102" height="40" rx="6"/><text x="173" y="59" text-anchor="middle" class="lbl-mono">uop1 v9</text>
+      <rect class="box-acc" x="234" y="34" width="102" height="40" rx="6"/><text x="285" y="59" text-anchor="middle" class="lbl-mono">uop2 v10</text>
+      <rect class="box-acc" x="346" y="34" width="102" height="40" rx="6"/><text x="397" y="59" text-anchor="middle" class="lbl-mono">uop3 v11</text>
+      <text x="10" y="114" class="lbl-b">vwadd.vv · e32·m2 → uop 4개 (dupF2W)</text>
+      <rect class="box-2" x="10" y="126" width="102" height="40" rx="6"/><text x="61" y="151" text-anchor="middle" class="lbl-mono">→ v16</text>
+      <rect class="box-2" x="122" y="126" width="102" height="40" rx="6"/><text x="173" y="151" text-anchor="middle" class="lbl-mono">→ v17</text>
+      <rect class="box-2" x="234" y="126" width="102" height="40" rx="6"/><text x="285" y="151" text-anchor="middle" class="lbl-mono">→ v18</text>
+      <rect class="box-2" x="346" y="126" width="102" height="40" rx="6"/><text x="397" y="151" text-anchor="middle" class="lbl-mono">→ v19</text>
+      <text x="10" y="186" class="lbl-dim">결과 원소가 2배 폭이라 목적 그룹이 4개로 커진다</text>
+      <text x="10" y="222" class="lbl-b">vredsum.vs · e32·m4 → uop 4개 (redu)</text>
+      <rect class="box" x="10" y="234" width="92" height="40" rx="6"/><text x="56" y="259" text-anchor="middle" class="lbl-mono">vadd</text>
+      <rect class="box" x="122" y="234" width="92" height="40" rx="6"/><text x="168" y="259" text-anchor="middle" class="lbl-mono">vadd</text>
+      <rect class="box" x="234" y="234" width="92" height="40" rx="6"/><text x="280" y="259" text-anchor="middle" class="lbl-mono">vadd</text>
+      <rect class="box-ok" x="346" y="234" width="102" height="40" rx="6"/><text x="397" y="259" text-anchor="middle" class="lbl-mono">vredsum</text>
+      <line class="ln" x1="102" y1="254" x2="120" y2="254" marker-end="url(#m11-3)"/>
+      <line class="ln" x1="214" y1="254" x2="232" y2="254" marker-end="url(#m11-3)"/>
+      <line class="ln" x1="326" y1="254" x2="344" y2="254" marker-end="url(#m11-3)"/>
+      <text x="10" y="292" class="lbl-dim">그룹을 vadd로 한 레지스터에 접은 뒤 마지막 uop만 reduction</text>
+    </svg>
+    <figcaption>분할 방식은 명령마다 다르다. 같은 m4라도 일반 연산은 4개, widening은 목적 그룹이 2배라 m4에서 8개, reduction은 접기 uop과 마지막 reduction uop으로 나뉜다. 근거: <code>Split/SplitTable.scala:89-118, 184-212, 359-396</code>.</figcaption>
+  </figure>
+  <div class="table-wrap"><table class="data">
+    <tr><th>분할 종류 (예)</th><th class="num">m8</th><th class="num">m4</th><th class="num">m2</th><th class="num">m1</th><th class="num">분수</th></tr>
+    <tr><td>dup (vadd, vmul, vfadd)</td><td class="num">8</td><td class="num">4</td><td class="num">2</td><td class="num">1</td><td class="num">1</td></tr>
+    <tr><td>dupM (vmseq 등 마스크 비교)</td><td class="num">8</td><td class="num">4</td><td class="num">2</td><td class="num">1</td><td class="num">1</td></tr>
+    <tr><td>dupF2W (vwadd, widening)</td><td>illegal</td><td class="num">8</td><td class="num">4</td><td class="num">2</td><td class="num">1</td></tr>
+    <tr><td>dupF2N (vnsrl, narrowing)</td><td>illegal</td><td class="num">8</td><td class="num">4</td><td class="num">2</td><td class="num">1</td></tr>
+    <tr><td>redu (vredsum)</td><td class="num">8</td><td class="num">4</td><td class="num">2</td><td class="num">1</td><td class="num">1</td></tr>
+    <tr><td>unit-stride load/store</td><td colspan="5">max(EMUL,1) × nf, EMUL = LMUL×EEW/SEW. EMUL ≥ 1/8이고 8개 이하일 때만 합법</td></tr>
+  </table></div>
+  <p>분수 LMUL 칸은 SEW가 맞을 때만 1이다(mf2는 e32까지, mf4는 e16까지, mf8은 e8만). widening과 narrowing은 SEW ≤ 32이고 LMUL ≤ 4일 때만 합법이다(<code>SewLmulRangeField.scala:22</code>). 부동소수점 명령은 SEW ≥ 16이다(<code>:23</code>). 표에서 빈 칸(<code>Seq.empty</code>)이거나 범위 필터에 걸리면 그 조합은 illegal 명령이 된다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V3 · 분할표 조회</span><h4>(명령, SEW, LMUL)이 표에 없으면 illegal</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">산술 명령은 <code>SplitTable.table(inst)(sew##lmul)</code>로 uop 열을 얻는다. 메모리 명령은 EMUL·nf로 개수를 계산하고 8을 넘거나 EMUL &lt; 1/8이면 빈 열이다. 빈 열이면 illegal 정보를 담은 uop 1개를 낸다.</dd>
+      <dt>이유</dt><dd class="why">디코더는 명령 하나를 최대 8개 uop(<code>maxSplitUopNum</code>, <code>backend/vector/package.scala:30</code>)으로만 쪼갠다. 코드 주석은 이 값을 "IQ/ROB가 담을 uop 최대 수"라고 적지만, IQ·ROB 쪽에서 이 상수를 쓰는 곳은 확인하지 못했다(추론). 그보다 큰 조합(예: vwadd m8은 16개가 필요)은 규격상으로도 불법이다.</dd>
+      <dt>없으면</dt><dd>표에 없는 조합이 들어오면 uop 수를 알 수 없어 rename 슬롯 계산이 깨진다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/vector/Decoder/DecodeFields/VecDecodeChannel/UopInfoField.scala:93,116-138; NumUopOhField.scala:22-28@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="sim" id="sim-puop">
+    <div class="sim-head"><span class="sim-tag predict">PREDICT</span><h3>uop 개수를 먼저 맞혀 보기</h3></div>
+    <div class="sim-body">
+      <p style="margin:0"><code>vsetvli</code>로 e32·m4를 설정한 뒤 <code>vwadd.vv v16, v8, v12</code>를 디코드한다. uop은 몇 개인가?</p>
+      <div class="seg" id="puop-choice"><button class="on">4</button><button>8</button><button>16</button><button>illegal</button></div>
+      <div class="btn-row"><button class="btn primary" id="puop-run">분할해 보기</button></div>
+      <div class="verdict grey" id="puop-out">아직 확인하지 않음</div>
+    </div>
+  </div>
+  <p>쪼갠 uop은 한 사이클에 rename 슬롯 8개(<code>RenameWidth</code>)까지만 나갈 수 있다. m8 명령 하나가 8칸을 다 쓰면, 같은 사이클에 들어온 다른 명령은 기다려야 한다. 넘치는 uop은 최대 7개짜리 uop 버퍼에 남겨 다음 사이클에 먼저 내보낸다. 디코드 단계 전체 흐름은 <a href="ch05-decode-rename.html">5장 디코드와 리네임</a>에서 다루고, 여기서는 벡터 명령이 이 슬롯을 어떻게 채우는지만 본다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V4 · 디코드 수용</span><h4>누적 uop이 8에 닿는 명령까지 받는다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">버퍼에 남은 uop 수에서 시작해 앞 명령부터 uop 수(1·2·4·8로 올림)를 더한다. 누적이 처음 8 이상이 되는 명령까지 받고(ready), 8을 넘친 몫(0~7)은 uop 버퍼에 남긴다. redirect가 오면 버퍼 수를 0으로 비운다.</dd>
+      <dt>이유</dt><dd class="why">rename은 한 사이클에 8칸뿐이다. 큰 LMUL 명령 뒤에 오는 명령을 같은 사이클에 받으면 내보낼 곳이 없다. 넘침을 7칸 버퍼에 담아 두면 최대 7+8=15 uop을 한 번에 감당할 수 있다.</dd>
+      <dt>없으면</dt><dd>m8 명령이 끼면 uop을 잃거나, 반대로 사이클마다 명령 하나만 받아 rename 폭을 낭비한다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/vector/Decoder/UopBufferCtrlDecoder.scala:196-229; Select/ChannelUopSelect.scala:257-298; DecodeChannels.scala:61,226-245,300@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="sim" id="sim-dslot">
+    <div class="sim-head"><span class="sim-tag anim">ANIMATION</span><h3>디코드 슬롯 8칸과 uop 버퍼 7칸</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="ds-scn"><button class="on">m8 두 개</button><button>섞인 흐름</button><button>3 uop 반올림</button></div>
+      <div class="simpad" id="ds-view"></div>
+      <div class="ctl"><label>사이클 (드래그로 되감기) <output data-for="cyc" data-fmt="int"></output></label>
+        <input type="range" data-k="cyc" id="ds-cyc" min="0" max="6" step="1" value="0"></div>
+      <div class="btn-row"><button class="btn primary" id="ds-play">재생</button><button class="btn" id="ds-step">한 사이클</button><button class="btn" id="ds-reset">처음으로</button></div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">사이클</span><span class="v" id="ds-c">0</span></div>
+      <div class="stat"><span class="k">받은 명령</span><span class="v" id="ds-acc">-</span></div>
+      <div class="stat"><span class="k">내보낸 uop</span><span class="v acc" id="ds-out">-</span></div>
+      <div class="stat"><span class="k">버퍼에 남김</span><span class="v" id="ds-buf">-</span></div>
+    </div>
+    <div class="sim-note">합성 명령열에 V4 규칙(<code>UopBufferCtrlDecoder.scala:196-229</code>, 패턴 생성 <code>ChannelUopSelect.scala:257-298</code>)을 적용한다. rename이 항상 받을 수 있다고 가정했다. ① "m8 두 개"에서 두 번째 vadd가 첫 사이클에 왜 못 들어오는지 보세요. ② "섞인 흐름"에서 vwadd의 뒤쪽 uop 4개가 버퍼를 거쳐 다음 사이클 앞자리로 나가는지 확인하세요. ③ "3 uop 반올림"에서 빗금 칸이 무엇인지 생각해 보세요(반올림 칸이 실제 빈 슬롯이 되는지는 확인하지 못했다, 추론).</div>
+  </div>
+</section>
+
+<section>
+  <h2>추측 vtype: 디코드는 vtype을 미리 알아야 한다</h2>
+  <p>3절에서 본 대로 디코더는 vtype을 알아야 uop 수를 정한다. 그런데 vtype을 바꾸는 <code>vsetvli</code>는 실행 유닛에서 실행된다. 결과를 기다리면 vsetvli 뒤의 모든 벡터 명령이 디코드에서 멈춘다. 반복문마다 vsetvli가 있으니 성능이 크게 떨어진다. 해법은 vsetvli의 vtype을 프런트엔드에서 미리 계산하는 것이다. <code>vsetvli</code>와 <code>vsetivli</code>는 vtype이 명령 안의 즉치라서 실행 전에도 알 수 있다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 260" role="img" aria-label="IBuffer의 VTypeGen에서 ROB의 VTypeBuffer까지 vtype이 흐르고 되돌아오는 경로">
+      <defs><marker id="m11-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-acc" x="10" y="30" width="96" height="62" rx="8"/><text x="58" y="56" text-anchor="middle" class="lbl-b">IBuffer</text><text x="58" y="78" text-anchor="middle" class="lbl-mono">VTypeGen</text>
+      <rect class="box" x="128" y="30" width="96" height="62" rx="8"/><text x="176" y="56" text-anchor="middle" class="lbl-b">Decode</text><text x="176" y="78" text-anchor="middle" class="lbl-mono">uop 분할</text>
+      <rect class="box" x="246" y="30" width="96" height="62" rx="8"/><text x="294" y="56" text-anchor="middle" class="lbl-b">Rename</text><text x="294" y="78" text-anchor="middle" class="lbl-mono">vl RAT</text>
+      <rect class="box-2" x="364" y="30" width="86" height="62" rx="8"/><text x="407" y="56" text-anchor="middle" class="lbl-b">ROB</text><text x="407" y="78" text-anchor="middle" class="lbl-mono">VTypeBuf</text>
+      <line class="ln" x1="106" y1="61" x2="126" y2="61" marker-end="url(#m11-4)"/>
+      <line class="ln" x1="224" y1="61" x2="244" y2="61" marker-end="url(#m11-4)"/>
+      <line class="ln" x1="342" y1="61" x2="362" y2="61" marker-end="url(#m11-4)"/>
+      <text x="58" y="20" text-anchor="middle" class="lbl-dim">명령마다 vtype 태그</text>
+      <path class="ln-acc" d="M407,92 V142 H58 V96" fill="none" marker-end="url(#m11-4)"/>
+      <text x="232" y="136" text-anchor="middle" class="lbl-acc">① 커밋 vtype → vtypeArch</text>
+      <path class="ln" d="M420,92 V182 H44 V96" fill="none" marker-end="url(#m11-4)"/>
+      <text x="232" y="176" text-anchor="middle" class="lbl">② 오예측: walk vtype → vtypeSpec</text>
+      <path class="ln-dash" d="M434,92 V222 H30 V96" fill="none" marker-end="url(#m11-4)"/>
+      <text x="232" y="216" text-anchor="middle" class="lbl-dim">③ vsetvl 커밋: flush + 새 vtype</text>
+      <text x="232" y="250" text-anchor="middle" class="lbl-mono">vtypeSpec 갱신 우선순위: ③ &gt; ② &gt; arch로 되감기 &gt; 새 그룹</text>
+    </svg>
+    <figcaption>vtype은 IBuffer 안의 VTypeGen에서 추측되어 명령에 붙고, ROB 옆 VTypeBuffer에 순서대로 기록된다. 되돌아오는 세 경로가 추측을 바로잡는다. 근거: <code>frontend/ibuffer/IBuffer.scala:70,334-341</code>, <code>backend/decode/VTypeGen.scala:126-148</code>.</figcaption>
+  </figure>
+  <p><code>VTypeGen</code>은 IBuffer 안에 있다. 디코드 폭(8)만큼 VSetFuncUnit을 두고, 같은 그룹 안의 vsetvli 결과를 Mux 사슬로 뒤 명령에 넘긴다. vsetvli·vsetivli 자신은 <code>vtype</code> 필드에 새 vtype을, <code>specvtype</code> 필드에 직전 vtype을 단다. 다른 명령은 앞선 가장 가까운 vsetvli의 새 vtype을 받는다(<code>VTypeGen.scala:66-67,115-117</code>, <code>frontend/ibuffer/IBuffer.scala:360-361</code>). 그룹의 마지막 vtype이 다음 그룹을 위한 <code>vtypeSpec</code>이 된다. 리셋 직후 vtype은 vill=1이다(<code>fu/vector/Bundles.scala:76-84</code>). 그래서 vsetvli 없이 벡터 명령을 쓰면 illegal이 된다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V5 · vsetvl flush</span><h4>vsetvl만 커밋 때 파이프를 비운다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond"><code>rawInst(31,25) == 1000000</code>(vsetvl)이면 <code>flushPipe := 1</code>. VTypeGen은 vsetvl을 처리하지 않는다(<code>vsetvlVType.valid := false</code>). vsetvl이 커밋되면 VTypeBuffer가 <code>hasVsetvl</code>을 내고 VTypeGen이 vtypeSpec과 vtypeArch를 실행 결과로 덮어쓴다.</dd>
+      <dt>이유</dt><dd class="why">vsetvl의 vtype은 레지스터 값이라 실행 전에는 모른다. 뒤 명령은 틀린 vtype으로 쪼개졌을 수 있으므로, 커밋 시점에 뒤를 모두 버리고 옳은 vtype으로 다시 디코드한다.</dd>
+      <dt>없으면</dt><dd>vsetvl 뒤 명령이 옛 vtype의 uop 수와 opcode로 실행되어 결과가 틀린다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/vector/Decoder/DecodeChannel/VsetDecoder.scala:43,129; backend/decode/VTypeGen.scala:41,126-148; backend/rob/VTypeBuffer.scala:385-387@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V6 · VTypeBuffer 입장</span><h4>vl을 쓰는 uop만, 56칸까지</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">VlWen이 켜진 uop만 한 칸씩 받는다. 직전 사이클에 계산한 "유효 항목 + 입장 수 ≤ 64 − 8 = 56"(<code>GatedValidRegNext</code>로 한 사이클 늦음)이 참이고 상태가 s_idle일 때만 <code>canEnq</code>. ROB 입장은 <code>vtypeBuffer.io.canEnq</code>가 0이면 막힌다. redirect가 오면 스냅샷이 있으면 s_walk, 없으면 s_spcl_walk로 간다.</dd>
+      <dt>이유</dt><dd class="why">오예측 지점까지 되감은 vtype을 VTypeGen에 돌려주려면 vtype이 프로그램 순서로 남아 있어야 한다. 8칸 여유는 한 사이클 최대 입장(RenameWidth=8)을 위한 것이다.</dd>
+      <dt>없으면</dt><dd>분기 오예측 뒤 잘못된 경로의 vsetvli가 남긴 vtype으로 올바른 경로를 디코드하게 된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/VTypeBuffer.scala:168-169,287-309,312-315,348; backend/rob/Rob.scala:172,200@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="sim" id="sim-vtype">
+    <div class="sim-head"><span class="sim-tag anim">ANIMATION</span><h3>추측 vtype과 복구 따라가기</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="vt-scn"><button class="on">정상 흐름</button><button>분기 오예측</button><button>vsetvl</button></div>
+      <div class="simpad" id="vt-view"></div>
+      <div class="ctl"><label>단계 (드래그로 되감기) <output data-for="stp" data-fmt="int"></output></label>
+        <input type="range" data-k="stp" id="vt-stp" min="0" max="5" step="1" value="0"></div>
+      <div class="btn-row"><button class="btn primary" id="vt-play">재생</button><button class="btn" id="vt-next">다음 단계</button><button class="btn" id="vt-reset">처음으로</button></div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">vtypeSpec</span><span class="v acc" id="vt-spec">-</span></div>
+      <div class="stat"><span class="k">vtypeArch</span><span class="v" id="vt-arch">-</span></div>
+      <div class="stat"><span class="k">VTypeBuffer</span><span class="v" id="vt-buf">-</span></div>
+      <div class="stat"><span class="k">vadd uop 수</span><span class="v" id="vt-uop">-</span></div>
+    </div>
+    <div class="sim-note">합성 명령열을 V5·V6 규칙과 <code>VTypeGen.scala:139-148</code>의 갱신 우선순위로 손으로 따라간 단계다. uop 수는 3절 분할 규칙으로 계산한다. ① "분기 오예측"에서 vadd의 uop 수가 4에서 1로 바뀌는 단계를 찾으세요. ② "vsetvl"에서 vadd가 처음에는 옛 vtype으로 쪼개지는 이유를 V5에서 확인하세요. ③ 세 시나리오 모두 vtypeArch는 커밋 때만 바뀌는지 보세요.</div>
+  </div>
+</section>
+
+<section>
+  <h2>벡터 레지스터 파일과 실행</h2>
+  <p>uop은 rename을 거쳐 벡터 이슈 큐로 간다. 벡터 쪽 실행은 <code>VecRegion</code>이라는 별도 영역에 모여 있다(<code>backend/Backend.scala:179</code>). 여기에는 벡터 이슈 큐, 이슈 파이프, 실행 유닛(Exu), 레지스터 파일, 쓰기 경로가 함께 들어 있다. 이슈 큐에서 실행 유닛까지의 일반적인 흐름은 <a href="ch06-dispatch-issue.html">6장</a>과 <a href="ch07-execute.html">7장</a>에서 다루므로, 여기서는 벡터만의 차이를 본다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 270" role="img" aria-label="VecRegion 안에서 이슈 큐, 이슈 파이프, 실행 유닛, 병합 유닛, 레지스터 파일로 가는 흐름">
+      <defs><marker id="m11-5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box" x="10" y="30" width="96" height="58" rx="8"/><text x="58" y="55" text-anchor="middle" class="lbl-b">Dispatch</text><text x="58" y="76" text-anchor="middle" class="lbl-mono">rename 뒤</text>
+      <rect class="box-acc" x="130" y="30" width="120" height="58" rx="8"/><text x="190" y="55" text-anchor="middle" class="lbl-b">벡터 IQ ×6</text><text x="190" y="76" text-anchor="middle" class="lbl-mono">VFEX0~3·VSTD</text>
+      <rect class="box-acc" x="274" y="30" width="176" height="58" rx="8"/><text x="362" y="55" text-anchor="middle" class="lbl-b">IssuePipe</text><text x="362" y="76" text-anchor="middle" class="lbl-mono">is0 → is1 → is2</text>
+      <rect class="box-2" x="274" y="140" width="176" height="58" rx="8"/><text x="362" y="165" text-anchor="middle" class="lbl-b">Exu (FU)</text><text x="362" y="186" text-anchor="middle" class="lbl-mono">ex0 … exN</text>
+      <rect class="box-ok" x="130" y="140" width="120" height="58" rx="8"/><text x="190" y="165" text-anchor="middle" class="lbl-b">MergeUnit</text><text x="190" y="186" text-anchor="middle" class="lbl-mono">tail·mask 병합</text>
+      <rect class="box" x="10" y="140" width="96" height="58" rx="8"/><text x="58" y="165" text-anchor="middle" class="lbl-b">VfRegFile</text><text x="58" y="186" text-anchor="middle" class="lbl-mono">물리 128개</text>
+      <line class="ln" x1="106" y1="59" x2="128" y2="59" marker-end="url(#m11-5)"/>
+      <line class="ln" x1="250" y1="59" x2="272" y2="59" marker-end="url(#m11-5)"/>
+      <line class="ln" x1="362" y1="88" x2="362" y2="138" marker-end="url(#m11-5)"/>
+      <line class="ln" x1="274" y1="169" x2="252" y2="169" marker-end="url(#m11-5)"/>
+      <line class="ln" x1="130" y1="169" x2="108" y2="169" marker-end="url(#m11-5)"/>
+      <path class="ln-dash" d="M58,140 V112 H300 V90" fill="none" marker-end="url(#m11-5)"/>
+      <text x="180" y="108" text-anchor="middle" class="lbl-dim">is1에서 읽기 주소</text>
+      <text x="10" y="232" class="lbl-mono">vl 물리 32개 · v0 물리 22개 · 논리 벡터 47개(32+15)</text>
+      <text x="10" y="256" class="lbl-dim">v0·vl은 별도 레지스터 파일, rename도 따로</text>
+    </svg>
+    <figcaption>벡터 uop은 is1에서 레지스터를 읽고 FU를 지나 MergeUnit에서 tail과 비활성 원소를 정리한 뒤 VfRegFile에 쓴다. 근거: <code>backend/vector/IssuePipe.scala:105-197</code>, <code>Exu.scala:137-166</code>, <code>Parameters.scala:95,133-149,321</code>.</figcaption>
+  </figure>
+  <p>논리 벡터 레지스터는 32개가 아니라 47개다. 15개(<code>VecInnerLogicRegs</code>)는 분할 중간값을 담는 내부 임시 레지스터다(<code>Parameters.scala:95,321</code>). vl과 v0도 각자 물리 레지스터 파일(32개, 22개)을 가지며 따로 rename된다. 벡터 이슈 큐는 6개이고 각각 16칸이다.</p>
+  <div class="table-wrap"><table class="data">
+    <tr><th>Exu</th><th>FU</th><th>FU 지연 (FuConfig)</th></tr>
+    <tr><td>VFEX0</td><td>Vialu, Vimac, Vmove, Vfcvt, Vfmac</td><td>1, 2, 0, 2, 3</td></tr>
+    <tr><td>VFEX1</td><td>Vialu, Vidiv, Vfmac, Vfdiv</td><td>1, 가변, 3, 가변</td></tr>
+    <tr><td>VFEX2, VFEX3</td><td>Vialu</td><td>1</td></tr>
+    <tr><td>VSTD0, VSTD1</td><td>VStd (벡터 store 데이터)</td><td>0</td></tr>
+  </table></div>
+  <p class="mini">근거: <code>Parameters.scala:483-552</code>(IQ 구성), <code>fu/FuConfig.scala:598,621,642,665,686,708,730</code>(지연). 실제 uop 지연은 디코드에서 <code>LatDecoder</code>가 opcode별로 정하므로 위 값과 다를 수 있다(<code>DecodeStage.scala:183</code>).</p>
+  <p>벡터 명령은 vl 밖의 원소(tail)와 마스크로 꺼진 원소를 어떻게 할지 정해야 한다. vtype의 <span class="term" data-def="tail agnostic. 1이면 tail 원소를 옛 값 유지 또는 모두 1로 채울 수 있고, 0(undisturbed)이면 옛 값을 유지해야 한다.">vta</span>와 <span class="term" data-def="mask agnostic. 마스크로 꺼진 원소에 대해 vta와 같은 선택을 한다.">vma</span>가 그 정책이다. undisturbed(0)이면 옛 목적 레지스터 값을 지켜야 하므로, 하드웨어는 옛 vd를 읽어 새 결과와 바이트 단위로 섞는다. 이 일을 FU 뒤의 <code>MergeUnit</code>이 한다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V7 · MergeUnit 범위</span><h4>uop마다 새 값을 쓸 바이트 끝(end)</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">vl을 바이트로 바꿔(vl×EEW/8) 그것이 몇 번째 레지스터(vlMapVdIdx)의 몇 번째 바이트(end)인지 구한다. uopIdx &lt; vlMapVdIdx이면 16바이트 전부, 같으면 end까지, 크면 0. 시작(begin)은 항상 0. 마스크는 <code>Fill(16, vm) | v0</code>. whole-register move는 언제나 16.</dd>
+      <dt>이유</dt><dd class="why">LMUL 그룹을 uop 여러 개로 나눴으므로, 각 uop은 vl 경계가 자기 레지스터의 앞인지 안인지 뒤인지 알아야 tail을 지킬 수 있다.</dd>
+      <dt>없으면</dt><dd>vl 밖의 원소를 덮어써 undisturbed 정책이 깨진다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/vector/Exu.scala:137-166,223-235@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="sim" id="sim-merge">
+    <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>tail과 mask 병합</h3></div>
+    <div class="sim-body">
+      <div class="seg" id="mg-sew"><button>e8</button><button>e16</button><button class="on">e32</button><button>e64</button></div>
+      <div class="seg" id="mg-mask"><button class="on">vm=1 (마스크 없음)</button><button>vm=0 규격 모델</button><button>vm=0 현재 코드</button></div>
+      <div class="seg" id="mg-vta"><button class="on">vta·vma=0 유지</button><button>vta·vma=1 agnostic</button></div>
+      <div class="ctl"><label>LMUL <output id="mg-lmul-o">m2</output></label>
+        <input type="range" data-k="lm" min="0" max="3" step="1" value="1"></div>
+      <div class="ctl"><label>vl <output data-for="vl" data-fmt="int"></output></label>
+        <input type="range" data-k="vl" id="mg-vl" min="0" max="8" step="1" value="6"></div>
+      <div class="simpad" id="mg-view"></div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">vlMapVdIdx</span><span class="v" id="mg-idx">-</span></div>
+      <div class="stat"><span class="k">end (바이트)</span><span class="v" id="mg-end">-</span></div>
+      <div class="stat"><span class="k">새 값 원소</span><span class="v acc" id="mg-act">-</span></div>
+      <div class="stat"><span class="k">마스크로 꺼짐</span><span class="v" id="mg-off">-</span></div>
+      <div class="stat"><span class="k">tail</span><span class="v" id="mg-tail">-</span></div>
+    </div>
+    <div class="sim-note">합성 입력에 V7의 end 계산을 적용한다. "규격 모델"의 v0 패턴은 원소 i가 i mod 3 ≠ 2일 때 켜진다고 가정했다. "현재 코드"는 이슈 파이프가 v0 데이터를 0으로 넣는 점(<code>IssuePipe.scala:195-197</code>, "//to do")을 반영하며, 이때 모든 원소가 꺼진 것으로 처리된다는 해석은 추론이다. ① e32·m2에서 vl=6이면 uop1의 end가 8바이트인지 확인하세요. ② vl을 최대로 올려 tail이 0이 되는지 보세요. ③ "현재 코드"로 바꿔 마스크 명령이 지금 어떤 상태인지 7절 표와 비교하세요.</div>
+  </div>
+</section>
+
+<section>
+  <h2>벡터 메모리: 일반 load 파이프에서 16바이트씩</h2>
+  <p>옛 설계에는 벡터 load/store 전용 유닛(VLSU)이 있었다. 원소별로 주소를 쪼개고(VSplit), 돌아온 조각을 모으는(VMergeBuffer) 구조였다. 이 브랜치는 그 유닛을 지웠다(<code>ls src/main/scala/xiangshan/mem/vector</code> → <code>VecCommon.scala</code> 1개). 대신 연속 주소를 읽는 <span class="term" data-def="연속된 주소에서 원소를 차례로 읽는 벡터 load/store. 원소 i의 주소 = base + i×EEW/8.">unit-stride</span> 접근은 uop 하나가 레지스터 하나(16바이트)를 맡으므로, 스칼라 load 파이프라인의 128비트 경로를 그대로 쓴다. load 파이프라인 자체는 <a href="ch09-loadstore.html">9장</a>, 16바이트 뱅크와 64바이트 캐시라인은 <a href="ch10-cache-mmu.html">10장</a>에서 다룬다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="vle32 m4가 uop 4개로 나뉘어 16바이트씩 캐시라인을 읽는 모습">
+      <defs><marker id="m11-6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="20" class="lbl-b">vle32.v v8, (a0) · e32·m4 → uop 4개</text>
+      <rect class="box-acc" x="10" y="34" width="102" height="44" rx="6"/><text x="61" y="53" text-anchor="middle" class="lbl-mono">uop0</text><text x="61" y="70" text-anchor="middle" class="lbl-mono">imm=0</text>
+      <rect class="box-acc" x="122" y="34" width="102" height="44" rx="6"/><text x="173" y="53" text-anchor="middle" class="lbl-mono">uop1</text><text x="173" y="70" text-anchor="middle" class="lbl-mono">imm=16</text>
+      <rect class="box-acc" x="234" y="34" width="102" height="44" rx="6"/><text x="285" y="53" text-anchor="middle" class="lbl-mono">uop2</text><text x="285" y="70" text-anchor="middle" class="lbl-mono">imm=32</text>
+      <rect class="box-acc" x="346" y="34" width="102" height="44" rx="6"/><text x="397" y="53" text-anchor="middle" class="lbl-mono">uop3</text><text x="397" y="70" text-anchor="middle" class="lbl-mono">imm=48</text>
+      <line class="ln" x1="61" y1="78" x2="61" y2="118" marker-end="url(#m11-6)"/>
+      <line class="ln" x1="173" y1="78" x2="173" y2="118" marker-end="url(#m11-6)"/>
+      <line class="ln" x1="285" y1="78" x2="285" y2="118" marker-end="url(#m11-6)"/>
+      <line class="ln" x1="397" y1="78" x2="397" y2="118" marker-end="url(#m11-6)"/>
+      <text x="230" y="102" text-anchor="middle" class="lbl-dim">일반 LoadUnit: vaddr = rs1 + imm</text>
+      <rect class="box-2" x="10" y="120" width="440" height="40" rx="6"/>
+      <line class="ln" x1="117" y1="120" x2="117" y2="160"/><line class="ln" x1="229" y1="120" x2="229" y2="160"/><line class="ln" x1="341" y1="120" x2="341" y2="160"/>
+      <text x="61" y="145" text-anchor="middle" class="lbl-mono">+0..15</text><text x="173" y="145" text-anchor="middle" class="lbl-mono">+16..31</text>
+      <text x="285" y="145" text-anchor="middle" class="lbl-mono">+32..47</text><text x="397" y="145" text-anchor="middle" class="lbl-mono">+48..63</text>
+      <text x="10" y="180" class="lbl-dim">a0가 64B 정렬이면 캐시라인 하나, 16B 접근 4번</text>
+      <rect class="box-warn" x="10" y="196" width="200" height="34" rx="6"/><text x="110" y="218" text-anchor="middle" class="lbl-mono">head: a0..경계</text>
+      <rect class="box-warn" x="220" y="196" width="230" height="34" rx="6"/><text x="335" y="218" text-anchor="middle" class="lbl-mono">tail: 다음 16B 경계</text>
+      <text x="10" y="246" class="lbl-dim">16B 경계를 넘는 uop은 두 번 접근(unalignHead → unalignTail)</text>
+    </svg>
+    <figcaption>연속 벡터 load는 uop i에 imm=16·i를 붙여, 일반 load처럼 rs1+imm 주소에서 16바이트를 읽는다. 16바이트 경계를 넘으면 head와 tail 두 번으로 나뉜다. 근거: <code>VectorDecodeChannel.scala:286</code>, <code>mem/pipeline/NewLoadUnit.scala:182,298,329,658</code>.</figcaption>
+  </figure>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V8 · 16B 경계 분할</span><h4>뱅크를 넘는 접근은 head와 tail로</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">벡터 size 인코딩(최상위 비트 1)은 16바이트 마스크(0xffff)를 만든다. 접근 범위가 16바이트 뱅크 경계를 넘으면(crossBank) <code>unalignHead</code>로 표시하고, 다음 사이클에 주소를 다음 16바이트 경계로 올린 <code>unalignTail</code>(size=QB, 뱅크 전체 읽기)을 다시 넣는다.</dd>
+      <dt>이유</dt><dd class="why">DCache는 16바이트 뱅크 단위로 읽는다. 경계를 넘는 16바이트는 뱅크 두 개에 걸치므로 한 번에 읽을 수 없다.</dd>
+      <dt>없으면</dt><dd>경계를 넘는 uop이 앞 뱅크 데이터만 받아 레지스터 뒤쪽이 틀린 값이 된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/mem/vector/VecCommon.scala:133-141; mem/pipeline/NewLoadUnit.scala:279-299,654-665@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">V9 · vstd 입장</span><h4>연속 벡터 store만 데이터 uop을 받는다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">store 주소 uop이 디스패치될 때, <code>isVecMemContinousOp</code>(unit-stride, whole, mask)일 때만 VecRegion의 vstd 큐에도 넣는다.</dd>
+      <dt>이유</dt><dd class="why">벡터 store 데이터(최대 16바이트)는 벡터 레지스터에서 읽어야 하므로 벡터 쪽 Exu(VSTD)가 공급한다. 지금은 연속 store만 이 경로가 있다.</dd>
+      <dt>없으면</dt><dd>store queue가 주소만 받고 데이터를 받지 못해 store가 끝나지 않는다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/Region.scala:306-309; backend/decode/opcode/Opcode.scala:426@09453ff8</dd>
+    </dl>
+  </div>
+  <div class="sim" id="sim-mem">
+    <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>벡터 load가 건드리는 16B 접근과 캐시라인</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="mm-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="seg" id="mm-mode"><button class="on">unit-stride</button><button>strided (일반 모델)</button></div>
+        <div class="seg" id="mm-eew"><button>e8</button><button>e16</button><button class="on">e32</button><button>e64</button></div>
+        <div class="ctl"><label>LMUL <output id="mm-lmul-o">m4</output></label>
+          <input type="range" data-k="lm" min="0" max="3" step="1" value="2"></div>
+        <div class="ctl"><label>base 오프셋 (바이트) <output data-for="off" data-fmt="int"></output></label>
+          <input type="range" data-k="off" min="0" max="63" step="1" value="0"></div>
+        <div class="ctl"><label>stride (바이트) <output data-for="str" data-fmt="int"></output></label>
+          <input type="range" data-k="str" min="0" max="64" step="4" value="24"></div>
+        <div class="verdict grey" id="mm-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">uop</span><span class="v" id="mm-uop">-</span></div>
+      <div class="stat"><span class="k">DCache 접근</span><span class="v acc" id="mm-acc">-</span></div>
+      <div class="stat"><span class="k">head·tail 분할</span><span class="v" id="mm-split">-</span></div>
+      <div class="stat"><span class="k">캐시라인</span><span class="v" id="mm-line">-</span></div>
+    </div>
+    <div class="sim-note">합성 주소(0x1000 + 오프셋), SEW=EEW, vl=VLMAX로 가정한다. unit-stride는 V8 규칙과 uop i 주소 = base + 16·i(<code>VectorDecodeChannel.scala:286</code>)를 따른다. strided는 원소마다 한 번 접근하는 <b>일반 모델</b>이며 KMHv3 이 커밋에서는 이 경로가 확인되지 않는다. ① 오프셋을 0에서 4로 바꿔 접근 수가 uop 수의 두 배가 되는지 보세요. ② m8, 오프셋 0이면 캐시라인 몇 개인지 세어 보세요. ③ strided로 바꿔 stride를 64로 올리면 원소마다 캐시라인이 하나씩 필요한 이유를 생각해 보세요.</div>
+  </div>
+</section>
+
+<section>
+  <h2>현재 상태: 다시 쓰는 중인 벡터</h2>
+  <p>이 장의 코드가 이상하게 보이는 곳(v0 데이터가 0, 벡터 예외가 꺼짐, strided 경로 없음)은 대부분 버그가 아니라 공사 중 흔적이다. 2026년 3월부터 새 벡터 실행 영역을 따로 만들고, 8월에 옛 디코더와 VLSU를 한꺼번에 지웠으며, 8월 말(2026-08-31)에 widening/narrowing 분할을, 9월에는 부동소수점 명령을 채우고 있다.</p>
+  <div class="callout decision"><strong>2026-08-06 옛 벡터 디코더와 VLSU를 지우고 새 디코더로 교체 (29f48d8a6)</strong><p>커밋 "feat(vector): new vector initial commit"(PR 번호 없음)은 193개 파일을 바꾸며 10,829줄을 지우고 18,775줄을 더했다. 지운 파일은 디코드 쪽 <code>VecDecoder</code>(843줄), <code>DecodeUnitComp</code>(2,059), <code>UopInfoGen</code>(275), <code>VecExceptionGen</code>(308)과 메모리 쪽 <code>VSplit</code>(573), <code>VMergeBuffer</code>(511), <code>VSegmentUnit</code>(1,017), <code>VfofBuffer</code>(140), <code>VecBundle</code>(334)다(<code>git show --stat 29f48d8a6</code>). 그 자리를 <code>backend/vector/Decoder/*</code>의 표 기반 디코더와, 연속 접근을 일반 load/store 파이프에 맡기는 구조가 대신한다.</p></div>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 260" role="img" aria-label="2026년 3월부터 9월까지 벡터 관련 주요 커밋 연표">
+      <line class="ln" x1="124" y1="18" x2="124" y2="246"/>
+      <text x="10" y="30" class="lbl-mono">2026-03-31</text><circle cx="124" cy="26" r="5" class="dot-acc"/><text x="138" y="31" class="lbl">VecRegion 새 실행 파이프</text>
+      <text x="10" y="58" class="lbl-mono">2026-04-25</text><circle cx="124" cy="54" r="5" class="dot-acc"/><text x="138" y="59" class="lbl">vstd를 벡터 Exu로</text>
+      <text x="10" y="86" class="lbl-mono">2026-06-04</text><circle cx="124" cy="82" r="5" class="dot-acc"/><text x="138" y="87" class="lbl">VS=Off이면 vset illegal</text>
+      <text x="10" y="114" class="lbl-mono">2026-06-05</text><circle cx="124" cy="110" r="5" class="dot-acc"/><text x="138" y="115" class="lbl">VSetFuncUnit vill 검사</text>
+      <text x="10" y="142" class="lbl-mono">2026-08-06</text><circle cx="124" cy="138" r="7" class="dot-acc"/><text x="138" y="143" class="lbl-acc2">옛 디코더·VLSU 삭제</text>
+      <text x="10" y="170" class="lbl-mono">2026-08-31</text><circle cx="124" cy="166" r="5" class="dot-acc"/><text x="138" y="171" class="lbl">widening·narrowing 분할</text>
+      <text x="10" y="198" class="lbl-mono">2026-09-03</text><circle cx="124" cy="194" r="5" class="dot-acc"/><text x="138" y="199" class="lbl">VIPU·VPPU·VPerm 정리</text>
+      <text x="10" y="226" class="lbl-mono">2026-09-12</text><circle cx="124" cy="222" r="5" class="dot-acc"/><text x="138" y="227" class="lbl">VFALU+VFMul → VFMac</text>
+      <text x="10" y="252" class="lbl-mono">2026-09-20</text><circle cx="124" cy="248" r="5" class="dot-acc"/><text x="138" y="253" class="lbl">벡터 부동소수점 명령 지원</text>
+    </svg>
+    <figcaption>새 벡터 파이프는 3월에 시작해 8월에 옛 구조를 대체했고, 9월에도 기능을 채우는 중이다. 커밋: 4599560c9, 75b088e55, 1df189187, ffc63e71c, 29f48d8a6, 9e29a4f7d, 0b0b12600, b84bb1543, 873aaf2ef.</figcaption>
+  </figure>
+  <div class="table-wrap"><table class="data">
+    <tr><th>기능</th><th>상태</th><th>근거 (@09453ff8)</th></tr>
+    <tr><td>vset 계열 디코드·vl 계산·추측 vtype</td><td><span class="chip done">동작</span></td><td><code>VsetDecoder.scala</code>, <code>VSetFuncUnit.scala</code>, <code>VTypeGen.scala</code></td></tr>
+    <tr><td>정수·부동소수점 산술 uop 분할</td><td><span class="chip done">동작</span></td><td><code>Split/SplitTable.scala</code>(e8 부동소수점은 표에 없음)</td></tr>
+    <tr><td>unit-stride·whole·mask load/store</td><td><span class="chip run">일반 파이프 재사용</span></td><td><code>NewLoadUnit.scala:182</code>, <code>Region.scala:306-309</code></td></tr>
+    <tr><td>strided·indexed load/store 실행</td><td><span class="chip wait">경로 없음 (추론)</span></td><td>디코드는 됨. <code>grep -rn "isStrided\|isIndexed" src/main/scala/xiangshan/mem</code> → 0건</td></tr>
+    <tr><td>segment(nf&gt;1) 의미론</td><td><span class="chip wait">경로 없음 (추론)</span></td><td>VSegmentUnit 삭제(29f48d8a6). 디코드는 nf배 uop만 만든다</td></tr>
+    <tr><td>v0 마스크 데이터</td><td><span class="chip blocked">0으로 고정</span></td><td><code>IssuePipe.scala:195-197</code> "//to do"</td></tr>
+    <tr><td>벡터 load 예외·vstart 재시작</td><td><span class="chip blocked">꺼짐</span></td><td><code>Rob.scala:1263,1266</code> "Todo[Vector]"(쓰기 쪽), <code>Rob.scala:1224,1227</code> 입장 쪽도 <code>false.B</code>; <code>NewLoadUnit.scala:1161</code></td></tr>
+    <tr><td>VecExcpDataMergeModule (654줄)</td><td><span class="chip none">연결만, 입력 항상 0</span></td><td><code>Backend.scala:198</code>, <code>Rob.scala:771</code></td></tr>
+    <tr><td>벡터 요청으로 prefetcher 학습</td><td><span class="chip none">하지 않음</span></td><td><code>NewLoadUnit.scala:1221-1224</code></td></tr>
+    <tr><td>레거시 <code>VsetModule</code>·VSetRiWi 등</td><td><span class="chip none">BackendV2 설정에서만</span></td><td><code>BackendParams.scala:710,779</code></td></tr>
+  </table></div>
+  <div class="callout tip"><strong>읽을 때의 요령</strong><p>코드에서 <code>Todo[Vector]</code>, <code>//to do</code>, <code>:= false.B // Todo</code>를 만나면 이 표에 있는지 먼저 확인한다. 표에 없는 동작을 "KMHv3 벡터는 이렇게 한다"고 일반화하지 않는다. 이 장의 strided 모드처럼 교과서 동작을 보여 줄 때는 일반 모델이라고 밝힌다.</p></div>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ul>
+    <li>RVV는 폭을 명령에 박지 않는다. 프로그램이 <code>vsetvli</code>로 AVL을 넘기면 하드웨어가 vl을 돌려주며, KMHv3(VLEN=128)는 AVL ≥ VLMAX이면 항상 VLMAX를 고른다.</li>
+    <li>VLMAX = 128 × LMUL / SEW이고, SEW &gt; min(LMUL,1)×64이면 vill이다. vill이면 vl=0이고 vtype 필드는 0이 된다.</li>
+    <li>데이터패스가 레지스터 하나 폭이므로 디코더는 SplitTable로 명령을 최대 8개 uop으로 쪼갠다. widening은 같은 LMUL에서 2배, m8은 불법이다.</li>
+    <li>디코드는 vtype을 미리 알아야 하므로 IBuffer의 VTypeGen이 vsetvli·vsetivli의 vtype을 추측한다. 오예측은 VTypeBuffer walk로, vsetvl은 커밋 때 flush로 바로잡는다.</li>
+    <li>연속 벡터 load/store는 별도 VLSU 없이 일반 load/store 파이프에서 uop마다 16바이트씩 처리하고, 16바이트 경계를 넘으면 head·tail 두 번으로 나눈다.</li>
+    <li>이 브랜치는 2026-08-06 이후 재작성 중이다. v0 마스크, 벡터 예외, strided·indexed·segment 실행은 아직 비어 있다.</li>
+  </ul>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="2">
+    <div class="q">VLEN=128인 KMHv3에서 <code>vsetvli t0, a0, e16, m2</code>를 a0=20으로 실행했다. t0는?</div>
+    <div class="opts"><button>20</button><button>10</button><button>16</button><button>8</button></div>
+    <div class="explain">VLMAX = 128×2/16 = 16이고 AVL=20 ≥ 16이므로 vl=VLMAX=16이다. 20은 VLMAX를 넘으므로 불가능하다. 10(ceil(20/2))은 규격이 허용하는 값이지만 KMHv3는 항상 VLMAX를 고른다(V1). 8은 m1일 때의 VLMAX다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">e32·m4에서 <code>vwadd.vv</code>가 uop 8개로 갈라지는 이유는?</div>
+    <div class="opts"><button>원본 피연산자 두 개를 따로 읽어야 해서</button><button>결과 원소가 64비트라 목적 레지스터 그룹이 8개가 되어서</button><button>widening은 항상 uop 8개로 고정이라서</button><button>reduction 트리를 만들어야 해서</button></div>
+    <div class="explain">widening은 결과 폭이 2배라 목적 그룹이 LMUL의 2배(8개)가 되고, 데이터패스는 레지스터 하나씩 쓴다(dupF2W). 피연산자 개수는 uop 수를 바꾸지 않는다. 고정 8개가 아니며 m1이면 2개다. reduction 트리는 vredsum의 이야기다.</div>
+  </div>
+  <div class="quiz" data-answer="3">
+    <div class="q"><code>vsetvl</code>(레지스터 vtype) 뒤의 vadd가 틀린 vtype으로 디코드될 수 있는데도 결과가 맞는 이유는?</div>
+    <div class="opts"><button>VTypeGen이 vsetvl의 rs2를 미리 읽기 때문</button><button>VTypeBuffer가 vsetvl을 받지 않기 때문</button><button>디코드가 vsetvl 실행까지 멈추기 때문</button><button>vsetvl이 커밋될 때 flushPipe로 뒤를 버리고 새 vtype으로 다시 디코드하기 때문</button></div>
+    <div class="explain">VsetDecoder가 vsetvl에만 flushPipe를 켜고, 커밋 때 hasVsetvl이 vtypeSpec을 실행 결과로 덮어쓴다(V5). VTypeGen은 vsetvl을 처리하지 않으며 rs2를 읽지 못한다. vsetvl도 VlWen uop이므로 VTypeBuffer에 들어간다. 디코드는 멈추지 않고 추측대로 진행한다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">KMHv3 이 커밋에서 <code>vle32.v</code>(e32·m2)가 주소 0x1004에서 시작한다. DCache 접근은 몇 번인가?</div>
+    <div class="opts"><button>4번</button><button>2번</button><button>8번</button><button>1번</button></div>
+    <div class="explain">uop은 2개(0x1004, 0x1014)이고, 둘 다 16바이트 경계를 넘으므로 각각 head와 tail로 나뉘어 4번이다(V8). 2번은 정렬된 경우다. 8번은 원소마다 접근하는 일반 모델 숫자다. 1번은 uop 분할을 무시한 답이다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08.</p>
+
+</main>
+</div>
+<script src="assets/ch11.js"></script>
+<script src="assets/ch11-b.js"></script>
+</body>
+</html>

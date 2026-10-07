@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="ko" data-book="kmhv3">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMHv3Book 1장 · CPU 기초와 KMHv3 지도</title>
+<link rel="stylesheet" href="assets/book.css">
+<script src="assets/book.js"></script>
+<style>
+  #blk-svg .blk { cursor: pointer; }
+  #blk-svg .blk:focus { outline: none; }
+  #blk-svg .blk:focus rect, #blk-svg .blk:hover rect { stroke: var(--accent); }
+  .blk-info { padding: 14px 18px; border-top: 1px solid var(--border); font-size: 15px; }
+  .blk-info h4 { margin: 0 0 6px; font-size: 17px; }
+  .blk-info ul { margin: 6px 0; padding-left: 20px; }
+  .blk-info .src { font-family: var(--mono); font-size: 12px; color: var(--text-dim); word-break: break-all; }
+  table.rn td.new { color: var(--accent); font-weight: 700; }
+  table.rn tr.cur td { background: var(--accent-soft); }
+  .isa { font-family: var(--mono); font-size: 13px; line-height: 1.8; word-break: break-word; background: var(--surface); border-radius: var(--radius-sm); padding: 12px 14px; }
+  .isa b { color: var(--accent); }
+  table.params { min-width: 720px; }
+  table.rn code, #ren-rat code, #cfg-table td { white-space: nowrap; }
+</style>
+</head>
+<body data-chapter="ch01">
+<div class="page">
+<main class="chapter">
+
+<div class="chapter-hero">
+  <div class="eyebrow">Chapter 01</div>
+  <h1>CPU 기초와 KMHv3 지도</h1>
+  <p class="lead">CPU는 명령어를 한 줄씩 읽어 실행하는 기계다. 그런데 현대 코어는 한 사이클에 여덟 줄을 읽고, 순서를 뒤섞어 실행하고, 다시 순서대로 확정한다. 이 장은 그 방법을 맨바닥에서부터 쌓아 올린 뒤, 같은 개념이 쿤밍후 v3(KMHv3) 코드의 어느 모듈에 들어 있는지 지도를 그린다. 이 장에서는 개념과 전체 구조만 다루고, 각 블록의 내부 규칙은 2장부터 한 블록씩 연다.</p>
+  <ul class="objectives">
+    <li>명령어, 클록, 파이프라인, 해저드를 자기 말로 설명할 수 있다.</li>
+    <li>슈퍼스칼라 폭과 비순차 실행이 IPC를 어떻게 바꾸는지 예측할 수 있다.</li>
+    <li>ROB와 레지스터 리네이밍이 왜 필요한지, 없으면 무엇이 깨지는지 말할 수 있다.</li>
+    <li>KMHv3의 XSTop → XSTile → XSCore → Frontend·Backend·MemBlock 계층과 실제 클래스 이름을 짚을 수 있다.</li>
+    <li>DefaultConfig의 핵심 수치(폭 8, ROB 352, L2 2MB 등)를 출처 줄과 함께 읽을 수 있다.</li>
+  </ul>
+</div>
+
+<section id="sec-instr">
+  <h2>명령어와 클록: CPU가 하는 일</h2>
+  <p>요리사가 레시피 카드를 한 장씩 넘기며 요리한다고 상상하자. 카드 한 장이 <span class="term" data-def="CPU가 이해하는 기계어 한 줄. RISC-V에서는 32비트(압축 명령어는 16비트)로 인코딩된다.">명령어<span class="en">(instruction)</span></span>이고, 어떤 카드가 존재하며 각 카드가 무슨 뜻인지 정한 약속이 <span class="term" data-def="Instruction Set Architecture. 소프트웨어와 하드웨어 사이의 계약. 이 책의 코어는 RISC-V 64비트(rv64)를 구현한다.">ISA<span class="en">(Instruction Set Architecture)</span></span>다. KMHv3는 RISC-V 64비트 ISA를 구현한다. 설정 코드의 <code>ISABase</code>가 <code>"rv64i"</code>다(<code>src/main/scala/xiangshan/Parameters.scala:303@09453ff8</code>).</p>
+  <p>CPU는 카드 한 장을 네 단계로 처리한다. 메모리에서 명령어를 <b>가져오고</b>(fetch), 비트를 <b>해석하고</b>(decode), 계산을 <b>실행하고</b>(execute), 결과를 레지스터에 <b>기록한다</b>(writeback). 그다음 프로그램 카운터(PC)를 다음 명령어로 옮긴다. 이 모든 일은 <span class="term" data-def="CPU 전체가 맞춰 움직이는 박자 1회. 레지스터는 클록 가장자리에서만 값을 바꾼다.">클록 사이클<span class="en">(clock cycle)</span></span>이라는 박자에 맞춰 일어난다. 레지스터는 박자마다 한 번만 값을 바꾼다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="add x3, x1, x2 명령어의 32비트 인코딩과 가져오기-해석-실행-기록 순환">
+      <defs><marker id="m1-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="10" y="20" class="lbl-b">add x3, x1, x2</text><text x="450" y="20" text-anchor="end" class="lbl-dim">32비트 R형 인코딩</text>
+      <rect class="box" x="10" y="32" width="96" height="34" rx="4"/><text x="58" y="54" text-anchor="middle" class="lbl-dim">funct7</text>
+      <rect class="box-2" x="106" y="32" width="69" height="34" rx="4"/><text x="140" y="54" text-anchor="middle" class="lbl">rs2=x2</text>
+      <rect class="box-2" x="175" y="32" width="69" height="34" rx="4"/><text x="209" y="54" text-anchor="middle" class="lbl">rs1=x1</text>
+      <rect class="box" x="244" y="32" width="41" height="34" rx="4"/><text x="264" y="54" text-anchor="middle" class="lbl-dim">f3</text>
+      <rect class="box-acc" x="285" y="32" width="69" height="34" rx="4"/><text x="319" y="54" text-anchor="middle" class="lbl">rd=x3</text>
+      <rect class="box" x="354" y="32" width="96" height="34" rx="4"/><text x="402" y="54" text-anchor="middle" class="lbl-dim">opcode</text>
+      <text x="58" y="84" text-anchor="middle" class="lbl-mono">0000000</text><text x="140" y="84" text-anchor="middle" class="lbl-mono">00010</text><text x="209" y="84" text-anchor="middle" class="lbl-mono">00001</text><text x="264" y="84" text-anchor="middle" class="lbl-mono">000</text><text x="319" y="84" text-anchor="middle" class="lbl-mono">00011</text><text x="402" y="84" text-anchor="middle" class="lbl-mono">0110011</text>
+      <text x="230" y="112" text-anchor="middle" class="lbl-dim">읽을 레지스터 둘(rs1, rs2), 쓸 레지스터 하나(rd), 연산 종류(opcode·funct)</text>
+      <rect class="box-acc" x="10" y="140" width="95" height="50" rx="10"/><text x="57" y="162" text-anchor="middle" class="lbl-b">가져오기</text><text x="57" y="181" text-anchor="middle" class="lbl-mono">fetch</text>
+      <rect class="box-acc" x="125" y="140" width="95" height="50" rx="10"/><text x="172" y="162" text-anchor="middle" class="lbl-b">해석</text><text x="172" y="181" text-anchor="middle" class="lbl-mono">decode</text>
+      <rect class="box-acc" x="240" y="140" width="95" height="50" rx="10"/><text x="287" y="162" text-anchor="middle" class="lbl-b">실행</text><text x="287" y="181" text-anchor="middle" class="lbl-mono">execute</text>
+      <rect class="box-acc" x="355" y="140" width="95" height="50" rx="10"/><text x="402" y="162" text-anchor="middle" class="lbl-b">기록</text><text x="402" y="181" text-anchor="middle" class="lbl-mono">writeback</text>
+      <line class="ln" x1="105" y1="165" x2="123" y2="165" marker-end="url(#m1-a)"/><line class="ln" x1="220" y1="165" x2="238" y2="165" marker-end="url(#m1-a)"/><line class="ln" x1="335" y1="165" x2="353" y2="165" marker-end="url(#m1-a)"/>
+      <path class="ln" d="M402,190 V222 H57 V192" marker-end="url(#m1-a)"/>
+      <text x="230" y="240" text-anchor="middle" class="lbl-dim">PC ← PC + 4, 다음 명령어로</text>
+    </svg>
+    <figcaption>명령어는 32비트 안에 "무엇을, 어디서 읽어, 어디에 쓸지"를 담는다. CPU는 이 카드를 가져오기 → 해석 → 실행 → 기록 순서로 처리하고 PC를 옮긴다.</figcaption>
+  </figure>
+  <p>가장 단순한 설계는 네 단계를 <b>한 사이클 안에</b> 모두 끝내는 단일 사이클 CPU다. 동작은 쉽지만 사이클 길이가 가장 느린 경로(예: 메모리 읽기 + 덧셈 + 쓰기)에 맞춰져 박자가 느려진다. 박자를 빠르게 하려면 일을 잘게 나눠야 하고, 그 아이디어가 다음 절의 파이프라인이다.</p>
+  <div class="callout tip"><strong>성능을 재는 한 줄 공식</strong><p>실행 시간 = 명령어 수 × (1 / <span class="term" data-def="Instructions Per Cycle. 한 사이클에 평균 몇 개의 명령어를 끝내는가. 높을수록 좋다.">IPC</span>) × 사이클 시간. 이 책의 거의 모든 장치는 IPC를 올리거나(더 많이, 덜 멈추게) 사이클 시간을 지키려는(한 박자 안에 일을 덜 하게) 목적을 가진다.</p></div>
+</section>
+
+<section id="sec-pipe">
+  <h2>파이프라인과 세 가지 해저드</h2>
+  <p>빨래를 생각하자. 세탁기, 건조기, 개기를 한 바구니씩 끝까지 한 뒤 다음 바구니를 시작하면 세 바구니에 아홉 시간이 걸린다. 첫 바구니가 건조기로 가는 순간 두 번째 바구니를 세탁기에 넣으면 다섯 시간이면 끝난다. 이것이 <span class="term" data-def="명령어 처리를 여러 단계로 나눠, 서로 다른 명령어가 서로 다른 단계를 동시에 지나가게 하는 구조. 한 명령어의 지연은 줄지 않지만 처리량이 늘어난다.">파이프라인<span class="en">(pipeline)</span></span>이다. 고전적인 5단 파이프라인은 IF(가져오기), ID(해석), EX(실행), MEM(메모리), WB(기록)로 나눈다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 236" role="img" aria-label="파이프라인 없이 15사이클, 5단 파이프라인으로 7사이클">
+      <text x="10" y="18" class="lbl-b">파이프라인 없음: 15 사이클</text>
+      <text x="10" y="44" class="lbl-mono">I1</text><text x="10" y="66" class="lbl-mono">I2</text><text x="10" y="88" class="lbl-mono">I3</text>
+      <g class="lbl-mono" text-anchor="middle">
+        <rect class="box-acc" x="40" y="30" width="125" height="20" rx="3"/><text x="102" y="44">F D E M W</text>
+        <rect class="box-2" x="165" y="52" width="125" height="20" rx="3"/><text x="227" y="66">F D E M W</text>
+        <rect class="box-ok" x="290" y="74" width="125" height="20" rx="3"/><text x="352" y="88">F D E M W</text>
+      </g>
+      <text x="10" y="128" class="lbl-b">5단 파이프라인: 7 사이클</text>
+      <text x="10" y="154" class="lbl-mono">I1</text><text x="10" y="176" class="lbl-mono">I2</text><text x="10" y="198" class="lbl-mono">I3</text>
+      <g class="lbl-mono" text-anchor="middle">
+        <rect class="box-acc" x="40" y="140" width="125" height="20" rx="3"/><text x="102" y="154">F D E M W</text>
+        <rect class="box-2" x="65" y="162" width="125" height="20" rx="3"/><text x="127" y="176">F D E M W</text>
+        <rect class="box-ok" x="90" y="184" width="125" height="20" rx="3"/><text x="152" y="198">F D E M W</text>
+      </g>
+      <line class="ln-dash" x1="40" y1="214" x2="415" y2="214"/>
+      <text x="40" y="230" class="lbl-dim">0</text><text x="215" y="230" text-anchor="middle" class="lbl-dim">7</text><text x="415" y="230" text-anchor="end" class="lbl-dim">15 사이클</text>
+    </svg>
+    <figcaption>한 명령어가 걸리는 시간(5칸)은 같지만, 단계를 겹치면 세 명령어가 7사이클에 끝난다. n개면 n + 4 사이클로 IPC가 1에 다가간다.</figcaption>
+  </figure>
+  <p>겹쳐 놓으면 서로 부딪힌다. 이 충돌을 <span class="term" data-def="파이프라인에서 다음 명령어가 예정된 사이클에 진행할 수 없게 만드는 상황. 데이터·제어·구조 세 종류가 있다.">해저드<span class="en">(hazard)</span></span>라 한다. 세 가지가 있다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 210" role="img" aria-label="데이터, 제어, 구조 해저드와 각각의 처방">
+      <defs><marker id="m3-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--bad)"/></marker></defs>
+      <rect class="box-warn" x="10" y="10" width="140" height="120" rx="10"/><text x="80" y="32" text-anchor="middle" class="lbl-b">데이터 해저드</text><text x="80" y="52" text-anchor="middle" class="lbl-dim">앞 결과가 아직 없다</text>
+      <text x="22" y="80" class="lbl-mono">lw  x1,0(x2)</text><text x="22" y="112" class="lbl-mono">add x3,x1,x4</text><path class="ln-bad" d="M50,84 C30,92 30,98 44,104" marker-end="url(#m3-a)"/>
+      <rect class="box-warn" x="160" y="10" width="140" height="120" rx="10"/><text x="230" y="32" text-anchor="middle" class="lbl-b">제어 해저드</text><text x="230" y="52" text-anchor="middle" class="lbl-dim">다음 PC를 아직 모른다</text>
+      <text x="172" y="80" class="lbl-mono">beq x5,x0,L</text><text x="172" y="112" class="lbl-mono">→ L? PC+4?</text>
+      <rect class="box-warn" x="310" y="10" width="140" height="120" rx="10"/><text x="380" y="32" text-anchor="middle" class="lbl-b">구조 해저드</text><text x="380" y="52" text-anchor="middle" class="lbl-dim">자원이 모자란다</text>
+      <text x="380" y="80" text-anchor="middle" class="lbl-mono">ALU 1개에</text><text x="380" y="112" text-anchor="middle" class="lbl-mono">명령 2개</text>
+      <rect class="box-ok" x="10" y="146" width="140" height="54" rx="10"/><text x="80" y="168" text-anchor="middle" class="lbl">포워딩·대기</text><text x="80" y="188" text-anchor="middle" class="lbl-dim">+ 리네이밍(4절)</text>
+      <rect class="box-ok" x="160" y="146" width="140" height="54" rx="10"/><text x="230" y="168" text-anchor="middle" class="lbl">분기 예측</text><text x="230" y="188" text-anchor="middle" class="lbl-dim">틀리면 플러시</text>
+      <rect class="box-ok" x="310" y="146" width="140" height="54" rx="10"/><text x="380" y="168" text-anchor="middle" class="lbl">유닛 늘리기</text><text x="380" y="188" text-anchor="middle" class="lbl-dim">슈퍼스칼라(3절)</text>
+    </svg>
+    <figcaption>세 해저드와 처방. 위 칸이 문제, 아래 칸이 이 책에서 만나게 될 해결책이다.</figcaption>
+  </figure>
+  <p><b>데이터 해저드</b>는 뒤 명령어가 앞 명령어의 결과를 읽어야 하는데 아직 나오지 않은 경우다. 결과를 레지스터 파일을 거치지 않고 바로 넘겨주는 <span class="term" data-def="실행 결과를 레지스터 파일에 쓰기 전에 다음 명령어의 입력으로 곧장 전달하는 경로. bypass라고도 한다.">포워딩<span class="en">(forwarding)</span></span>으로 대부분 해결하지만, 로드 결과는 MEM 단계가 끝나야 나오므로 한 사이클은 기다려야 한다. <b>제어 해저드</b>는 분기의 방향이 EX에서야 정해지는데 그 사이에 이미 다음 명령어를 가져와 버린 경우다. 틀린 길로 가져온 명령어는 버려야 한다(<span class="term" data-def="잘못 가져온 명령어들을 파이프라인에서 무효화하는 일. 프런트엔드에는 올바른 PC를 다시 알린다(redirect).">플러시<span class="en">(flush)</span></span>). <b>구조 해저드</b>는 같은 사이클에 같은 자원을 둘이 원하는 경우다.</p>
+
+  <div class="sim" id="sim-pipe">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>5단 파이프라인 사이클 재생기</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="pipe-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="seg" id="pipe-mode"><button class="on">비파이프라인</button><button>5단</button><button>해저드 포함</button></div>
+        <div class="ctl"><label>진행 (드래그로 되감기) <output id="pipe-t-out">0</output></label>
+          <input type="range" id="pipe-t" min="0" max="30" step="1" value="0"></div>
+        <div class="btn-row"><button class="btn primary" id="pipe-play">재생</button><button class="btn" id="pipe-step">한 사이클</button><button class="btn" id="pipe-reset">처음으로</button></div>
+        <div class="verdict grey" id="pipe-verdict">대기</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">사이클</span><span class="v" id="pipe-ro-c">0</span></div>
+      <div class="stat"><span class="k">끝난 명령어</span><span class="v" id="pipe-ro-n">0</span></div>
+      <div class="stat"><span class="k">IPC(끝까지)</span><span class="v acc" id="pipe-ro-ipc">0</span></div>
+      <div class="stat"><span class="k">멈춤·버린 칸</span><span class="v" id="pipe-ro-bub">0</span></div>
+    </div>
+    <div class="sim-note">① "비파이프라인"과 "5단"을 끝까지 돌려 같은 6개 명령어의 사이클 수(30 대 10)를 비교한다. ② "해저드 포함"에서 beq는 taken이라 바로 뒤 두 줄(PC+4의 <code>xor</code>, PC+8의 <code>and</code>)을 건너뛰고 <code>L:</code>로 간다. <code>add x3,x1,x4</code>가 ID에 한 칸 더 머무는 곳(로드-사용 1사이클)을 찾는다. ③ <code>beq</code>가 EX에 도달한 다음 사이클, 뒤에 따라오던 두 명령어가 ×로 버려지는 것을 본다. 일반 교과서 모델(포워딩 있음, 분기는 EX에서 판정, 예측은 not-taken)로 만든 장난감이며 KMHv3의 실제 단계 수가 아니다. 왜 그런지는 이 절 본문에서.</div>
+  </div>
+</section>
+
+<section id="sec-ooo">
+  <h2>넓게, 그리고 순서 없이: 슈퍼스칼라와 비순차 실행</h2>
+  <p>파이프라인의 IPC 상한은 1이다. 이를 넘으려면 한 사이클에 명령어를 여러 개 가져오고, 해석하고, 실행해야 한다. 이것이 <span class="term" data-def="한 사이클에 여러 명령어를 동시에 처리하는 구조. 한 사이클에 처리하는 최대 개수를 폭(width)이라 한다.">슈퍼스칼라<span class="en">(superscalar)</span></span>다. KMHv3는 디코드·리네임·커밋 폭이 모두 8이다(<code>DecodeWidth = 8</code>, <code>RenameWidth = 8</code>, <code>CommitWidth = 8</code>, <code>src/main/scala/xiangshan/Parameters.scala:81-83@09453ff8</code>).</p>
+  <p>폭만 넓혀서는 부족하다. 앞의 명령어 하나가 캐시 미스로 수백 사이클을 기다리면, 순서대로만 실행하는 코어는 그 뒤의 독립적인 명령어까지 모두 멈춘다. 식당 주방을 떠올리자. 주문은 들어온 순서대로 받지만, 조리는 재료가 준비된 요리부터 한다. 손님에게 내갈 때는 다시 주문 순서를 지킨다. 이것이 <span class="term" data-def="Out-of-Order 실행. 프로그램 순서와 무관하게 피연산자가 준비된 명령어부터 실행한다. 결과 확정(커밋)은 다시 순서대로 한다.">비순차 실행<span class="en">(out-of-order, OoO)</span></span>의 골격이다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 220" role="img" aria-label="주문은 순서대로, 조리는 순서 없이, 서빙은 다시 순서대로">
+      <defs><marker id="m4-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <text x="57" y="20" text-anchor="middle" class="lbl-acc">순서대로</text><text x="230" y="20" text-anchor="middle" class="lbl-bad">순서 없이</text><text x="397" y="20" text-anchor="middle" class="lbl-acc">순서대로</text>
+      <rect class="box-acc" x="10" y="32" width="95" height="76" rx="10"/><text x="57" y="58" text-anchor="middle" class="lbl-b">주문 접수</text><text x="57" y="78" text-anchor="middle" class="lbl-mono">페치·디코드</text><text x="57" y="96" text-anchor="middle" class="lbl-mono">·리네임</text>
+      <rect class="box" x="125" y="32" width="95" height="76" rx="10"/><text x="172" y="58" text-anchor="middle" class="lbl-b">대기표</text><text x="172" y="80" text-anchor="middle" class="lbl-mono">이슈 큐</text>
+      <rect class="box-2" x="240" y="32" width="95" height="76" rx="10"/><text x="287" y="58" text-anchor="middle" class="lbl-b">조리대</text><text x="287" y="80" text-anchor="middle" class="lbl-mono">실행 유닛</text>
+      <rect class="box-acc" x="350" y="32" width="100" height="76" rx="10"/><text x="400" y="58" text-anchor="middle" class="lbl-b">서빙대</text><text x="400" y="80" text-anchor="middle" class="lbl-mono">ROB 커밋</text>
+      <line class="ln" x1="105" y1="70" x2="123" y2="70" marker-end="url(#m4-a)"/><line class="ln" x1="220" y1="70" x2="238" y2="70" marker-end="url(#m4-a)"/><line class="ln" x1="335" y1="70" x2="348" y2="70" marker-end="url(#m4-a)"/>
+      <g class="lbl-b" text-anchor="middle">
+        <circle class="box-acc" cx="27" cy="140" r="11"/><text x="27" y="145">1</text><circle class="box-acc" cx="47" cy="140" r="11"/><text x="47" y="145">2</text><circle class="box-acc" cx="67" cy="140" r="11"/><text x="67" y="145">3</text><circle class="box-acc" cx="87" cy="140" r="11"/><text x="87" y="145">4</text>
+        <circle class="box-2" cx="257" cy="140" r="11"/><text x="257" y="145">3</text><circle class="box-2" cx="277" cy="140" r="11"/><text x="277" y="145">4</text><circle class="box-2" cx="297" cy="140" r="11"/><text x="297" y="145">2</text><circle class="box-warn" cx="317" cy="140" r="11"/><text x="317" y="145">1</text>
+        <circle class="box-ok" cx="370" cy="140" r="11"/><text x="370" y="145">1</text><circle class="box-ok" cx="390" cy="140" r="11"/><text x="390" y="145">2</text><circle class="box-ok" cx="410" cy="140" r="11"/><text x="410" y="145">3</text><circle class="box-ok" cx="430" cy="140" r="11"/><text x="430" y="145">4</text>
+      </g>
+      <text x="287" y="176" text-anchor="middle" class="lbl-dim">1번은 재료(캐시 미스)를 기다리는 중</text>
+      <text x="230" y="204" text-anchor="middle" class="lbl-dim">끝난 순서는 3·4·2·1이어도, 확정은 1·2·3·4</text>
+    </svg>
+    <figcaption>비순차 코어의 세 구간. 앞과 뒤는 프로그램 순서를 지키고, 가운데 실행만 순서를 푼다.</figcaption>
+  </figure>
+  <p>왜 끝에서 다시 순서를 지켜야 할까? 3번이 먼저 끝나 레지스터를 바꿔 버렸는데 1번이 페이지 폴트를 낸다면, 운영체제는 "1번 직전 상태"를 볼 수 없다. 결과를 프로그램 순서대로 확정하는 일을 <span class="term" data-def="실행이 끝난 명령어의 결과를 프로그램 순서대로 아키텍처 상태로 확정하는 일. 이 지점 이전의 명령어는 모두 끝났고 이후는 하나도 반영되지 않았음을 보장한다.">커밋<span class="en">(commit)</span></span>이라 하고, 그 덕분에 예외가 <b>정확</b>(precise)해진다.</p>
+
+  <div class="sim" id="sim-ooo">
+    <div class="sim-head"><span class="sim-tag predict">Predict</span><h3>순차 코어 대 비순차 코어: 캐시 미스 하나</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="ooo-cv" class="tall"></canvas></div>
+      <div class="sim-controls">
+        <p style="margin:0">8개 명령어의 맨 앞 <code>ld x1</code>이 캐시 미스다. 비순차 코어에서 <code>mul x4</code>(2번)는 6사이클 무렵 실행이 끝난다. 그렇다면 <code>mul</code>의 <b>커밋</b>은 언제일까? 먼저 고른 뒤 실행하자.</p>
+        <div class="seg" id="ooo-choice"><button class="on">실행 직후</button><button>ld 커밋 이후</button><button>프로그램 끝</button></div>
+        <div class="btn-row"><button class="btn primary" id="ooo-run">실행</button></div>
+        <div class="verdict grey" id="ooo-out">아직 실행하지 않음</div>
+        <div class="ctl"><label>미스 지연(사이클) <output data-for="lat" data-fmt="int"></output></label>
+          <input type="range" data-k="lat" min="2" max="40" step="1" value="20"></div>
+        <div class="ctl"><label>창 크기(ROB 칸) <output data-for="win" data-fmt="int"></output></label>
+          <input type="range" data-k="win" min="2" max="8" step="1" value="8"></div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">순차 코어</span><span class="v" id="ooo-ro-in">0<small>cyc</small></span></div>
+      <div class="stat"><span class="k">비순차 코어</span><span class="v acc" id="ooo-ro-oo">0<small>cyc</small></span></div>
+      <div class="stat"><span class="k">절감</span><span class="v" id="ooo-ro-save">0</span></div>
+      <div class="stat"><span class="k">mul 끝남 → 커밋</span><span class="v" id="ooo-ro-mul">-</span></div>
+    </div>
+    <div class="sim-note">① 미스 지연을 2로 낮추면 절감이 9사이클에서 3사이클로 줄어드는 것을 본다. 숨길 기다림이 짧으면 비순차의 이득도 작다. ② 지연 20과 40에서 절감이 똑같이 9사이클인 것을 본다. 숨길 수 있는 일은 미스 뒤 독립 명령어의 양만큼이다. ③ 창 크기를 2로 줄이면 비순차 코어가 미스 뒤로 명령어를 들이지 못해 이득이 사라진다. 모델: 둘 다 발행 폭 1, 커밋 폭 4, 지연 ALU 1·mul 3·로드 적중 3의 합성 가정. 이유는 4절(ROB).</div>
+  </div>
+
+  <p>그렇다면 폭은 넓을수록 좋을까? 아래 실험은 합성 명령어 3,000개를 폭 1~12인 비순차 코어에 넣어 IPC를 잰다. 프로그램 안의 의존이 많으면 폭을 늘려도 IPC가 따라오지 않는다. 또 KMHv3의 정수 쪽 실행 유닛은 ALU 6, 분기(BJU) 3, 로드(LDU) 3, 스토어 주소(STA) 2, 스토어 데이터(STD) 2개다(<code>Parameters.scala:341-445@09453ff8</code>의 <code>ExeUnitParams(</code> 16개). 폭이 8이어도 같은 종류 명령어가 몰리면 유닛 수에서 막힌다.</p>
+
+  <div class="sim" id="sim-ipc">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>폭을 늘리면 IPC는 얼마나 오르나</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="ipc-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctl"><label>폭(디스패치·커밋) <output data-for="w" data-fmt="int"></output></label>
+          <input type="range" data-k="w" min="1" max="12" step="1" value="8"></div>
+        <div class="ctl"><label>의존 밀도 <output data-for="dep" data-fmt="pct"></output></label>
+          <input type="range" data-k="dep" min="0.1" max="0.9" step="0.1" value="0.5"></div>
+        <div class="ctl"><label>로드 비율 <output data-for="ld" data-fmt="pct"></output></label>
+          <input type="range" data-k="ld" min="0.1" max="0.6" step="0.05" value="0.25"></div>
+        <div class="ctl"><label><input type="checkbox" data-k="cap" checked> KMHv3 유닛 수 제한(ALU 6·BJU 3·LDU 3·STA 2)</label></div>
+        <div class="verdict grey" id="ipc-verdict">계산 중</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">현재 폭의 IPC</span><span class="v acc" id="ipc-ro-cur">0</span></div>
+      <div class="stat"><span class="k">폭 12의 IPC</span><span class="v" id="ipc-ro-max">0</span></div>
+      <div class="stat"><span class="k">폭 +1의 이득</span><span class="v" id="ipc-ro-gain">0</span></div>
+    </div>
+    <div class="sim-note">① 의존 밀도를 0.9로 올리면 폭 2부터 곡선이 평평해지는 것(IPC 약 1.6)을 본다. ② 로드 비율을 0.6으로 올리고 유닛 수 제한을 켜고 끄며, 실선(제한)과 점선(무제한)이 갈라지는 폭을 찾는다. LDU 3개가 병목이다. ③ 폭 8에서 +1의 이득이 몇 %인지 읽는다. 합성 가정: ALU·분기 지연 1, 로드 4, ROB 352칸, 분기 예측은 항상 맞음. 실제 KMHv3의 IPC가 아니다. 왜 그런지는 이 절과 7장.</div>
+  </div>
+</section>
+
+<section id="sec-rob">
+  <h2>추측 실행과 순차 커밋: ROB와 레지스터 리네이밍</h2>
+  <p>비순차 코어는 분기 결과도 기다리지 않는다. <span class="term" data-def="Branch Prediction Unit. 분기 방향과 목적지를 미리 맞히는 장치. KMHv3는 BTB, TAGE, RAS 등으로 구성한다(2~3장).">분기 예측기</span>가 맞힌 방향으로 먼저 가져와 실행하는 것을 <span class="term" data-def="결과가 확정되지 않은 예측(분기 방향 등)을 믿고 앞질러 실행하는 것. 예측이 틀리면 그 뒤 명령어를 모두 버린다.">추측 실행<span class="en">(speculative execution)</span></span>이라 한다. 예측이 틀리면 그 뒤 명령어를 전부 버리고 올바른 주소에서 다시 가져온다. 이렇게 "확정 전 상태"와 "확정 후 상태"를 나누는 장부가 <span class="term" data-def="Reorder Buffer. 디스패치된 명령어를 프로그램 순서대로 줄 세워 두는 원형 큐. 머리(head)부터 완료된 것만 커밋한다.">ROB<span class="en">(Reorder Buffer)</span></span>다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 196" role="img" aria-label="ROB는 원형 큐. head에서 커밋하고 tail로 들어온다">
+      <defs><marker id="m5-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <g>
+        <rect class="box-grey" x="22" y="70" width="24" height="40" rx="3"/><rect class="box-grey" x="48" y="70" width="24" height="40" rx="3"/><rect class="box-grey" x="74" y="70" width="24" height="40" rx="3"/>
+        <rect class="box-warn" x="100" y="70" width="24" height="40" rx="3"/><rect class="box-ok" x="126" y="70" width="24" height="40" rx="3"/><rect class="box-ok" x="152" y="70" width="24" height="40" rx="3"/>
+        <rect class="box-warn" x="178" y="70" width="24" height="40" rx="3"/><rect class="box-ok" x="204" y="70" width="24" height="40" rx="3"/><rect class="box-warn" x="230" y="70" width="24" height="40" rx="3"/>
+        <rect class="box-ok" x="256" y="70" width="24" height="40" rx="3"/><rect class="box-warn" x="282" y="70" width="24" height="40" rx="3"/><rect class="box-warn" x="308" y="70" width="24" height="40" rx="3"/>
+        <rect class="box-grey" x="334" y="70" width="24" height="40" rx="3"/><rect class="box-grey" x="360" y="70" width="24" height="40" rx="3"/><rect class="box-grey" x="386" y="70" width="24" height="40" rx="3"/><rect class="box-grey" x="412" y="70" width="24" height="40" rx="3"/>
+      </g>
+      <text x="112" y="30" text-anchor="middle" class="lbl-acc">head</text><text x="112" y="48" text-anchor="middle" class="lbl-mono">deqPtr</text><line class="ln" x1="112" y1="52" x2="112" y2="68" marker-end="url(#m5-a)"/>
+      <text x="346" y="30" text-anchor="middle" class="lbl-acc2">tail</text><text x="346" y="48" text-anchor="middle" class="lbl-mono">enqPtr</text><line class="ln" x1="346" y1="52" x2="346" y2="68" marker-end="url(#m5-a)"/>
+      <path class="ln-dash" d="M436,112 V132 H22 V114" marker-end="url(#m5-a)"/><text x="230" y="148" text-anchor="middle" class="lbl-dim">끝에 닿으면 처음으로 돈다(원형 큐)</text>
+      <rect class="box-warn" x="22" y="164" width="14" height="14" rx="2"/><text x="42" y="176" class="lbl-dim">실행 중</text>
+      <rect class="box-ok" x="112" y="164" width="14" height="14" rx="2"/><text x="132" y="176" class="lbl-dim">완료, 커밋 대기</text>
+      <rect class="box-grey" x="252" y="164" width="14" height="14" rx="2"/><text x="272" y="176" class="lbl-dim">빈 칸</text>
+    </svg>
+    <figcaption>ROB 장부. head의 명령어(주황)가 끝나지 않으면 그 뒤의 완료된 명령어(초록)도 커밋하지 못한다. KMHv3의 ROB는 352칸이다.</figcaption>
+  </figure>
+  <p>KMHv3의 ROB는 <code>RobSize = 352</code>칸이다(<code>Parameters.scala:114@09453ff8</code>). 한 사이클에 리네임 폭만큼(8개) 들어오고, head에서 최대 <code>CommitWidth</code>(8개)가 나간다. ROB 입구와 출구에는 다음 두 관문이 있다.</p>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G1 · allowEnqueueForDispatch</span><h4>ROB 입장: 디스패치는 16칸 여유를 두고 멈춘다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">디스패치가 보는 허가: allowEnqueueForDispatch := numValidEntries + dispatchNum &lt;= RobSize − 2×RenameWidth (= 352 − 16 = 336), dispatch.io.enqRob.canAccept := enqRob.canAcceptForDispatch &amp;&amp; …. ROB 자신의 허가 allowEnqueue는 ≤ 344(RobSize − RenameWidth)이며 마지막 안전판이다. numValidEntries는 이번 사이클 입장 전 점유, dispatchNum은 이번 사이클 입장 수</dd>
+      <dt>이유</dt><dd class="why">허가 자체가 레지스터라 한 사이클 늦게 쓰이고, 디스패치와 ROB 사이에 RegNext 1단이 더 있다. 그래서 허가를 끈 시점에도 8개 묶음 두 개(파이프 안 1개, 그다음 디스패치 1개)가 더 들어올 수 있어 2×8 = 16칸 여유가 필요하다. 그 결과 점유는 352까지 찰 수 있다.</dd>
+      <dt>없으면</dt><dd>꽉 찬 ROB에 8개가 더 들어와 아직 커밋하지 않은 엔트리를 덮어쓴다. 덮인 명령어의 결과와 예외 정보가 사라진다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:971-972@09453ff8 · canAcceptForDispatch :201 · CtrlBlock.scala:797, :800</dd>
+    </dl>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G2 · commitValidThisLine</span><h4>순차 커밋: 앞이 안 끝나면 뒤도 못 나간다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">commit(i) = commit_v(i) &amp;&amp; commit_w(i) &amp;&amp; !isBlocked &amp;&amp; !isBlockedByOlder &amp;&amp; !hasCommitted(i); isBlockedByOlder = 앞 슬롯 중 하나라도 라이트백 전</dd>
+      <dt>이유</dt><dd class="why">프로그램 순서대로 확정해야 예외·인터럽트가 정확해진다. ROB는 8뱅크로 나뉘어 한 사이클에 8칸짜리 한 줄(line) 안에서만 커밋한다.</dd>
+      <dt>없으면</dt><dd>앞 명령어가 예외를 내도 뒤 명령어의 결과가 이미 반영돼, 운영체제가 복구할 정확한 지점이 없다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rob/Rob.scala:826, :832-842, 뱅크 수 :173@09453ff8</dd>
+    </dl>
+  </div>
+
+  <div class="sim" id="sim-rob">
+    <div class="sim-head"><span class="sim-tag anim">Animation</span><h3>ROB 원형 큐: 미스 하나가 352칸을 채우는 과정</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><canvas id="rob-cv"></canvas></div>
+      <div class="sim-controls">
+        <div class="seg" id="rob-size"><button class="on">Default 352</button><button>Minimal 48</button></div>
+        <div class="ctl"><label>미스 지연(사이클) <output data-for="miss" data-fmt="int"></output></label>
+          <input type="range" data-k="miss" min="0" max="400" step="20" value="200"></div>
+        <div class="btn-row"><button class="btn primary" id="rob-play">재생</button><button class="btn" id="rob-step">한 사이클</button><button class="btn" id="rob-reset">처음으로</button></div>
+        <div class="verdict grey" id="rob-verdict">대기</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">사이클</span><span class="v" id="rob-ro-c">0</span></div>
+      <div class="stat"><span class="k">점유</span><span class="v" id="rob-ro-occ">0</span></div>
+      <div class="stat"><span class="k">디스패치 막힌 사이클</span><span class="v" id="rob-ro-full">0</span></div>
+      <div class="stat"><span class="k">IPC</span><span class="v acc" id="rob-ro-ipc">0</span></div>
+    </div>
+    <div class="sim-note">① 재생하면 300번째 명령어마다 오는 미스 하나가 head에 걸린 동안 점유가 점선 336을 넘고 "디스패치 막힘"이 켜지는 것을 본다. 이미 파이프 안에 있던 묶음이 들어와 점유는 336과 352 사이에서 멈춘다(G1). ② Minimal 48로 바꾸면 미스 동안 품을 수 있는 명령어가 48개 이하라 IPC가 절반 가까이 떨어진다. ③ 미스 지연을 0으로 두면 Default의 IPC가 8에 붙는다(Minimal은 칸이 작아 짧은 지연에도 막힌다). 규칙은 실제 코드의 상수(디스패치 허가 ≤ RobSize−16, 디스패치→ROB 1사이클, 커밋은 8칸 줄 안에서 최대 8)이고, 명령어 지연(1~4)과 미스 위치는 합성이다. 왜 그런지는 G1·G2 카드와 8장.</div>
+  </div>
+
+  <p>비순차 실행에는 숨은 장애물이 하나 더 있다. 프로그램은 레지스터 이름을 재활용한다. <code>add x1,...</code> 다음에 한참 뒤 다시 <code>add x1,...</code>이 오면, 두 명령어는 값을 주고받지 않는데도 같은 이름 <code>x1</code> 때문에 순서가 묶인다. 이렇게 이름만 겹친 가짜 의존이 WAR(읽은 뒤 쓰기)과 WAW(쓴 뒤 쓰기)다. <span class="term" data-def="아키텍처 레지스터 이름(x1..x31)을 더 많은 물리 레지스터에 매번 새로 대응시켜 WAR/WAW 의존을 없애는 기법.">레지스터 리네이밍<span class="en">(register renaming)</span></span>은 목적지가 나올 때마다 새 <span class="term" data-def="실제 하드웨어 레지스터 파일의 칸. KMHv3 정수 쪽은 224개다(Parameters.scala:122).">물리 레지스터</span>를 하나 꺼내 주고, 이름 대응표(<span class="term" data-def="Rename Alias Table. 아키텍처 레지스터 → 현재 물리 레지스터 대응표.">RAT</span>)를 고친다. 비어 있는 물리 레지스터 번호를 모아 둔 큐가 <span class="term" data-def="아직 아무도 쓰지 않는 물리 레지스터 번호의 큐. 리네임에서 꺼내고, 커밋에서 이전 대응(old pdest)을 돌려받는다.">프리 리스트<span class="en">(free list)</span></span>다.</p>
+
+  <div class="sim" id="sim-ren">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>리네이밍 놀이터: 가짜 의존 지우기</h3></div>
+    <div class="sim-body">
+      <div class="table-wrap" style="margin:0"><table class="data rn" id="ren-table"></table></div>
+      <div class="table-wrap" style="margin:0"><table class="data" id="ren-rat"></table></div>
+      <div class="btn-row"><button class="btn primary" id="ren-step">한 줄 리네임</button><button class="btn" id="ren-all">끝까지</button><button class="btn" id="ren-reset">처음으로</button></div>
+      <div class="verdict grey" id="ren-verdict">대기</div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">리네임한 줄</span><span class="v" id="ren-ro-i">0</span></div>
+      <div class="stat"><span class="k">프리 리스트 남은 수</span><span class="v" id="ren-ro-free">223</span></div>
+      <div class="stat"><span class="k">의존 깊이 전 → 후</span><span class="v acc" id="ren-ro-depth">6 → ?</span></div>
+    </div>
+    <div class="sim-note">① 처음 상태에서 RAT의 x1~x10이 모두 p0인 것을 본다. KMHv3 정수 RAT의 리셋값이 실제로 "32개 모두 물리 0번"이다(RenameTable.scala:97). 프리 리스트는 p1부터 223개다(Rename.scala:117). ② 3번 줄 <code>add x1</code>이 p1이 아닌 p3을 받아, 2번 줄이 읽는 p1과 충돌하지 않는 것을 본다(WAR 소멸). ③ 끝까지 돌려 의존 깊이(동시에 시작할 수 있는 묶음 수)가 6에서 3으로 줄어드는지 확인한다. 아래 G3 카드가 이 표 뒤에 숨은 관문이다.</div>
+  </div>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G3 · canAllocate</span><h4>리네임 관문: 프리 리스트가 8개 미만이면 전부 멈춘다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">canAllocate := GatedValidRegNext(freeRegCnt &gt;= RenameWidth); canOut = dispatchCanAcc &amp;&amp; int·fp·vec·vl 4개 프리 리스트 모두 canAllocate &amp;&amp; !walk &amp;&amp; LSQ canAccept</dd>
+      <dt>이유</dt><dd class="why">한 사이클에 최대 8개 목적지에 새 번호를 줘야 한다. 개수 계산을 레지스터로 끊어 타이밍을 맞추므로 "8개 이상 남음"을 보수적으로 본다.</dd>
+      <dt>없으면</dt><dd>빈 번호가 없는데 할당하면 같은 물리 레지스터를 두 명령어가 나눠 써 값이 오염된다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/rename/freelist/StdFreeList.scala:68; backend/rename/Rename.scala:284-290, :463@09453ff8</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="sec-map">
+  <h2>KMHv3 지도: XSTop에서 코어의 세 덩어리까지</h2>
+  <p>이제 개념을 실제 코드에 겹쳐 보자. KMHv3는 Scala 기반 하드웨어 언어 Chisel로 쓰였고, 버스 연결을 위해 두 단계로 만들어지는 <span class="term" data-def="rocket-chip diplomacy의 모듈 틀. 먼저 버스 노드를 협상하고, 그다음 lazy val module(…Imp 클래스)에서 실제 회로를 만든다.">LazyModule</span>을 많이 쓴다. 빌드 기본 config는 <code>DefaultConfig</code>다(<code>Makefile:50</code> <code>CONFIG ?= DefaultConfig</code>). 이때 최상위는 <code>XSTop</code>이고, 그 안에 코어 1개와 L2를 묶은 <code>XSTile</code>이 있다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 300" role="img" aria-label="XSTop 안에 XSTile, 그 안에 XSCore와 L2Top, 밖에 OpenLLC">
+      <defs><marker id="m6-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-grey" x="6" y="6" width="448" height="288" rx="12"/><text x="18" y="26" class="lbl-b">XSTop</text><text x="76" y="26" class="lbl-mono">top/Top.scala:91</text>
+      <rect class="box" x="18" y="36" width="302" height="248" rx="10"/><text x="30" y="56" class="lbl-b">XSTile</text><text x="84" y="56" class="lbl-mono">XSTile.scala:34</text>
+      <rect class="box-acc" x="28" y="66" width="190" height="208" rx="8"/><text x="40" y="86" class="lbl-b">XSCore</text><text x="100" y="86" class="lbl-mono">XSCore.scala:77</text>
+      <rect class="box" x="40" y="96" width="166" height="50" rx="6"/><text x="52" y="117" class="lbl-b">Frontend</text><text x="52" y="136" class="lbl-mono">예측·페치 (CORE:64)</text>
+      <rect class="box" x="40" y="154" width="166" height="50" rx="6"/><text x="52" y="175" class="lbl-b">Backend</text><text x="52" y="194" class="lbl-mono">리네임~커밋 (CORE:66)</text>
+      <rect class="box" x="40" y="212" width="166" height="50" rx="6"/><text x="52" y="233" class="lbl-b">MemBlock</text><text x="52" y="252" class="lbl-mono">로드·스토어 (CORE:68)</text>
+      <rect class="box-2" x="228" y="66" width="82" height="208" rx="8"/><text x="269" y="88" text-anchor="middle" class="lbl-b">L2Top</text><text x="269" y="140" text-anchor="middle" class="lbl">CoupledL2</text><text x="269" y="162" text-anchor="middle" class="lbl-acc2">2MB</text><text x="269" y="182" text-anchor="middle" class="lbl-mono">4 bank</text>
+      <line class="ln" x1="206" y1="237" x2="226" y2="237" marker-end="url(#m6-a)"/><line class="ln" x1="206" y1="121" x2="226" y2="121" marker-end="url(#m6-a)"/>
+      <rect class="box-2" x="332" y="36" width="114" height="118" rx="10"/><text x="389" y="62" text-anchor="middle" class="lbl-b">OpenLLC</text><text x="389" y="88" text-anchor="middle" class="lbl-acc2">32MB</text><text x="389" y="110" text-anchor="middle" class="lbl-mono">16-way</text><text x="389" y="128" text-anchor="middle" class="lbl-mono">4 bank</text>
+      <rect class="box" x="332" y="166" width="114" height="118" rx="10"/><text x="389" y="196" text-anchor="middle" class="lbl-b">메모리</text><text x="389" y="218" text-anchor="middle" class="lbl-b">·주변장치</text><text x="389" y="248" text-anchor="middle" class="lbl-mono">CHI 버스</text>
+      <line class="ln" x1="310" y1="100" x2="330" y2="100" marker-end="url(#m6-a)"/><line class="ln" x1="389" y1="154" x2="389" y2="164" marker-end="url(#m6-a)"/>
+    </svg>
+    <figcaption>DefaultConfig 기본 빌드의 계층. XSTop → XSTile → (XSCore + L2Top), 바깥에 OpenLLC. 코어 밖 버스는 CHI다.</figcaption>
+  </figure>
+  <ul>
+    <li><code>XSTop</code>이 <code>XSTile</code>을 직접 만든다(<code>top/Top.scala:109</code>). <code>UseXSNoCTop = true</code>로 빌드하면 최상위가 <code>XSNoCTop</code>이 되고, 비동기 클록·전압 도메인을 나누는 <code>XSTileWrap</code>이 그 사이에 끼어든다(<code>top/Top.scala:674-677</code>, <code>XSTileWrap.scala:34-43</code>). 기본값은 false다(<code>system/SoC.scala:96</code>).</li>
+    <li><code>XSTile</code>은 <code>core = new XSCore</code>, <code>l2top = new L2Top</code> 두 개를 묶는다(<code>XSTile.scala:39-40</code>). L1 요청(DCache, ICache, PTW)은 L2Top 안의 버스로 모여 L2로 간다(<code>XSTile.scala:64-72</code>).</li>
+    <li><code>XSCore</code>(<code>XSCoreBase</code>, <code>XSCore.scala:59</code>)는 <code>Frontend</code>, <code>Backend</code>, <code>MemBlock</code> 세 덩어리다(<code>XSCore.scala:64-68</code>). 프런트엔드와 백엔드는 <code>frontend.io.backend &lt;&gt; backend.io.frontend</code> 한 줄로 이어지고(<code>XSCore.scala:136</code>), 이 번들의 <code>cfVec</code>이 한 사이클에 명령어 8개(<code>DecodeWidth</code>)를 넘긴다(<code>Bundle.scala:430</code>).</li>
+  </ul>
+  <p>아래 블록도는 세 덩어리 안의 주요 모듈을 실제 클래스 이름으로 그린 것이다. 블록을 누르면 역할, 핵심 수치, 소스 위치, 해당 장이 나온다.</p>
+
+  <div class="sim" id="sim-blk">
+    <div class="sim-head"><span class="sim-tag lab">Explorer</span><h3>KMHv3 코어 블록도: 눌러서 열기</h3></div>
+    <div class="sim-body">
+      <svg id="blk-svg" viewBox="0 0 460 412" role="img" aria-label="Frontend, Backend, MemBlock, L2Top의 주요 모듈 블록도"></svg>
+      <div class="btn-row"><button class="btn" id="blk-prev">◀ 이전 블록</button><button class="btn primary" id="blk-next">다음 블록 ▶</button></div>
+    </div>
+    <div class="blk-info" id="blk-info"></div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">선택</span><span class="v acc" id="blk-ro-name">-</span></div>
+      <div class="stat"><span class="k">덩어리</span><span class="v" id="blk-ro-grp">-</span></div>
+      <div class="stat"><span class="k">자세히</span><span class="v" id="blk-ro-ch">-</span></div>
+    </div>
+    <div class="sim-note">① <code>Rob</code>를 눌러 352칸과 커밋 폭 8이 앞 절의 G1·G2와 같은 숫자인지 확인한다. ② <code>Region</code>을 눌러 정수 실행 유닛 16개의 구성을 읽고, IPC 실험의 유닛 수와 맞춰 본다. ③ 화살표 버튼으로 Frontend → Backend → MemBlock 순서로 돌며 "명령어의 일생" 목록과 비교한다. 수치는 DefaultConfig 기준.</div>
+  </div>
+
+  <h3>명령어 한 개의 일생</h3>
+  <ol class="steps">
+    <li><b>예측</b> <code>Bpu</code>가 다음 페치 블록(시작 PC와 분기 위치)을 예측해 <code>Ftq</code>에 넣는다. <span class="io">frontend/bpu/Bpu.scala:49 → frontend/ftq/Ftq.scala:64</span></li>
+    <li><b>페치</b> FTQ가 <code>ICache</code>에 요청하고, <code>Ifu</code>가 바이트를 받아 명령어 단위로 자른 뒤 <code>IBuffer</code>에 쌓는다. <span class="io">Frontend.scala:225-244</span></li>
+    <li><b>디코드</b> IBuffer가 <code>cfVec</code>으로 8개씩 백엔드 <code>CtrlBlock</code>의 <code>DecodeStage</code>에 넘긴다. <span class="io">Frontend.scala:260 → CtrlBlock.scala:75</span></li>
+    <li><b>리네임</b> <code>Rename</code>이 프리 리스트에서 물리 레지스터를 받는다. <span class="io">CtrlBlock.scala:683 → rename/Rename.scala:117-120</span></li>
+    <li><b>디스패치</b> <code>Dispatch</code>가 uop을 이슈 큐와 ROB, LSQ에 넣는다. ROB 할당 요청은 레지스터 1단을 지난다. <span class="io">CtrlBlock.scala:784, :797</span></li>
+    <li><b>발행·레지스터 읽기·실행</b> <code>Region</code>의 <code>IssueQueueImp</code>에서 피연산자를 기다린 뒤 <code>DataPath</code>에서 읽고 <code>ExuBlock</code>에서 실행한다. 메모리 uop은 MemBlock의 <code>NewLoadUnit</code>/<code>NewStoreUnit</code>으로 간다. <span class="io">Region.scala:43-57, Backend.scala:572</span></li>
+    <li><b>라이트백</b> <code>WbDataPath</code>가 결과를 모아 ROB에 완료를 알린다. <span class="io">Backend.scala:214-217</span></li>
+    <li><b>커밋</b> <code>Rob</code>가 head에서 최대 8개를 순서대로 확정한다. 틀린 예측은 <code>RedirectGenerator</code>를 거쳐 프런트엔드로 되돌아간다(G4). <span class="io">rob/Rob.scala:837-842, CtrlBlock.scala:430</span></li>
+  </ol>
+  <div class="gate">
+    <div class="gate-head"><span class="gate-id">G4 · s1_s3_redirect</span><h4>리다이렉트 우선순위: ROB 플러시가 이긴다</h4><span class="actor code">CODE</span></div>
+    <dl>
+      <dt>조건</dt><dd class="cond">s1_s3_redirect = Mux(s1_robFlushRedirect.valid, s1_robFlushRedirect, s3_redirectGen); 프런트엔드로는 toFtq.redirect.valid := s5_flushFromRobValid || s3_redirectGen.valid</dd>
+      <dt>이유</dt><dd class="why">예외·인터럽트로 인한 ROB 플러시는 가장 오래된 명령어에서 나오므로, 같은 사이클의 분기 오예측보다 더 앞을 되돌린다. 더 오래된 쪽을 따라야 버릴 범위가 맞다.</dd>
+      <dt>없으면</dt><dd>더 젊은 분기 리다이렉트를 따르면 예외를 낸 명령어 뒤의 명령어 일부가 살아남아 커밋될 수 있다.</dd>
+      <dt>근거</dt><dd class="src">src/main/scala/xiangshan/backend/CtrlBlock.scala:142, :430-431; RedirectGenerator.scala:59@09453ff8</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="sec-param">
+  <h2>숫자로 보는 KMHv3: 파라미터, config, 캐시, ISA</h2>
+  <p>코어의 거의 모든 크기는 <code>XSCoreParameters</code>라는 case class의 기본값에서 나온다(<code>Parameters.scala:48</code>). config는 이 값을 덮어쓰는 층이다. 빌드 기본 <code>DefaultConfig</code>는 L1D(메모리 채널 2개 포함), L2, LLC 크기와 ZhuJiang 구성(<code>ZhuJiangConfig("32MB", ways = 16)</code>)만 바꾸고 코어 파라미터는 기본값 그대로 쓴다(<code>top/Configs.scala:583-589</code>). <code>KunminghuV3Config</code>라는 클래스는 없다(<code>grep -rn KunminghuV3 --include=*.scala src</code> 0건). "KunminghuV3"는 빌드가 붙이는 버전 태그(<code>KunminghuV3-Release-날짜</code> / <code>KunminghuV3-dev</code>, <code>build.mill:189-192</code>)일 뿐이다.</p>
+  <div class="table-wrap"><table class="data params">
+    <tr><th>이름</th><th class="num">DefaultConfig</th><th class="num">MinimalConfig</th><th>뜻</th><th>근거(Parameters.scala 등)</th></tr>
+    <tr><td><code>DecodeWidth / RenameWidth / CommitWidth</code></td><td class="num">8 / 8 / 8</td><td class="num">8 / 8 / 8</td><td>사이클당 처리 폭</td><td class="mono">P:81-83, C:100-101(CommitWidth는 덮어쓰지 않음)</td></tr>
+    <tr><td><code>FetchBlockSize</code></td><td class="num">64 B</td><td class="num">32 B</td><td>한 번에 예측·인출하는 바이트</td><td class="mono">FrontendParameters.scala:28, C:122</td></tr>
+    <tr><td><code>FtqSize</code></td><td class="num">64</td><td class="num">8</td><td>페치 목표 큐</td><td class="mono">ftq/FtqParameters.scala:23, C:170</td></tr>
+    <tr><td><code>IBuffer Size</code></td><td class="num">48</td><td class="num">24</td><td>명령어 버퍼</td><td class="mono">ibuffer/Parameters.scala:23, C:176</td></tr>
+    <tr><td><code>RobSize / RabSize</code></td><td class="num">352 / 352</td><td class="num">48 / 96</td><td>재정렬 버퍼</td><td class="mono">P:114-115, C:119-120</td></tr>
+    <tr><td><code>IssueQueueSize</code></td><td class="num">20</td><td class="num">10</td><td>ALU3~5 등 이슈 큐 엔트리</td><td class="mono">P:117, C:181</td></tr>
+    <tr><td>정수 / FP / 벡터 물리 레지스터</td><td class="num">224 / 256 / 128</td><td class="num">64 / 64 / 160</td><td>리네이밍 재료</td><td class="mono">P:121-138, C:183-200</td></tr>
+    <tr><td><code>VirtualLoadQueueSize</code></td><td class="num">120</td><td class="num">24</td><td>로드 큐</td><td class="mono">P:101, C:104</td></tr>
+    <tr><td><code>StoreQueuePhysicalSize × Multiple</code></td><td class="num">64 × 2</td><td class="num">16 × 2</td><td>스토어 큐(물리 × 가상 배수)</td><td class="mono">P:109-110, C:111-112</td></tr>
+    <tr><td><code>LoadPipelineWidth / StorePipelineWidth</code></td><td class="num">3 / 2</td><td class="num">3 / 2</td><td>로드·스토어 파이프 수</td><td class="mono">P:166-167</td></tr>
+    <tr><td><code>XLEN / VLEN</code></td><td class="num">64 / 128</td><td class="num">64 / 128</td><td>정수·벡터 레지스터 비트 폭</td><td class="mono">P:52-53</td></tr>
+    <tr><td><code>PAddrBits / VAddrBits</code></td><td class="num">48 / 50</td><td class="num">48 / 50</td><td>물리·가상 주소 비트(H 확장 + Sv48 → 50)</td><td class="mono">SoC.scala:57, P:694-706</td></tr>
+  </table></div>
+  <p>표의 정수 쪽 실행 유닛은 이슈 큐 13개, 실행 유닛 16개로 묶여 있다(<code>sed -n 341,452p Parameters.scala | grep -c 'IssueBlockParams(Seq('</code> = 13, <code>ExeUnitParams(</code> = 16). FP 쪽은 FEX 4개, 벡터 쪽은 VFEX 4개와 VSTD 2개다(<code>P:456-545</code>). 캐시 크기는 config가 공식으로 계산한다. 아래 실험의 공식은 <code>Configs.scala</code>의 줄을 그대로 옮긴 것이다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="L1I와 L1D 64KB, L2 2MB, LLC 32MB, 메모리로 이어지는 캐시 계층">
+      <defs><marker id="m7-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <rect class="box-acc" x="130" y="8" width="200" height="30" rx="6"/><text x="230" y="28" text-anchor="middle" class="lbl-b">코어 (XSCore)</text>
+      <rect class="box" x="90" y="54" width="135" height="44" rx="6"/><text x="157" y="72" text-anchor="middle" class="lbl-b">L1I 64KB</text><text x="157" y="90" text-anchor="middle" class="lbl-mono">256set × 4way</text>
+      <rect class="box" x="235" y="54" width="135" height="44" rx="6"/><text x="302" y="72" text-anchor="middle" class="lbl-b">L1D 64KB</text><text x="302" y="90" text-anchor="middle" class="lbl-mono">256set × 4way</text>
+      <rect class="box-2" x="60" y="114" width="340" height="40" rx="6"/><text x="230" y="132" text-anchor="middle" class="lbl-b">L2 (CoupledL2) 2MB</text><text x="230" y="148" text-anchor="middle" class="lbl-mono">4 bank × 1024set × 8way · 코어마다 1개</text>
+      <rect class="box-2" x="30" y="170" width="400" height="40" rx="6"/><text x="230" y="188" text-anchor="middle" class="lbl-b">LLC (OpenLLC) 32MB</text><text x="230" y="204" text-anchor="middle" class="lbl-mono">4 bank × 8192set × 16way · 칩 공유</text>
+      <rect class="box-grey" x="10" y="222" width="440" height="24" rx="6"/><text x="230" y="239" text-anchor="middle" class="lbl">메모리(DRAM)</text>
+      <line class="ln" x1="200" y1="38" x2="170" y2="52" marker-end="url(#m7-a)"/><line class="ln" x1="260" y1="38" x2="290" y2="52" marker-end="url(#m7-a)"/>
+      <line class="ln" x1="230" y1="98" x2="230" y2="112" marker-end="url(#m7-a)"/><line class="ln" x1="230" y1="154" x2="230" y2="168" marker-end="url(#m7-a)"/>
+    </svg>
+    <figcaption>DefaultConfig 캐시 계층. 모든 캐시 라인은 64B(CacheLineSize 512비트, P:80). 크기는 Configs.scala:584-587의 인자와 공식에서 나온다. 아래로 갈수록 크고 느리다(폭은 실제 비율이 아니다).</figcaption>
+  </figure>
+
+  <div class="sim" id="sim-cfg">
+    <div class="sim-head"><span class="sim-tag">Simulator</span><h3>config 탐색기: 크기 인자 → set 수</h3></div>
+    <div class="sim-body side">
+      <div class="sim-view"><div class="table-wrap" style="margin:0;border:0"><table class="data" id="cfg-table"></table></div></div>
+      <div class="sim-controls">
+        <div class="seg" id="cfg-preset"><button class="on">DefaultConfig</button><button>MinimalConfig</button></div>
+        <div class="ctl"><label>L1D 크기 <output id="cfg-l1-out">64KB</output></label>
+          <input type="range" id="cfg-l1" min="0" max="3" step="1" value="2"></div>
+        <div class="ctl"><label>L2 크기 <output id="cfg-l2-out">2MB</output></label>
+          <input type="range" id="cfg-l2" min="0" max="5" step="1" value="4"></div>
+        <div class="ctl"><label>L2 뱅크 수 <output id="cfg-bk-out">4</output></label>
+          <input type="range" id="cfg-bk" min="0" max="3" step="1" value="2"></div>
+        <div class="verdict grey" id="cfg-verdict">-</div>
+      </div>
+    </div>
+    <div class="sim-readout">
+      <div class="stat"><span class="k">L1D sets</span><span class="v acc" id="cfg-ro-l1">0</span></div>
+      <div class="stat"><span class="k">L2 sets/bank</span><span class="v acc" id="cfg-ro-l2">0</span></div>
+      <div class="stat"><span class="k">LLC sets/bank</span><span class="v" id="cfg-ro-llc">0</span></div>
+    </div>
+    <div class="sim-note">① MinimalConfig를 눌러 L2가 128KB·1뱅크 → 256 set이 되는 것을 본다(C:95, C:339 공식). ② DefaultConfig에서 L2 뱅크를 8로 올리면 같은 2MB가 뱅크당 512 set으로 쪼개진다. 뱅크는 동시에 여러 요청을 받으려고 나눈 것이다. ③ L1D를 128KB로 올려 set이 512가 되는 것을 본다. 이 탐색기는 공식만 계산한다. 실제 빌드가 그 크기를 허용하는지(다른 require)는 확인하지 않았다(추론). 캐시 내부는 10장.</div>
+  </div>
+
+  <h3>ISA 문자열</h3>
+  <p>코어가 지원한다고 밝히는 RISC-V 확장 목록은 <code>ISAExtensions</code>에 있고(<code>Parameters.scala:304-317</code>), 장치 트리(DTS)의 <code>riscv,isa-base</code>와 <code>riscv,isa-extensions</code>로 내보낸다(<code>XSDts.scala:34-35</code>). 문자열은 100개다(<code>sed -n 306,316p Parameters.scala | grep -o '"[a-z0-9]*"' | wc -l</code> = 100). 한 글자 확장 9개가 기본 골격이다: I(정수), M(곱셈·나눗셈), A(원자 연산), F·D(단·배정밀도 부동소수), C(압축 16비트), B(비트 조작), V(벡터), H(하이퍼바이저).</p>
+  <p class="isa">rv64i + <b>i m a f d c b v h</b> sdext sdtrig sha shcounterenw shgatpa shlcofideleg shtvala shvsatpa shvstvala shvstvecd smaia smcdeleg smcntrpmf smcsrind smdbltrp smmpm smnpm smrnmi smstateen ss1p13 ssaia ssccfg ssccptr sscofpmf sscounterenw sscsrind ssdbltrp ssnpm sspm ssstateen ssstrict sstc sstvala sstvecd ssu64xl supm sv39 sv48 svade svbare svinval svnapot svpbmt za64rs zabha zacas zama16b zawrs zba zbb zbc zbkb zbkc zbkx zbs zcb zcmop zfa zfh zfhmin zic64b zicbom zicbop zicboz ziccamoa ziccamoc ziccif zicclsm ziccrse zicntr zicond zicsr zifencei zihintntl zihintpause zihpm zimop zkn zknd zkne zknh zksed zksh zkt zvbb zvfh zvfhmin zvkt zvl128b zvl32b zvl64b</p>
+</section>
+
+<section id="sec-hist">
+  <h2>v3의 역사와 이 책 읽는 법</h2>
+  <p>KMHv3는 한 번에 설계된 코어가 아니라 v2 계열 코드에서 한 블록씩 갈아 끼운 결과다. 이 저장소에서 kunminghu-v3 CI가 처음 생긴 커밋(2822fe269, 2025-03-14)의 값은 디코드·리네임 폭 6, ROB 160, 로드 큐 72, DefaultConfig L2 1MB였다(<code>git show 2822fe269:src/main/scala/xiangshan/Parameters.scala</code>). 실행 유닛도 ALU 4·BJU 4·FEX 5에서 지금의 ALU 6·BJU 3·FEX 4로 바뀌었다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 500" role="img" aria-label="2025-03부터 2026-09까지 KMHv3 주요 변경 연표">
+      <line class="ln-acc" x1="96" y1="14" x2="96" y2="488"/>
+      <g class="lbl-mono" text-anchor="end">
+        <text x="84" y="24">2025-03-14</text><text x="84" y="56">2025-04-11</text><text x="84" y="88">2025-04-15</text><text x="84" y="120">2025-05-27</text><text x="84" y="152">2025-08-15</text><text x="84" y="184">2025-09-17</text><text x="84" y="216">2025-09-17</text><text x="84" y="248">2025-10-20</text><text x="84" y="280">2025-12-01</text><text x="84" y="312">2026-03-31</text><text x="84" y="344">2026-05-18</text><text x="84" y="376">2026-05-25</text><text x="84" y="408">2026-06-12</text><text x="84" y="440">2026-08-24</text><text x="84" y="472">2026-09-16</text>
+      </g>
+      <g class="dot-acc"><circle cx="96" cy="20" r="5"/><circle cx="96" cy="52" r="5"/><circle cx="96" cy="84" r="5"/><circle cx="96" cy="116" r="5"/><circle cx="96" cy="148" r="5"/><circle cx="96" cy="180" r="5"/><circle cx="96" cy="212" r="5"/><circle cx="96" cy="244" r="5"/><circle cx="96" cy="276" r="5"/><circle cx="96" cy="308" r="5"/><circle cx="96" cy="340" r="5"/><circle cx="96" cy="372" r="5"/><circle cx="96" cy="404" r="5"/><circle cx="96" cy="436" r="5"/><circle cx="96" cy="468" r="5"/></g>
+      <g class="lbl">
+        <text x="110" y="25">v3 CI 시작: 폭 6, ROB 160 <tspan class="lbl-mono">2822fe269</tspan></text>
+        <text x="110" y="57">FTQ 전면 재작성 <tspan class="lbl-mono">e205da0fb</tspan></text>
+        <text x="110" y="89"><tspan class="lbl-acc">6-wide → 8-wide</tspan> <tspan class="lbl-mono">a5dadc651</tspan></text>
+        <text x="110" y="121">새 BPU 최상위 <tspan class="lbl-mono">#4716</tspan></text>
+        <text x="110" y="153">구 BPU 코드 제거 <tspan class="lbl-mono">46e1c0b08</tspan></text>
+        <text x="110" y="185">페치 블록 32B → <tspan class="lbl-acc">64B</tspan> <tspan class="lbl-mono">#5014</tspan></text>
+        <text x="110" y="217">TAGE 구현 #5001 · Region 계층</text>
+        <text x="110" y="249">ROB 224 → <tspan class="lbl-acc">352</tspan>, FP preg 256 <tspan class="lbl-mono">6f12fb244</tspan></text>
+        <text x="110" y="281">새 LoadUnit 틀 <tspan class="lbl-mono">f85d3eef6</tspan></text>
+        <text x="110" y="313">새 벡터 파이프라인 <tspan class="lbl-mono">4599560c9</tspan></text>
+        <text x="110" y="345">L2 1MB → <tspan class="lbl-acc">2MB</tspan> <tspan class="lbl-mono">#5969</tspan></text>
+        <text x="110" y="377">TileLink 판 제거, CHI 전용 <tspan class="lbl-mono">#5992</tspan></text>
+        <text x="110" y="409">LQ 72 → 120, SQ 56 → 64 <tspan class="lbl-mono">#6089</tspan></text>
+        <text x="110" y="441">OpenLLC 16MB → <tspan class="lbl-acc">32MB</tspan> <tspan class="lbl-mono">#6401</tspan></text>
+        <text x="110" y="473">ZhuJiang 단일 코어 토폴로지 <tspan class="lbl-mono">#6122</tspan></text>
+      </g>
+    </svg>
+    <figcaption>v3 주요 변경 연표(커밋 작성일 기준, 병합일은 다를 수 있다). 출처는 각 커밋의 <code>git log --format='%h %ad %s' --date=short</code>.</figcaption>
+  </figure>
+  <div class="callout decision"><strong>2025-04-15 백엔드 폭 6 → 8 (a5dadc651, 제목에 PR 번호 없음)</strong><p>커밋 제목 "support 8 IBufNBank, 8 decodeWidth, 8 renameWidth, 8 rabCommitWidth". 작성일은 2025-04-15, 저장소 병합일(commit date)은 2025-07-25다. 지금의 <code>DecodeWidth = RenameWidth = 8</code>(P:81-82)이 여기서 왔다.</p></div>
+  <div class="callout decision"><strong>2025-10-20 ROB 224 → 352, RAB 256 → 352, FP 물리 레지스터 192 → 256 (6f12fb244, 제목에 PR 번호 없음)</strong><p>제목 "perf(backend): increase fpPreg to 256, robSize and rabSize to 352". 그 전 2025-08-21(0306fb2ba)에 ROB 압축을 임시로 끄면서 160 → 224로 한 번 늘렸다. 창이 클수록 긴 미스 동안 더 많은 명령어를 들일 수 있다(4절 ROB 실험).</p></div>
+  <div class="callout decision"><strong>2026-05-18 L2 1MB → 2MB (#5969), 2026-08-24 OpenLLC 16MB → 32MB (#6401)</strong><p>DefaultConfig의 <code>L2CacheConfig("2MB", banks = 4)</code>와 <code>OpenLLCConfig("32MB", ways = 16, banks = 4)</code>가 이 두 커밋에서 정해졌다(<code>Configs.scala:584-586</code>).</p></div>
+  <div class="callout decision"><strong>2026-05-25 TileLink 판 제거 (#5992)</strong><p>"refactor: remove TileLink version of XiangShan". 이후 코어 밖 버스는 CHI 하나다(<code>Makefile:52</code> <code>ISSUE ?= E.b</code>). LLC 기본은 OpenLLC(<code>Makefile:53</code>, <code>SoC.scala:84</code>).</p></div>
+
+  <h3>이 책 읽는 법</h3>
+  <p>이 책의 장 순서는 명령어가 지나가는 길을 따른다. 아래 지도에서 각 블록을 누르면 해당 장으로 간다.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 460 250" role="img" aria-label="명령어 경로를 따라 배치한 2장부터 13장까지의 지도">
+      <defs><marker id="m9-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)"/></marker></defs>
+      <a href="ch02-bpu.html"><rect class="box-acc" x="10" y="10" width="100" height="50" rx="8"/><text x="60" y="31" text-anchor="middle" class="lbl-b">2·3장</text><text x="60" y="50" text-anchor="middle" class="lbl-dim">분기 예측</text></a>
+      <a href="ch03-predictors.html"><text x="60" y="74" text-anchor="middle" class="lbl-mono">TAGE·RAS →3장</text></a>
+      <a href="ch04-fetch.html"><rect class="box-acc" x="130" y="10" width="90" height="50" rx="8"/><text x="175" y="31" text-anchor="middle" class="lbl-b">4장</text><text x="175" y="50" text-anchor="middle" class="lbl-dim">인출</text></a>
+      <a href="ch05-decode-rename.html"><rect class="box-acc" x="240" y="10" width="95" height="50" rx="8"/><text x="287" y="31" text-anchor="middle" class="lbl-b">5장</text><text x="287" y="50" text-anchor="middle" class="lbl-dim">디코드·리네임</text></a>
+      <a href="ch06-dispatch-issue.html"><rect class="box-acc" x="355" y="10" width="95" height="50" rx="8"/><text x="402" y="31" text-anchor="middle" class="lbl-b">6장</text><text x="402" y="50" text-anchor="middle" class="lbl-dim">디스패치·이슈</text></a>
+      <a href="ch07-execute.html"><rect class="box-2" x="355" y="92" width="95" height="50" rx="8"/><text x="402" y="113" text-anchor="middle" class="lbl-b">7장</text><text x="402" y="132" text-anchor="middle" class="lbl-dim">실행</text></a>
+      <a href="ch08-rob-redirect.html"><rect class="box-2" x="240" y="92" width="95" height="50" rx="8"/><text x="287" y="113" text-anchor="middle" class="lbl-b">8장</text><text x="287" y="132" text-anchor="middle" class="lbl-dim">ROB·커밋</text></a>
+      <a href="ch09-loadstore.html"><rect class="box-2" x="130" y="92" width="90" height="50" rx="8"/><text x="175" y="113" text-anchor="middle" class="lbl-b">9장</text><text x="175" y="132" text-anchor="middle" class="lbl-dim">로드·스토어</text></a>
+      <a href="ch10-cache-mmu.html"><rect class="box-2" x="10" y="92" width="100" height="50" rx="8"/><text x="60" y="113" text-anchor="middle" class="lbl-b">10장</text><text x="60" y="132" text-anchor="middle" class="lbl-dim">캐시·TLB</text></a>
+      <line class="ln" x1="110" y1="35" x2="128" y2="35" marker-end="url(#m9-a)"/><line class="ln" x1="220" y1="35" x2="238" y2="35" marker-end="url(#m9-a)"/><line class="ln" x1="335" y1="35" x2="353" y2="35" marker-end="url(#m9-a)"/>
+      <line class="ln" x1="402" y1="60" x2="402" y2="90" marker-end="url(#m9-a)"/><line class="ln" x1="355" y1="117" x2="337" y2="117" marker-end="url(#m9-a)"/><line class="ln" x1="240" y1="117" x2="222" y2="117" marker-end="url(#m9-a)"/><line class="ln" x1="130" y1="117" x2="112" y2="117" marker-end="url(#m9-a)"/>
+      <path class="ln-dash" d="M287,92 C287,76 200,76 175,62" marker-end="url(#m9-a)"/><text x="232" y="86" text-anchor="middle" class="lbl-mono">redirect</text>
+      <a href="ch11-vector.html"><rect class="box" x="10" y="168" width="140" height="44" rx="8"/><text x="80" y="195" text-anchor="middle" class="lbl">11장 벡터(RVV)</text></a>
+      <a href="ch12-verify.html"><rect class="box" x="160" y="168" width="140" height="44" rx="8"/><text x="230" y="195" text-anchor="middle" class="lbl">12장 빌드·검증</text></a>
+      <a href="ch13-lab.html"><rect class="box-ok" x="310" y="168" width="140" height="44" rx="8"/><text x="380" y="195" text-anchor="middle" class="lbl">13장 통합 실험실</text></a>
+      <text x="230" y="238" text-anchor="middle" class="lbl-dim">위 두 줄: 명령어의 길 · 아래 줄: 가로지르는 주제</text>
+    </svg>
+    <figcaption>책 지도. 윗줄은 프런트엔드(2~5장), 오른쪽 아래로 꺾여 백엔드와 메모리(6~10장)로 이어진다. 벡터·검증·실험실은 모든 블록을 가로지른다.</figcaption>
+  </figure>
+  <div class="table-wrap"><table class="data">
+    <tr><th>장</th><th>주제</th><th>이 장의 어디와 이어지나</th></tr>
+    <tr><td><a href="ch02-bpu.html">2장</a> · <a href="ch03-predictors.html">3장</a></td><td>BPU 파이프라인, BTB / TAGE·SC·ITTAGE·RAS</td><td>2절 제어 해저드, 4절 추측 실행</td></tr>
+    <tr><td><a href="ch04-fetch.html">4장</a></td><td>FTQ·ICache·IFU</td><td>5절 일생 1~2단계</td></tr>
+    <tr><td><a href="ch05-decode-rename.html">5장</a></td><td>디코드와 리네임</td><td>4절 리네이밍 놀이터, G3</td></tr>
+    <tr><td><a href="ch06-dispatch-issue.html">6장</a> · <a href="ch07-execute.html">7장</a></td><td>디스패치·이슈 큐 / 데이터패스·실행 유닛</td><td>3절 IPC 실험의 유닛 수</td></tr>
+    <tr><td><a href="ch08-rob-redirect.html">8장</a></td><td>ROB, 커밋, 리다이렉트</td><td>4절 G1·G2, 5절 G4</td></tr>
+    <tr><td><a href="ch09-loadstore.html">9장</a> · <a href="ch10-cache-mmu.html">10장</a></td><td>로드·스토어와 LSQ / 캐시·TLB·프리페처</td><td>3절 캐시 미스 실험, 6절 캐시 계층</td></tr>
+    <tr><td><a href="ch11-vector.html">11장</a> · <a href="ch12-verify.html">12장</a> · <a href="ch13-lab.html">13장</a></td><td>벡터 / 빌드·검증 / 통합 실험</td><td>6절 ISA의 V 확장, 전체</td></tr>
+  </table></div>
+</section>
+
+<div class="keypoints">
+  <h2>핵심 정리</h2>
+  <ol>
+    <li>파이프라인은 한 명령어의 지연이 아니라 처리량을 늘린다. 해저드(데이터·제어·구조)가 그 이득을 깎는다.</li>
+    <li>슈퍼스칼라는 폭을, 비순차 실행은 "기다리는 동안 다른 일"을 늘린다. 둘 다 프로그램의 의존과 실행 유닛 수를 넘지는 못한다.</li>
+    <li>실행은 순서 없이, 커밋은 순서대로. ROB(352칸)가 그 장부이고, 디스패치는 "점유 + 이번 입장 ≤ 336"일 때만 다음 묶음을 보내며(G1), 커밋은 head부터 최대 8개(G2)다.</li>
+    <li>리네이밍은 이름만 겹친 WAR·WAW 의존을 지운다. 프리 리스트가 8개 미만이면 리네임 전체가 멈춘다(G3).</li>
+    <li>KMHv3 = XSTop → XSTile → XSCore(Frontend + Backend + MemBlock) + L2Top. 빌드 기본은 DefaultConfig이고, 이것은 캐시·버스 구성만 바꾸고 코어 파라미터는 그대로 둔다.</li>
+  </ol>
+</div>
+
+<section class="no-num">
+  <h2>확인 퀴즈</h2>
+  <div class="quiz" data-answer="1">
+    <div class="q">5단 파이프라인이 파이프라인 없는 설계보다 좋아지는 것은?</div>
+    <div class="opts"><button>한 명령어가 끝나는 데 걸리는 사이클 수(지연)</button><button>단위 시간에 끝나는 명령어 수(처리량)</button><button>프로그램의 명령어 개수</button><button>캐시 미스 지연</button></div>
+    <div class="explain">한 명령어는 여전히 다섯 단계를 모두 지난다. 그래서 지연은 그대로다. 단계를 겹쳐 처리량이 늘어난다. 명령어 개수는 컴파일러가 정하고, 캐시 미스 지연은 메모리 계층이 정하므로 파이프라인과 무관하다.</div>
+  </div>
+  <div class="quiz" data-answer="2">
+    <div class="q">비순차 코어가 커밋만은 프로그램 순서대로 하는 가장 중요한 이유는?</div>
+    <div class="opts"><button>실행 유닛을 아끼려고</button><button>캐시 적중률을 높이려고</button><button>예외·인터럽트가 났을 때 "그 명령어 직전" 상태를 정확히 보여 주려고</button><button>분기 예측기를 훈련하려고</button></div>
+    <div class="explain">순서대로 확정해야 예외 지점 앞은 모두 반영, 뒤는 하나도 반영되지 않은 정확한 상태가 남는다. 커밋 순서는 실행 유닛 수나 캐시 적중률과 무관하다. 예측기 훈련은 커밋 정보를 쓰기는 하지만(CtrlBlock.scala:413-419) 순서를 지키는 이유는 아니다.</div>
+  </div>
+  <div class="quiz" data-answer="1">
+    <div class="q">ROB가 352칸인데 디스패치 허가 조건이 "점유 + 이번에 들어온 수 ≤ 336"인 이유는?</div>
+    <div class="opts"><button>8칸은 예외 정보 전용 칸이라서</button><button>허가가 레지스터라 한 사이클 늦고 디스패치→ROB 사이에도 레지스터 1단이 있어, 그 사이 들어올 8개 묶음 두 개 자리를 남겨야 해서</button><button>ROB가 8뱅크라 뱅크마다 1칸씩 비워야 해서</button><button>MinimalConfig와 크기를 맞추려고</button></div>
+    <div class="explain">Rob.scala:972에서 allowEnqueueForDispatch는 RobSize − 2×RenameWidth(336)와 비교하고, CtrlBlock.scala:800에서 디스패치가 이 값을 쓴다. CtrlBlock.scala:797의 RegNext 때문에 허가를 끈 뒤에도 파이프 안 묶음과 다음 묶음, 최대 16개가 더 들어온다. ROB 자신의 ≤ 344(:971)는 안전판이다. 예외 전용 칸은 없다. 뱅크 수 8은 커밋을 줄 단위로 하려는 구조이지 빈칸 규칙이 아니다. MinimalConfig는 ROB 48로 크기가 다르다.</div>
+  </div>
+  <div class="quiz" data-answer="2">
+    <div class="q">DefaultConfig의 <code>L2CacheConfig("2MB", banks = 4)</code>, 8-way, 64B 라인이면 뱅크당 set 수는? (공식: Configs.scala:339)</div>
+    <div class="opts"><button>256</button><button>512</button><button>1024</button><button>4096</button></div>
+    <div class="explain">l2sets = 2048KB × 1024 / 4 / 8 / 64 = 1024. 256은 MinimalConfig(128KB, 1뱅크)의 값이다. 512는 뱅크를 8로 나눈 경우, 4096은 뱅크로 나누지 않고 2MB 전체를 한 뱅크로 본 경우다.</div>
+  </div>
+  <div class="quiz" data-answer="0">
+    <div class="q">레지스터 리네이밍이 없애는 의존은?</div>
+    <div class="opts"><button>WAR과 WAW(이름만 같은 가짜 의존)</button><button>RAW(앞 결과를 실제로 읽는 진짜 의존)</button><button>분기 방향 의존</button><button>모든 의존</button></div>
+    <div class="explain">리네이밍은 쓰는 쪽에 새 물리 레지스터를 줘 이름 충돌을 없앤다. RAW는 값이 실제로 흘러가므로 남는다. 리네이밍 놀이터에서 깊이가 6 → 3으로 줄고 0이 되지 않는 이유다. 분기 방향은 예측과 플러시로 다룬다.</div>
+  </div>
+</section>
+
+<p class="footnote">근거 기준: XiangShan kunminghu-v3 @09453ff8 (2026-09-28 커밋), 작성 2026-10-08.</p>
+
+</main>
+</div>
+<script src="assets/ch01-a.js"></script>
+<script src="assets/ch01-b.js"></script>
+</body>
+</html>
